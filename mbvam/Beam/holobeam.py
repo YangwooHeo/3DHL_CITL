@@ -5,6 +5,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 from typing import Union
 from tqdm import tqdm
+from .zernike import combine_zernike_basis, compute_zernike_basis 
 
 class HoloBeam(Beam):
     '''
@@ -23,7 +24,30 @@ class HoloBeam(Beam):
         self.beam_mean_amplitude_iter = None #0D tensor describing the mean amplitude of the beam. This will be updated during optimization.
         self.slm_amplitude_profile = None #2D tensor describing the profile of the beam at the SLM plane. Normalized to 1. Could be Gaussian or flat top.
         self.H = None # The propagation kernel
+
+        ### New addition for CITL proxy model ###
+        self.zernike_coeffs = None
+        self.zernike_basis = None
+        self.source_modulation_map = None
+        self.camera_scale_factor = None
+
+    def _get_zernike_phase(self, shape):
+        """
+        return zernike phase from zernike coefficients
         
+        """
+        if self.zernike_coeffs is None:
+            return 0
+        if self.zernike_basis is None or self.zernike_basis.shape[-2:] != shape[-2:]:
+            self.zernike_basis = compute_zernike_basis(num_polynomials=len(self.zernike_coeffs),
+                                                       field_res=shape[-2:],
+                                                       dtype=self.beam_config.fdtype).to(self.beam_config.device)
+
+        coeffs = self.zernike_coeffs.view(-1, 1, 1)
+        zernike_phase = (coeffs*self.zernike_basis).sum(dim=0)
+
+        return zernike_phase
+
     @torch.no_grad()
     def buildASPropagationTF(self, z_prop:Union[CoordinateArray, torch.Tensor]=None, material_layer:MaterialLayer=None, delta:bool=False):
         '''
@@ -72,7 +96,6 @@ class HoloBeam(Beam):
 
         Nx = self.beam_config.Nx
         Ny = self.beam_config.Ny
-            
         X_slm, Y_slm = torch.meshgrid(
             torch.linspace(-(Nx-1)/2, (Nx-1)/2, Nx, device=self.beam_config.device, dtype=self.beam_config.fdtype)*self.beam_config.psSLM,
             torch.linspace(-(Ny-1)/2, (Ny-1)/2, Ny, device=self.beam_config.device, dtype=self.beam_config.fdtype)*self.beam_config.psSLM,
@@ -173,6 +196,33 @@ class HoloBeam(Beam):
 
         return H_eff
     
+    def build_true_ASM_TF(self, z_query: torch.Tensor, n_medium=1.0):
+        '''
+        Real spatial frequency based ASM transfer function, whereas current buildEffectiveTF was based on pupil/focal plane of objective lens.
+        '''
+        Nx, Ny = self.beam_config.Nx, self.beam_config.Ny
+        ps = self.beam_config.psSLM
+        lambda_ = self.beam_config.lambda_
+        
+        fx = torch.fft.fftfreq(Nx, d=ps, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+        fy = torch.fft.fftfreq(Ny, d=ps, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+        FX, FY = torch.meshgrid(fx, fy, indexing='ij')
+        
+        gamma_sq = 1 - (lambda_ * FX / n_medium)**2 - (lambda_ * FY / n_medium)**2
+        gamma = torch.sqrt(torch.clamp(gamma_sq, min=0)) # Clamp to prevent Evanescent wave
+        
+        km = 2 * torch.pi * n_medium / lambda_
+        z_query = z_query[None, None, :]
+        gamma = gamma[:, :, None]
+        
+        # ASM Transfer Function: H(fx, fy, z) = exp(i * k_z * z)
+        exponent = 1j * km * z_query * gamma
+        H_asm = torch.exp(exponent)
+        
+        # Masking evanescent wave 
+        H_asm[gamma_sq[:, :, None] < 0] = 0
+        
+        return H_asm.to(self.beam_config.cdtype)
 
     # def storeTransferFunction(self, H:torch.Tensor): #This function stores the transfer function in the beam object.
     #     self.H = H
@@ -213,7 +263,7 @@ class HoloBeam(Beam):
             raise ValueError('Phase mask is not provided nor stored.')
 
         if phase_mask.dim() != 2:
-            raise ValueError('phase_mask must be a 2D tensor.')
+            raise ValueError('phase_mask must be a 2D tensor. Current dimension is ' +str(phase_mask.dim()))
         
         if (beam_mean_amplitude is None):
             raise ValueError('beam_mean_amplitude is not provided nor stored.')
@@ -227,6 +277,10 @@ class HoloBeam(Beam):
         if H is None:
             raise ValueError('Transfer function is not provided nor stored. Use buildTransferFunction() to build the transfer function first.')
         
+        # Add aberrated phase map onto the phase mask
+        aberration_phase = self._get_zernike_phase(phase_mask.shape[-2:])
+        phase_mask = phase_mask + aberration_phase
+
         #Computation
         # slm_field = torch.sqrt(beam_total_energy[None,None]*slm_energy_profile)*torch.exp(1j*phase_mask) #float tensor becomes complex
         slm_field = beam_mean_amplitude[None,None]*slm_amplitude_profile*torch.exp(1j*phase_mask) #float tensor becomes complex
@@ -236,7 +290,47 @@ class HoloBeam(Beam):
             vol_field = torch.abs(vol_field)**2
 
         return torch.fft.fftshift(vol_field, dim=(0,1))
-    
+
+    @torch.no_grad()
+    def propagateToVolume_Axicon(self, axicon_angle: float, axicon_n: float, phase_mask=None, beam_mean_amplitude=None, 
+                                 slm_amplitude_profile=None, H_asm=None, convert_to_intensity=False):
+        '''
+        Axicon lens forward propagation
+        '''
+        if phase_mask is None: phase_mask = self.phase_mask_iter
+        if beam_mean_amplitude is None: beam_mean_amplitude = self.beam_mean_amplitude_iter
+        if slm_amplitude_profile is None: slm_amplitude_profile = self.slm_amplitude_profile
+
+        # 1. SLM plane phase with Zernike aberration
+        aberration_phase = self._get_zernike_phase(phase_mask.shape[-2:])
+        total_phase = phase_mask + aberration_phase
+        slm_field = beam_mean_amplitude[None,None] * slm_amplitude_profile * torch.exp(1j * total_phase)
+
+        # 2. Axicon phase mask
+        Nx, Ny = self.beam_config.Nx, self.beam_config.Ny
+        ps = self.beam_config.psSLM
+        x = torch.linspace(-(Nx-1)/2, (Nx-1)/2, Nx, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps
+        y = torch.linspace(-(Ny-1)/2, (Ny-1)/2, Ny, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps
+        X, Y = torch.meshgrid(x, y, indexing='ij')
+        R = torch.sqrt(X**2 + Y**2)
+        
+        k = 2 * torch.pi / self.beam_config.lambda_
+        
+        # Axicon phase: exp(-i * k * (n-1) * gamma * R)
+        axicon_phase_mask = -k * (axicon_n - 1) * axicon_angle * R
+        field_after_axicon = slm_field * torch.exp(1j * axicon_phase_mask)
+
+        # 3. Space to Space True ASM propagation 
+        E_fourier = torch.fft.fft2(field_after_axicon, dim=(0,1), norm="ortho")
+        vol_fourier = E_fourier[:,:,None] * H_asm
+        vol_field = torch.fft.ifft2(vol_fourier, dim=(0,1), norm="ortho")
+
+        if convert_to_intensity:
+            vol_field = torch.abs(vol_field)**2
+
+        return vol_field
+
+
     def propagateToMask(self, volume_field, H:torch.Tensor=None):
         '''
         Propagate the volume field back to the phase mask using the inverse transfer function.
@@ -264,21 +358,32 @@ class HoloBeam(Beam):
             H = self.H
         if H is None:
             raise ValueError('Transfer function is not provided nor stored. Use buildTransferFunction() to build the transfer function first.')
-        
+
         # Computation
         mask_field = torch.fft.ifft2(torch.fft.ifftshift(volume_field, dim=(0, 1)), dim=(0, 1), norm="ortho") #still 3D
         mask_field /= H #divide by the transfer function
         mask_field[torch.isinf(mask_field) | torch.isnan(mask_field)] = 0 #remove inf and nan resulted from region where H is zero. These frequencies are evanescent waves.
+        
+        # Aberration compensation
+        if self.zernike_coeffs is not None:
+            aberration_phase = self._get_zernike_phase(mask_field.shape[-2:])
+            correction_phasor = torch.exp(-1j * aberration_phase)
+            mask_field *= correction_phasor
 
         return mask_field
 
-    @torch.no_grad()
+    #@torch.no_grad()
     def buildSLMAmplitudeProfile(self):
         '''
         This function builds the source profile at the SLM plane.
         The amplitude profile should have mean value equal to 1.
         If the source profile is Gaussian, the kwargs should contain the gaussian_beam_waist in [m].
         '''
+
+        # If computed profile exist and not in the training step, return cached value
+        if self.slm_amplitude_profile is not None and self.source_modulation_map is None:
+             return self.slm_amplitude_profile
+        
         if self.beam_config.amplitude_profile_type == 'flat_top':
             slm_amplitude_profile = self.buildFlatTopSourceProfile()
         elif self.beam_config.amplitude_profile_type == 'gaussian':
@@ -286,7 +391,19 @@ class HoloBeam(Beam):
         else:
             raise ValueError('Invalid source profile type.')
         
-        return slm_amplitude_profile
+        if self.source_modulation_map is not None:
+            combined_profile = slm_amplitude_profile * self.source_modulation_map
+        else:
+            combined_profile = slm_amplitude_profile
+
+        # Re-normalization 
+        mean_val = torch.mean(torch.abs(combined_profile)) + 1e-12
+        final_profile = combined_profile / mean_val
+        
+        if self.source_modulation_map is None or not self.source_modulation_map.requires_grad:
+            self.slm_amplitude_profile = final_profile
+            
+        return final_profile
 
     @torch.no_grad()
     def buildFlatTopSourceProfile(self): # flat top with mean value of 1.
@@ -416,30 +533,169 @@ class HoloBeam(Beam):
 
         return phase_mask
 
-    def forward_asm_for_citl(self, slm_phase):
+    def init_proxy_params(self, num_zernike=20, init_source_map=None, device=None):
+        """
+        Activate gradient and initialize the parameters of proxy model
+        """
+        
+        target_device = device if device is not None else self.beam_config.device
+        self.beam_config.device = target_device # Config update
+
+        print(f"[HoloBeam] Initializing Proxy Params on {target_device}...")
+
+        # 1. Zernike Coefficients to zero
+        self.zernike_coeffs = torch.zeros(
+            num_zernike, 
+            device=target_device, 
+            dtype=self.beam_config.fdtype
+        ).requires_grad_(True)
+
+        # 2. Source Map to 1
+        if init_source_map is None:
+            #current_profile = self.buildSLMAmplitudeProfile().to(target_device).detach()
+            #self.source_modulation_map = current_profile.clone().requires_grad_(True)
+            self.source_modulation_map = torch.ones(
+                (self.beam_config.Nx, self.beam_config.Ny),
+                device=target_device,
+                dtype=self.beam_config.fdtype
+            ).requires_grad_(True)
+        else:
+            self.source_modulation_map = init_source_map.to(target_device).detach().requires_grad_(True)
+
+        # 3. Global Scale Factor
+        self.camera_scale_factor = torch.tensor(1.0, device=target_device, dtype=self.beam_config.fdtype).requires_grad_(True)
+
+    def get_proxy_parameters(self):
+        """
+        Return parameter list to the Optimizer
+        """
+        params = [self.zernike_coeffs, self.source_modulation_map, self.camera_scale_factor]
+        return params
+
+    #def forward_propagate_2D(self, slm_phase, defocus=0.0):
+    def forward_proxy_2D(self, slm_phase, source_profile=None, defocus=0.0):
         """
         Test code for the Camera in the Loop system. (written on 01_28_2026)
-        It makes compatible output to the source code of Neural Holography
+        Return intensity at a specific focal plane.
         
         Input: SLM phase
         Output: reconstructed amplitutde
         """
+        if not slm_phase.requires_grad:
+            slm_phase.requires_grad_(True)
 
         # beam initialization
+        if source_profile is not None:
+            use_profile = source_profile
+        elif self.source_modulation_map is not None:
+            use_profile = self.source_modulation_map
+        elif self.slm_amplitude_profile is not None:
+            use_profile = self.slm_amplitude_profile
+        else:
+            use_profile = self.buildSLMAmplitudeProfile()
         beam_amp = torch.tensor(1, device=self.beam_config.device)
-        slm_profile = self.buildSLMAmplitudeProfile()
+        #use_profile = self.buildSLMAmplitudeProfile()
 
         # propagation
         vol_field = self.propagateToVolume(phase_mask=slm_phase, 
                                            beam_mean_amplitude=beam_amp, 
-                                           slm_amplitude_profile=slm_profile,
+                                           slm_amplitude_profile=use_profile,
                                            H=self.H,
                                            convert_to_intensity=False)
         
         # get focal plane
-        mid_z_idx = vol_field.shape[2] // 2
-        target_field =  vol_field[:, :, mid_z_idx]
+        zv = self.local_coord_vec[2]
+        defocus_m = defocus * 1e-9
 
-        reconstructed_intensity = torch.abs(target_field) ** 2
+        # check if defocus exceeds the volume
+        if defocus_m < zv.min() or defocus_m > zv.max():
+             print(f"Warning: Defocus {defocus}nm is out of volume range [{zv.min().item()*1e9:.1f}, {zv.max().item()*1e9:.1f}]nm.")
 
-        return reconstructed_intensity.unsqueeze(0).unsqueeze(0)
+        dz = zv[1] - zv[0]
+        z_start = zv[0]
+        
+        # Index = (Target_Position - Start_Position) / Step_Size
+        exact_idx = (defocus_m - z_start) / dz
+        
+        # index clamping
+        exact_idx = torch.clamp(exact_idx, 0, len(zv) - 1.001)
+
+        # Linear Interpolation (Lerp)
+        idx_low = torch.floor(exact_idx).long()
+        idx_high = idx_low + 1
+        alpha = exact_idx - idx_low  
+
+        slice_low = vol_field[:, :, idx_low]
+        slice_high = vol_field[:, :, idx_high]
+        
+        # Complex Interpolation
+        target_field_slice = (1 - alpha) * slice_low + alpha * slice_high
+        reconstructed_intensity = torch.abs(target_field_slice) ** 2
+        
+        if self.camera_scale_factor is not None:
+            return reconstructed_intensity * torch.abs(self.camera_scale_factor)
+        else:
+            return reconstructed_intensity
+
+    def forward_proxy_2D_Axicon(self, slm_phase, axicon_angle=0.0174, axicon_n=1.5, source_profile=None, defocus=0):
+        """
+        Return intensity at a specific focal plane.
+        
+        Input: SLM phase
+        Output: reconstructed amplitutde
+        """
+        if not slm_phase.requires_grad:
+            slm_phase.requires_grad_(True)
+
+        if source_profile is not None:
+            use_profile = source_profile
+        elif self.source_modulation_map is not None:
+            use_profile = self.source_modulation_map
+        elif self.slm_amplitude_profile is not None:
+            use_profile = self.slm_amplitude_profile
+        else:
+            use_profile = self.buildSLMAmplitudeProfile()
+        beam_amp = torch.tensor(1.0, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+
+        vol_field = self.propagateToVolume_Axicon(
+                                                axicon_angle=axicon_angle, 
+                                                axicon_n=axicon_n,
+                                                phase_mask=slm_phase, 
+                                                beam_mean_amplitude=beam_amp, 
+                                                slm_amplitude_profile=use_profile,
+                                                H_asm=self.H_asm,
+                                                convert_to_intensity=True
+        )
+
+        # get focal plane
+        zv = self.local_coord_vec[2]
+        defocus_m = defocus * 1e-9
+
+        # check if defocus exceeds the volume
+        if defocus_m < zv.min() or defocus_m > zv.max():
+             print(f"Warning: Defocus {defocus}nm is out of volume range [{zv.min().item()*1e9:.1f}, {zv.max().item()*1e9:.1f}]nm.")
+
+        dz = zv[1] - zv[0]
+        z_start = zv[0]
+        
+        # Index = (Target_Position - Start_Position) / Step_Size
+        exact_idx = (defocus_m - z_start) / dz
+        
+        # index clamping
+        exact_idx = torch.clamp(exact_idx, 0, len(zv) - 1.001)
+
+        # Linear Interpolation (Lerp)
+        idx_low = torch.floor(exact_idx).long()
+        idx_high = idx_low + 1
+        alpha = exact_idx - idx_low  
+
+        slice_low = vol_field[:, :, idx_low]
+        slice_high = vol_field[:, :, idx_high]
+        
+        # Complex Interpolation
+        target_field_slice = (1 - alpha) * slice_low + alpha * slice_high
+        reconstructed_intensity = torch.abs(target_field_slice) ** 2
+
+        final_image = reconstructed_intensity * torch.abs(self.camera_scale_factor)
+        
+        return final_image
