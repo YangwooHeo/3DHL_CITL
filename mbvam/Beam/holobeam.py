@@ -220,7 +220,9 @@ class HoloBeam(Beam):
         H_asm = torch.exp(exponent)
         
         # Masking evanescent wave 
-        H_asm[gamma_sq[:, :, None] < 0] = 0
+        #H_asm[gamma_sq[:, :, None] < 0] = 0
+        valid_mask = (gamma_sq >= 0).unsqueeze(-1)  # [Nx, Ny, 1] 
+        H_asm = H_asm * valid_mask
         
         return H_asm.to(self.beam_config.cdtype)
 
