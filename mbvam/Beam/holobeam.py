@@ -2,10 +2,13 @@ from mbvam.Beam.beam import Beam
 from mbvam.Beam.holobeamconfig import HoloBeamConfig, MaterialLayer
 from mbvam.Geometry.coordinate import CoordinateArray
 import torch
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from typing import Union
 from tqdm import tqdm
 from .zernike import combine_zernike_basis, compute_zernike_basis 
+import time
+import math
 
 class HoloBeam(Beam):
     '''
@@ -195,17 +198,23 @@ class HoloBeam(Beam):
             H_eff.requires_grad_(False) #set requires_grad to be false so that gradient is not computed w.r.t. H
 
         return H_eff
-    
-    def build_true_ASM_TF(self, z_query: torch.Tensor, n_medium=1.0):
+        
+    def build_true_ASM_TF(self, z_query: torch.Tensor, upsample_factor=8, n_medium=1.0):
         '''
         Real spatial frequency based ASM transfer function, whereas current buildEffectiveTF was based on pupil/focal plane of objective lens.
         '''
         Nx, Ny = self.beam_config.Nx, self.beam_config.Ny
         ps = self.beam_config.psSLM
         lambda_ = self.beam_config.lambda_
+        Nx_orig, Ny_orig = self.beam_config.Nx, self.beam_config.Ny
+        ps_orig = self.beam_config.psSLM
         
-        fx = torch.fft.fftfreq(Nx, d=ps, device=self.beam_config.device, dtype=self.beam_config.fdtype)
-        fy = torch.fft.fftfreq(Ny, d=ps, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+        Nx_up = Nx_orig * int(upsample_factor)
+        Ny_up = Ny_orig * int(upsample_factor)
+        ps_up = ps_orig / upsample_factor
+
+        fx = torch.fft.fftfreq(Nx_up, d=ps_up, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+        fy = torch.fft.fftfreq(Ny_up, d=ps_up, device=self.beam_config.device, dtype=self.beam_config.fdtype)
         FX, FY = torch.meshgrid(fx, fy, indexing='ij')
         
         gamma_sq = 1 - (lambda_ * FX / n_medium)**2 - (lambda_ * FY / n_medium)**2
@@ -225,6 +234,75 @@ class HoloBeam(Beam):
         H_asm = H_asm * valid_mask
         
         return H_asm.to(self.beam_config.cdtype)
+
+    def build_axicon_ASM_TF(self, z_query: torch.Tensor, upsample_factor=8, n_medium=1.0, axicon_angle=None, margin_factor=5):
+        '''
+        Real spatial frequency based ASM transfer function with Sparse Ring Masking
+        '''
+        Nx_orig, Ny_orig = self.beam_config.Nx, self.beam_config.Ny
+        ps_orig = self.beam_config.psSLM
+        lambda_ = self.beam_config.lambda_
+        
+        Nx_up = Nx_orig * int(upsample_factor)
+        Ny_up = Ny_orig * int(upsample_factor)
+        ps_up = ps_orig / upsample_factor
+
+        fx = torch.fft.fftfreq(Nx_up, d=ps_up, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+        fy = torch.fft.fftfreq(Ny_up, d=ps_up, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+        
+        FX2 = fx.view(-1, 1) ** 2
+        FY2 = fy.view(1, -1) ** 2
+        KR = torch.sqrt(FX2 + FY2)
+        
+        if axicon_angle is not None:
+            k_ring_radius = torch.sin(torch.tensor(axicon_angle)) / lambda_
+            df = 1.0 / (Nx_orig * ps_orig)
+            ring_mask = torch.abs(KR - k_ring_radius) <= (df * margin_factor)
+            
+            # visualize ring mask
+            import matplotlib.pyplot as plt
+            ring_mask_shift = torch.fft.fftshift(ring_mask)
+            plt.figure(figsize=(6,6))
+            plt.imshow(ring_mask_shift.cpu().numpy(), cmap='gray', origin='lower')
+            plt.title('Ring Mask in Frequency Domain')
+            plt.xlabel('fy index')
+            plt.ylabel('fx index')
+            plt.colorbar(label='Mask (True=1, False=0)')
+            plt.show()
+            
+            KR_sparse = KR[ring_mask] # Shape: [N_sparse]
+            
+            gamma_sq_sparse = 1 - (lambda_ * KR_sparse / n_medium)**2
+            gamma_sparse = torch.sqrt(torch.clamp(gamma_sq_sparse, min=0))
+            
+            km = 2 * torch.pi * n_medium / lambda_
+            
+            # z_query: [Nz], gamma_sparse: [N_sparse] => 결과: [N_sparse, Nz]
+            H_asm_sparse = torch.exp(1j * km * z_query.view(1, -1) * gamma_sparse.view(-1, 1))
+            
+            valid_mask_sparse = (gamma_sq_sparse >= 0).unsqueeze(-1)
+            H_asm_sparse = H_asm_sparse * valid_mask_sparse
+            
+            retention = ring_mask.sum().item() / (Nx_up * Ny_up) * 100
+            print(f"[Method B] K-space Sparse Masking Active! Using only {retention:.3f}% of K-space memory.")
+            
+            # Delete redundant files
+            del FX2, FY2, KR, KR_sparse, gamma_sq_sparse, gamma_sparse
+            
+            return {
+                'type': 'sparse',
+                'ring_mask': ring_mask,
+                'H_asm_sparse': H_asm_sparse.to(self.beam_config.cdtype),
+                'Nx_up': Nx_up, 'Ny_up': Ny_up
+            }
+        else:
+            gamma_sq = 1 - (lambda_**2 * KR**2 / n_medium**2)
+            gamma = torch.sqrt(torch.clamp(gamma_sq, min=0))
+            km = 2 * torch.pi * n_medium / lambda_
+            H_asm = torch.exp(1j * km * z_query.view(1, 1, -1) * gamma.unsqueeze(-1))
+            valid_mask = (gamma_sq >= 0).unsqueeze(-1)
+            H_asm = H_asm * valid_mask
+            return H_asm.to(self.beam_config.cdtype)
 
     # def storeTransferFunction(self, H:torch.Tensor): #This function stores the transfer function in the beam object.
     #     self.H = H
@@ -294,7 +372,7 @@ class HoloBeam(Beam):
         return torch.fft.fftshift(vol_field, dim=(0,1))
 
     @torch.no_grad()
-    def propagateToVolume_Axicon(self, axicon_angle: float, axicon_n: float, phase_mask=None, beam_mean_amplitude=None, 
+    def propagateToVolume_Axicon(self, axicon_angle: float,  upsample_factor=int,  phase_mask=None, beam_mean_amplitude=None, 
                                  slm_amplitude_profile=None, H_asm=None, convert_to_intensity=False):
         '''
         Axicon lens forward propagation
@@ -309,18 +387,40 @@ class HoloBeam(Beam):
         slm_field = beam_mean_amplitude[None,None] * slm_amplitude_profile * torch.exp(1j * total_phase)
 
         # 2. Axicon phase mask
-        Nx, Ny = self.beam_config.Nx, self.beam_config.Ny
-        ps = self.beam_config.psSLM
-        x = torch.linspace(-(Nx-1)/2, (Nx-1)/2, Nx, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps
-        y = torch.linspace(-(Ny-1)/2, (Ny-1)/2, Ny, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps
+        Nx_orig, Ny_orig = self.beam_config.Nx, self.beam_config.Ny
+        ps_orig = self.beam_config.psSLM
+        if upsample_factor > 1:
+            # Separate real and imaginary for interpolation
+            real_part = slm_field.real.unsqueeze(0).unsqueeze(0)  # [1, 1, Nx, Ny]
+            imag_part = slm_field.imag.unsqueeze(0).unsqueeze(0)
+            
+            # mode='nearest' exactly mimics the physical square shape of SLM pixels
+            real_up = F.interpolate(real_part, scale_factor=upsample_factor, mode='nearest').squeeze()
+            imag_up = F.interpolate(imag_part, scale_factor=upsample_factor, mode='nearest').squeeze()
+            
+            slm_field_up = real_up + 1j * imag_up
+            Nx_up = Nx_orig * int(upsample_factor)
+            Ny_up = Ny_orig * int(upsample_factor)
+            ps_up = ps_orig / upsample_factor
+            print(f"Upsampled pixel size for axicon simulation is {ps_up*1e6}um")
+        else:
+            slm_field_up = slm_field
+            Nx_up, Ny_up = Nx_orig, Ny_orig
+            ps_up = ps_orig
+        #Nx, Ny = self.beam_config.Nx, self.beam_config.Ny
+        #ps = self.beam_config.psSLM
+        
+        t_loop_start = time.perf_counter()
+        x = torch.linspace(-(Nx_up-1)/2, (Nx_up-1)/2, Nx_up, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps_up
+        y = torch.linspace(-(Ny_up-1)/2, (Ny_up-1)/2, Ny_up, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps_up
         X, Y = torch.meshgrid(x, y, indexing='ij')
         R = torch.sqrt(X**2 + Y**2)
         
         k = 2 * torch.pi / self.beam_config.lambda_
         
-        # Axicon phase: exp(-i * k * (n-1) * gamma * R)
-        axicon_phase_mask = -k * (axicon_n - 1) * axicon_angle * R
-        field_after_axicon = slm_field * torch.exp(1j * axicon_phase_mask)
+        # Axicon phase: exp(-i * k * gamma * R)
+        axicon_phase_mask = -k * torch.sin(torch.tensor(axicon_angle)) * R
+        field_after_axicon = slm_field_up * torch.exp(1j * axicon_phase_mask)
 
         # 3. Space to Space True ASM propagation 
         E_fourier = torch.fft.fft2(field_after_axicon, dim=(0,1), norm="ortho")
@@ -330,8 +430,123 @@ class HoloBeam(Beam):
         if convert_to_intensity:
             vol_field = torch.abs(vol_field)**2
 
+        print(f"Slice computed in {time.perf_counter() - t_loop_start:.2f}s")
         return vol_field
 
+    def propagateToVolume_Axicon2(self, axicon_angle: float, upsample_factor=int, phase_mask=None, beam_mean_amplitude=None, 
+                                 slm_amplitude_profile=None, H_asm=None, convert_to_intensity=False, roi_size=1000):
+        '''
+        Axicon lens forward propagation (ULTIMATE FIX: ROI-only Storage & Slice-by-Slice IFFT)
+        '''
+        if phase_mask is None: phase_mask = self.phase_mask_iter
+        if beam_mean_amplitude is None: beam_mean_amplitude = self.beam_mean_amplitude_iter
+        if slm_amplitude_profile is None: slm_amplitude_profile = self.slm_amplitude_profile
+
+        is_sparse = isinstance(H_asm, dict) and H_asm.get('type') == 'sparse'
+        t0 = time.perf_counter()
+
+        def forward_engine(p_mask, b_amp, s_prof):
+            # 1. SLM plane phase
+            aberration_phase = self._get_zernike_phase(p_mask.shape[-2:])
+            total_phase = p_mask + aberration_phase
+            slm_field = b_amp[None,None] * s_prof * torch.exp(1j * total_phase)
+            
+            # 2. Upsampling
+            Nx_orig, Ny_orig = self.beam_config.Nx, self.beam_config.Ny
+            ps_orig = self.beam_config.psSLM
+            
+            if upsample_factor > 1:
+                slm_field_up = slm_field.repeat_interleave(upsample_factor, dim=0).repeat_interleave(upsample_factor, dim=1)
+                Nx_up = Nx_orig * int(upsample_factor)
+                Ny_up = Ny_orig * int(upsample_factor)
+                ps_up = ps_orig / upsample_factor
+            else:
+                slm_field_up = slm_field
+                Nx_up, Ny_up = Nx_orig, Ny_orig
+                ps_up = ps_orig
+
+            # 3. Axicon phase mask (Chunked)
+            x = torch.linspace(-(Nx_up-1)/2, (Nx_up-1)/2, Nx_up, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps_up
+            y = torch.linspace(-(Ny_up-1)/2, (Ny_up-1)/2, Ny_up, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps_up
+            
+            Y2 = y.view(1, -1) ** 2  
+            k_sin_alpha = (2 * torch.math.pi / self.beam_config.lambda_) * torch.sin(torch.tensor(axicon_angle))
+            
+            chunk_size = 1024
+            for i in range(0, Nx_up, chunk_size):
+                end_idx = min(i + chunk_size, Nx_up)
+                X2_chunk = x[i:end_idx].view(-1, 1) ** 2
+                
+                R_chunk = torch.sqrt(X2_chunk + Y2)
+                phase_chunk = -k_sin_alpha * R_chunk
+                slm_field_up[i:end_idx] *= torch.exp(1j * phase_chunk)
+            
+            field_after_axicon = slm_field_up
+            del x, y, Y2, R_chunk, phase_chunk
+            
+            # 4. K-space Transformation
+            E_fourier = torch.fft.fft2(field_after_axicon, dim=(0,1), norm="ortho")
+            del field_after_axicon 
+
+            out_dtype = self.beam_config.fdtype if convert_to_intensity else self.beam_config.cdtype
+            
+            m_start = Nx_up // 2 - roi_size // 2
+            n_start = Ny_up // 2 - roi_size // 2
+
+            if is_sparse:
+                ring_mask = H_asm['ring_mask']
+                H_sparse = H_asm['H_asm_sparse']
+                Nz = H_sparse.shape[1]
+
+                E_fourier_sparse = E_fourier[ring_mask]
+                del E_fourier
+
+                vol_field = torch.zeros((roi_size, roi_size, Nz), dtype=out_dtype, device=self.beam_config.device)
+
+                for z in range(Nz):
+                    t_loop_start = time.perf_counter()
+                    
+                    E_dense = torch.zeros((Nx_up, Ny_up), dtype=self.beam_config.cdtype, device=self.beam_config.device)
+                    E_dense[ring_mask] = E_fourier_sparse * H_sparse[:, z]
+                    
+                    slice_spatial = torch.fft.ifft2(E_dense, dim=(0,1), norm="ortho")
+                    del E_dense
+                    
+                    # ROI cropping
+                    slice_cropped = slice_spatial[m_start:m_start+roi_size, n_start:n_start+roi_size]
+                    del slice_spatial 
+                    
+                    if convert_to_intensity:
+                        vol_field[:, :, z] = torch.abs(slice_cropped)**2
+                    else:
+                        vol_field[:, :, z] = slice_cropped
+                        
+                    #print(f"Slice {z+1}/{Nz} computed in {time.perf_counter() - t_loop_start:.2f}s")
+                
+                del E_fourier_sparse
+            else:
+                Nz = H_asm.shape[2]
+                vol_field = torch.zeros((roi_size, roi_size, Nz), dtype=out_dtype, device=self.beam_config.device)
+                
+                for z in range(Nz):
+                    E_dense = E_fourier * H_asm[:, :, z]
+                    slice_spatial = torch.fft.ifft2(E_dense, dim=(0,1), norm="ortho")
+                    
+                    slice_cropped = slice_spatial[m_start:m_start+roi_size, n_start:n_start+roi_size]
+                    del slice_spatial 
+                    
+                    if convert_to_intensity:
+                        vol_field[:, :, z] = torch.abs(slice_cropped)**2
+                    else:
+                        vol_field[:, :, z] = slice_cropped
+                del E_fourier
+
+            return vol_field
+
+        if phase_mask.requires_grad or (self.source_modulation_map is not None and self.source_modulation_map.requires_grad) or (self.zernike_coeffs is not None and self.zernike_coeffs.requires_grad):
+            return torch.utils.checkpoint.checkpoint(forward_engine, phase_mask, beam_mean_amplitude, slm_amplitude_profile, use_reentrant=False)
+        else:
+            return forward_engine(phase_mask, beam_mean_amplitude, slm_amplitude_profile)
 
     def propagateToMask(self, volume_field, H:torch.Tensor=None):
         '''
@@ -639,7 +854,7 @@ class HoloBeam(Beam):
         else:
             return reconstructed_intensity
 
-    def forward_proxy_2D_Axicon(self, slm_phase, axicon_angle=0.0174, axicon_n=1.5, source_profile=None, defocus=0):
+    def forward_proxy_2D_Axicon(self, slm_phase, axicon_angle=0.0174, axicon_n=1.5, upsample_factor=8, source_profile=None, defocus=0):
         """
         Return intensity at a specific focal plane.
         
@@ -659,9 +874,10 @@ class HoloBeam(Beam):
             use_profile = self.buildSLMAmplitudeProfile()
         beam_amp = torch.tensor(1.0, device=self.beam_config.device, dtype=self.beam_config.fdtype)
 
-        vol_field = self.propagateToVolume_Axicon(
+        vol_field = self.propagateToVolume_Axicon2(
                                                 axicon_angle=axicon_angle, 
                                                 axicon_n=axicon_n,
+                                                upsample_factor=upsample_factor,
                                                 phase_mask=slm_phase, 
                                                 beam_mean_amplitude=beam_amp, 
                                                 slm_amplitude_profile=use_profile,
