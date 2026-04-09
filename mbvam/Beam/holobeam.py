@@ -434,7 +434,7 @@ class HoloBeam(Beam):
         return vol_field
 
     def propagateToVolume_Axicon2(self, axicon_angle: float, upsample_factor=int, phase_mask=None, beam_mean_amplitude=None, 
-                                 slm_amplitude_profile=None, H_asm=None, convert_to_intensity=False, roi_size=1000):
+                                 slm_amplitude_profile=None, H_asm=None, convert_to_intensity=False, roi_size=1000, apply_spatial_filter=True):
         '''
         Axicon lens forward propagation (ULTIMATE FIX: ROI-only Storage & Slice-by-Slice IFFT)
         '''
@@ -450,6 +450,29 @@ class HoloBeam(Beam):
             aberration_phase = self._get_zernike_phase(p_mask.shape[-2:])
             total_phase = p_mask + aberration_phase
             slm_field = b_amp[None,None] * s_prof * torch.exp(1j * total_phase)
+
+            if apply_spatial_filter:
+                filter_size_um = 550
+                f1 = 0.250
+                slm_fft = torch.fft.fftshift(torch.fft.fft2(slm_field, norm="ortho"))
+
+                lam = self.beam_config.lambda_
+                physical_slm_pitch = 8e-6 
+                Nx_orig, Ny_orig = self.beam_config.Nx, self.beam_config.Ny
+
+                f_limit = (filter_size_um * 1e-6 / 2.0) / (lam * f1)
+
+                fx = torch.fft.fftshift(torch.fft.fftfreq(Nx_orig, d=physical_slm_pitch, device=self.beam_config.device))
+                fy = torch.fft.fftshift(torch.fft.fftfreq(Ny_orig, d=physical_slm_pitch, device=self.beam_config.device))
+                FX, FY = torch.meshgrid(fx, fy, indexing='ij')
+
+                filter_mask = ~((torch.abs(FX) <= f_limit) & (torch.abs(FY) <= f_limit))
+                filter_mask = filter_mask.to(slm_fft.dtype)
+
+                slm_fft_filtered = slm_fft * filter_mask
+                slm_field = torch.fft.ifft2(torch.fft.ifftshift(slm_fft_filtered), norm="ortho")
+
+                del slm_fft, slm_fft_filtered, FX, FY, filter_mask
             
             # 2. Upsampling
             Nx_orig, Ny_orig = self.beam_config.Nx, self.beam_config.Ny

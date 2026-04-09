@@ -74,18 +74,16 @@ def visualize_kspace_distortion(beam, phase_tensor, Cone_angle, upsample_factor)
 
 def debug_aliasing_1d(slice_2d, upsample_factor, axicon_NA, original_pixel_size=8e-6):
     """
-    1D Center Slice를 추출하여 Sinc(Fourier) 보간을 수행하고, 
-    주파수 도메인 분석을 통해 Aliasing 발생 여부를 진단합니다.
+    Aliasing analysis
     """
     center_y = slice_2d.shape[0] // 2
     slice_1d = slice_2d[center_y, :]
     N = len(slice_1d)
     
-    # 현재 시뮬레이션의 실제 픽셀 피치
     current_dx = original_pixel_size / upsample_factor
     x_discrete = np.arange(-N//2, N//2) * current_dx * 1e6 # um 단위
     
-    # 2. Sinc Interpolation (Fourier Zero-padding 방식)
+    # Sinc Interpolation (Fourier Zero-padding)
     interp_factor = 10
     N_interp = N * interp_factor
     
@@ -96,22 +94,19 @@ def debug_aliasing_1d(slice_2d, upsample_factor, axicon_NA, original_pixel_size=
     pad_start = (N_interp - N) // 2
     spectrum_padded[pad_start : pad_start + N] = spectrum
     
-    # IFFT로 공간 도메인 복원 (진폭 보정 필요)
     slice_1d_interp = np.abs(ifft(fftshift(spectrum_padded))) * interp_factor
     x_interp = np.arange(-N_interp//2, N_interp//2) * (current_dx / interp_factor) * 1e6
     
-    # 3. 주파수 스펙트럼 분석 (Aliasing 판별)
-    # 현재 샘플링 레이트에서의 나이퀴스트 주파수 한계
+    # Frequency spectrum analysis
     f_max = 1.0 / (2 * current_dx) 
     f_theory = 2 * axicon_NA / 473e-9
-    freqs = fftshift(fftfreq(N, d=current_dx)) / 1000 # 1/mm 단위로 변환
+    freqs = fftshift(fftfreq(N, d=current_dx)) / 1000 # 1/mm unit
     spectrum_mag = np.abs(spectrum)
     
-    # 4. 시각화 (Visualization)
+    # Visualization
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
     
-    # --- Plot 1: 공간 도메인 (Spatial Domain) ---
-    # 중심부만 줌인해서 보여주기 위해 범위 제한 (예: 중앙 200um)
+    # --- Plot 1: (Spatial Domain) ---
     zoom_range = 25 
     
     ax1.plot(x_interp, slice_1d_interp, 'b-', alpha=0.8, label='Sinc Interpolated (Continuous)')
@@ -123,11 +118,11 @@ def debug_aliasing_1d(slice_2d, upsample_factor, axicon_NA, original_pixel_size=
     ax1.legend()
     ax1.grid(True, alpha=0.3)
     
-    # --- Plot 2: 주파수 도메인 (Frequency Domain) ---
+    # --- Plot 2: (Frequency Domain) ---
     ax2.plot(freqs, spectrum_mag, 'k-', linewidth=1.5)
     ax2.fill_between(freqs, spectrum_mag, color='gray', alpha=0.3)
     
-    # Nyquist Limit 선 표시
+    # Nyquist Limit
     ax2.axvline(-f_max/1000, color='r', linestyle='--', label='Nyquist Limit')
     ax2.axvline(f_max/1000, color='r', linestyle='--')
     ax2.axvline(-f_theory/1000, color='g', linestyle='--', label='NA/lambda')
@@ -145,10 +140,11 @@ def debug_aliasing_1d(slice_2d, upsample_factor, axicon_NA, original_pixel_size=
 if __name__ == "__main__":
     
     #PHASE_MASK = r"C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment\Proxy_calibration_AltBeam_1image\Epoch_500\Proxy_train_pool\HollowRectangle\slm_phase.npy"
-    #PHASE_MASK = r"C:\Users\cowgr\Downloads\phase_mask_blue_line.npy"
-    PHASE_MASK = r"C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment\03_24_2026_Axicon_phase_opt\HollowRect100um\phase_mask_3d_gs_adam_moreGS.npy"
+    #PHASE_MASK = r"C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment\03_24_2026_Axicon_phase_opt\HollowRect100um\phase_mask_3d_gs_adam_moreGS.npy"
+    PHASE_MASK = r"G:\내 드라이브\CITL for 3DHL\Phase Mask Axicon\04_06_2026_HollowRect100um_NA0.34\phase_mask_3d_gs_adam_11slice.npy"
     phase_data = np.load(PHASE_MASK)
     phase_data = phase_data.T
+    plt.imshow(phase_data);plt.show()
     phase_data = phase_data.astype(np.float32)
     phase_recon = phase_data * (2*np.pi/1023)
     phase_tensor = torch.from_numpy(phase_recon).float()
@@ -157,14 +153,14 @@ if __name__ == "__main__":
     #phase_tensor = torch.ones_like(phase_tensor) * 1023
     
     beam_config = HoloBeamConfig()
-    beam_config.psSLM_physical = 8e-6
+    beam_config.psSLM_physical = 8e-6 * 0.8 ### Current 4f system has 0.8 M (f1 = 250, f2 = 200)
     ### UV
     #beam_config.lambda_ = 0.365e-6
     #beam_config.focal_SLM = 0.020
 
     ### BLUE
     beam_config.lambda_ = 0.473e-6
-    beam_config.focal_SLM = 0.12625
+    #beam_config.focal_SLM = 0.12625
     assert beam_config.focal_SLM is not False
 
     beam_config.binningFactor = 1
@@ -177,8 +173,8 @@ if __name__ == "__main__":
     
     ### Axicon config
     Axicon_grating_pitch = 1.396e-6 # for testing
-    upsample_factor = 6 # axicon spatial frequency is 0.339um (lambda/4NA)
-    Axicon_NA = 0.08 #beam_config.lambda_/Axicon_grating_pitch 
+    upsample_factor = 24 # axicon spatial frequency is 0.339um (lambda/4NA)
+    Axicon_NA = beam_config.lambda_/Axicon_grating_pitch 
 
     Cone_angle = np.arcsin(Axicon_NA)
     print(f'Axicon NA is {Axicon_NA} and the angle is {Cone_angle} accordingly')
@@ -187,18 +183,18 @@ if __name__ == "__main__":
     print('1. Initializing beam')
     beam = HoloBeam(beam_config)
     #z_eval_planes = beam.local_coord_vec[2] 
-    z_min = 0.0
-    z_max = 0.02
-    z_steps = 11
+    z_min = 0.001
+    z_max = 0.015
+    z_steps = 15
     z_eval_planes = torch.linspace(z_min, z_max, steps=z_steps, device=beam_config.device) #unit: m
     #H_asm = beam.build_true_ASM_TF(upsample_factor=upsample_factor, z_query=z_eval_planes)
-    H_asm = beam.build_axicon_ASM_TF(upsample_factor=upsample_factor, z_query=z_eval_planes, axicon_angle=Cone_angle, margin_factor=2500)
+    H_asm = beam.build_axicon_ASM_TF(upsample_factor=upsample_factor, z_query=z_eval_planes, axicon_angle=Cone_angle, margin_factor=3000)
     print('2. Transfer function computation has been completed')
 
     beam.slm_amplitude_profile = beam.buildSLMAmplitudeProfile()
     beam.beam_mean_amplitude_iter = torch.tensor(1.0, device=beam_config.device, dtype=beam_config.fdtype)
     #visualize_kspace_distortion(beam, phase_tensor, Cone_angle, upsample_factor)
-    recon = beam.propagateToVolume_Axicon2(axicon_angle=Cone_angle, upsample_factor=upsample_factor, phase_mask=phase_tensor, H_asm=H_asm, roi_size= 1600)
+    recon = beam.propagateToVolume_Axicon2(axicon_angle=Cone_angle, upsample_factor=upsample_factor, phase_mask=phase_tensor, H_asm=H_asm, roi_size= 1600, apply_spatial_filter=False)
     print('3. Axicon propagation is successfully computed')
     recon_np = recon.to('cpu').numpy()
     recon_intensity_np = np.abs(recon_np)**2
@@ -206,16 +202,16 @@ if __name__ == "__main__":
 
     z_index = recon_intensity_np.shape[2] // 2
 
-    for i in range(1, z_steps, 1):
+    for i in range(0, z_steps, 1):
         slice_2d = recon_intensity_np[:, :, i]
-        #np.save(r'C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment\Axicon_upsample_test\Accuracy_Comparison\HollowRect_Ring_Filtered_CZT_NA0.08_UR10_Z0.01.npy', slice_2d)
+        #np.save(r'C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment\Axicon_upsample_test\Accuracy_Comparison\WO_Spatial_Filter_Demagnified.npy', slice_2d)
         plt.figure(figsize=(10, 10))
         centX=1600*upsample_factor/2
         centY=1200*upsample_factor/2
         #slice_2d = slice_2d[int(centY-800): int(centY+800), int(centX-800): int(centX+800)]
         plt.imshow(slice_2d, cmap='hot', interpolation='nearest')
         plt.colorbar(label='Intensity')
-        plt.title(f"Bessel Beam Intensity - Slice at z = {round(i * z_max / (z_steps-1)*1000,1)}mm")
+        #plt.title(f"Bessel Beam Intensity - Slice at z = {round(i * z_max / (z_steps-1)*1000,1)}mm")
 
         #plt.show()    
         #plt.savefig(r'C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment\Axicon_upsample_test\Accuracy_Comparison\New_MF100_HollowRect_NA'+str(round(Axicon_NA,3))+r'_Z'+str(i)+r'_PS'+str(round(8/upsample_factor, 3))+r'um.png', dpi=150)
