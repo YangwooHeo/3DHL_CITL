@@ -493,6 +493,7 @@ if __name__ == '__main__':
     save_directory = r"C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment\03_24_2026_Axicon_phase_opt\HollowRect100um"
 
     beam_config = HoloBeamConfig()
+    beam_config.psSLM_physical = 8e-6 * 0.8 
     beam_config.lambda_ = 0.473e-6
     assert beam_config.focal_SLM is not False, 'Effective Focal length needs to be set.'
     beam_config.binningFactor = 1
@@ -541,13 +542,14 @@ if __name__ == '__main__':
     rescaled_image = (final_image.T / 255.0).astype(np.float32)
 
     # ── Axicon / z config ─────────────────────────────────────────────────────
-    upsample_factor = 6
-    Axicon_NA       = 0.08
+    Axicon_grating_pitch = 1.396e-6 # for testing
+    upsample_factor = 20
+    Axicon_NA       = beam.lambda_ /Axicon_grating_pitch  #0.08
     Cone_angle      = np.arcsin(Axicon_NA)
 
-    z_min   = 0.01
-    z_max   = 0.02
-    z_steps = 21
+    z_min   = 0.001
+    z_max   = 0.015
+    z_steps = 15
     z_eval_planes = torch.linspace(z_min, z_max, steps=z_steps,
                                     device=beam_config.device)
 
@@ -555,7 +557,7 @@ if __name__ == '__main__':
         upsample_factor=upsample_factor,
         z_query=z_eval_planes,
         axicon_angle=Cone_angle,
-        margin_factor=2000,
+        margin_factor=8000,
     )
 
     # ── 2D optimization (single z-plane) ─────────────────────────────────────
@@ -570,9 +572,9 @@ if __name__ == '__main__':
     optimized_phase, recon_vol, loss, phase_slm = optimize_hybrid_gs_adam_3d(
         beam_obj=beam, target_image_np=rescaled_image,
         cone_angle=Cone_angle, H_asm=H_asm,
-        gs_iters=50,          # 3D GS warm-up  (10–20 권장)
-        adam_iters=200,       # Adam refinement
-        lr=0.01,              # 2D보다 낮게: 3D gradient는 Nz배 노이즈
+        gs_iters=50,          
+        adam_iters=200,       
+        lr=0.01,              
         upsample_factor=upsample_factor,
         roi_size=1600,
         loss_mode='per_slice_norm',   # 'per_slice_norm' | 'raw_mean' | 'worst_slice'
