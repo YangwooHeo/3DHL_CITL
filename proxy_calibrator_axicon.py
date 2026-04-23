@@ -72,6 +72,7 @@ class ProxyCalibrationDataset(Dataset):
         s = self.samples[idx]
 
         phase_data = np.load(s['phase_path']).T.astype(np.float32)
+        phase_data = phase_data[::-1, :] ## 04_22_2026 Fix: Image flip compensation
         phase_rad  = phase_data * (2 * np.pi / 1023)
         phase_tensor = torch.from_numpy(phase_rad).float()
 
@@ -89,14 +90,43 @@ class ProxyCalibrationDataset(Dataset):
 # ─────────────────────────────────────────────────────────────────────────────
 # Forward helper for axicon proxy
 # ─────────────────────────────────────────────────────────────────────────────
-
+def get_center_crop_slice(shape, crop_ratio):
+    """
+    Return (y_slice, x_slice, (y0, y1, x0, x1)) for a centered crop.
+    crop_ratio in (0, 1]; 1.0 = full image, 0.5 = central 50%.
+    """
+    H, W = shape
+    ch = int(round(H * crop_ratio))
+    cw = int(round(W * crop_ratio))
+    y0 = (H - ch) // 2
+    x0 = (W - cw) // 2
+    y1 = y0 + ch
+    x1 = x0 + cw
+    return slice(y0, y1), slice(x0, x1), (y0, y1, x0, x1)
+ 
+ 
+def draw_roi_overlay(ax, bounds, color='cyan', linewidth=1.2, linestyle='--'):
+    """Draw a thin rectangle on an imshow axis given (y0, y1, x0, x1)."""
+    y0, y1, x0, x1 = bounds
+    # imshow uses (col=x, row=y). Rectangle takes xy=(x, y).
+    from matplotlib.patches import Rectangle
+    rect = Rectangle((x0, y0), x1 - x0, y1 - y0,
+                     fill=False, edgecolor=color,
+                     linewidth=linewidth, linestyle=linestyle)
+    ax.add_patch(rect)
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# Forward helper for axicon proxy
+# ─────────────────────────────────────────────────────────────────────────────
+ 
 def axicon_forward_proxy(beam, slm_phase, H_asm, cone_angle,
                           upsample_factor, roi_size, z_target_idx,
                           use_profile):
     """
     Run the axicon forward model and return intensity at a single z plane,
     scaled by camera_scale_factor.
-
+ 
     This is the axicon analogue of `beam.forward_proxy_2D` from the lens version.
     Written as a standalone function (rather than a method of HoloBeam) so that
     it's self-contained and easy to debug — the in-class forward_proxy_2D_Axicon
@@ -104,7 +134,8 @@ def axicon_forward_proxy(beam, slm_phase, H_asm, cone_angle,
     """
     beam_amp = torch.tensor(1.0, device=beam.beam_config.device,
                             dtype=beam.beam_config.fdtype)
-
+ 
+    # NOTE: convert_to_intensity=False — we want complex field so we can pick
     # a slice and take |·|^2 once. Calling with True and then |·|^2 again
     # (as the existing forward_proxy_2D_Axicon does) squares the intensity
     # which is wrong.
@@ -120,25 +151,26 @@ def axicon_forward_proxy(beam, slm_phase, H_asm, cone_angle,
     )
     slice_cplx = vol_field[:, :, z_target_idx]
     intensity  = torch.abs(slice_cplx) ** 2                 # [roi, roi]
-
+ 
     # Global intensity scale (abs to keep it positive)
     if beam.camera_scale_factor is not None:
         intensity = intensity * torch.abs(beam.camera_scale_factor)
     return intensity
-
-
+ 
+ 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training
 # ─────────────────────────────────────────────────────────────────────────────
-
+ 
 def train_proxy_model_axicon(beam, dataloader, H_asm, cone_angle,
                               upsample_factor, roi_size, z_target_idx,
                               epochs=150, device='cuda',
                               loss_normalize='per_sample_rms',
-                              source_clamp=(1e-6, 5.0)):
+                              source_clamp=(1e-6, 5.0),
+                              center_crop_ratio=1.0):
     """
     Calibrate proxy parameters (Zernike, source map, scale) for the axicon system.
-
+ 
     loss_normalize
     --------------
     'per_sample_rms'  (default, recommended for axicon):
@@ -147,63 +179,71 @@ def train_proxy_model_axicon(beam, dataloader, H_asm, cone_angle,
         differ by orders of magnitude, and plain MSE lets bright samples dominate
         the gradient. RMS (not max) normalization is also less sensitive to a few
         hot pixels that are common in axicon speckle.
-
+ 
     'per_sample_max':
         Normalize by max of each sample. Simpler but more sensitive to outlier
         pixels.
-
+ 
     'none':
         Raw MSE on un-normalized outputs — proxy must learn the absolute scale
         via camera_scale_factor. This is what the lens version effectively did
         but is usually unstable for axicon.
-
+ 
     source_clamp
     ------------
     (min, max) range for source_modulation_map. The default 5.0 upper bound
     prevents non-physical runaway that the original code allowed.
+ 
+    center_crop_ratio
+    -----------------
+    Fraction of image (centered) used for loss computation. 1.0 = full image,
+    0.7 = central 70% region (recommended when camera frame has mirrored-pad
+    artifacts at the edges that you don't want the proxy to fit). Applied
+    AFTER per-sample normalization — normalization uses the full image so the
+    RMS reference is stable, only the MSE is restricted to the crop.
     """
     print(f"\n>>> Start Axicon Proxy Calibration on {device}...")
-
+ 
     beam.init_proxy_params(num_zernike=20, device=device)
     beam.beam_config.device = device
-
+ 
     optimizer = optim.Adam([
         {'params': beam.zernike_coeffs,        'lr': 0.05},
         {'params': beam.source_modulation_map, 'lr': 0.05},
         {'params': beam.camera_scale_factor,   'lr': 0.02},
     ])
-
+ 
     loss_history = []
     progress_bar = tqdm(range(epochs), desc="Axicon Calibration")
-
+ 
     for epoch in progress_bar:
         epoch_loss = 0.0
         grad_src_mean = 0.0
         grad_znk_mean = 0.0
         n_batches = 0
-
+ 
         for phases, targets, _ in dataloader:
             phases  = phases.to(device)
             targets = targets.to(device)
-
+ 
             optimizer.zero_grad()
-
+ 
             batch_loss = 0.0
             B = phases.shape[0]
-
+ 
             # Per-sample forward + loss (axicon forward is too large to batch
             # in the tensor dim — upsampled FFTs would OOM). We accumulate loss,
             # then call backward once per batch so Adam step sees the sum.
             for i in range(B):
                 single_phase = phases[i]
-
+ 
                 sim = axicon_forward_proxy(
                     beam, single_phase, H_asm, cone_angle,
                     upsample_factor, roi_size, z_target_idx,
                     use_profile=beam.buildSLMAmplitudeProfile(),
                 )
                 tgt = targets[i]
-
+ 
                 # Resize sim to match camera resolution if needed
                 if sim.shape != tgt.shape:
                     sim_r = F.interpolate(
@@ -211,8 +251,8 @@ def train_proxy_model_axicon(beam, dataloader, H_asm, cone_angle,
                         size=tgt.shape, mode='area').squeeze()
                 else:
                     sim_r = sim
-
-                # Per-sample normalization
+ 
+                # Per-sample normalization (full image — RMS reference stable)
                 if loss_normalize == 'per_sample_rms':
                     sim_n = sim_r / (torch.sqrt((sim_r**2).mean()) + 1e-8)
                     tgt_n = tgt   / (torch.sqrt((tgt**2).mean())   + 1e-8)
@@ -221,41 +261,48 @@ def train_proxy_model_axicon(beam, dataloader, H_asm, cone_angle,
                     tgt_n = tgt   / (tgt.max()   + 1e-8)
                 else:  # 'none'
                     sim_n, tgt_n = sim_r, tgt
-
+ 
+                # Optional center-crop restriction for the MSE
+                # (useful when camera frame has mirror-padded regions at edges)
+                if center_crop_ratio < 1.0:
+                    ys, xs, _ = get_center_crop_slice(sim_n.shape,
+                                                      center_crop_ratio)
+                    sim_n = sim_n[ys, xs]
+                    tgt_n = tgt_n[ys, xs]
+ 
                 batch_loss = batch_loss + F.mse_loss(sim_n, tgt_n)
-
+ 
             # Average across batch so lr is consistent w.r.t. batch_size
             batch_loss = batch_loss / B
             batch_loss.backward()
-
+ 
             if beam.source_modulation_map.grad is not None:
                 grad_src_mean += beam.source_modulation_map.grad.abs().mean().item()
             if beam.zernike_coeffs.grad is not None:
                 grad_znk_mean += beam.zernike_coeffs.grad.abs().mean().item()
-
+ 
             optimizer.step()
-
+ 
             # Bounded constraint on source map
             with torch.no_grad():
                 beam.source_modulation_map.clamp_(min=source_clamp[0],
                                                    max=source_clamp[1])
-
+ 
             epoch_loss += batch_loss.item()
             n_batches  += 1
-
+ 
         avg_loss = epoch_loss / max(n_batches, 1)
         loss_history.append(avg_loss)
-
+ 
         progress_bar.set_postfix({
             'Loss':     f"{avg_loss:.5f}",
             'Scale':    f"{beam.camera_scale_factor.item():.2e}",
             'SrcGrad':  f"{grad_src_mean / max(n_batches,1):.2e}",
             'ZnkGrad':  f"{grad_znk_mean / max(n_batches,1):.2e}",
         })
-
+ 
     print(">>> Calibration Finished.")
     return loss_history
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Utility / metrics (unchanged, with some cleanup)
@@ -369,7 +416,7 @@ def save_proxy_params(beam, filepath):
 if __name__ == "__main__":
 
     # ── Paths / device ───────────────────────────────────────────────────────
-    DATA_ROOT = r'G:\공유 드라이브\taylorlab\3DHL\CITL\Proxy_Train_Pool_1'
+    DATA_ROOT = r'H:\Shared drives\taylorlab\3DHL\CITL\Proxy_Train_Pool_1'
     DEVICE    = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # ── Beam config ──────────────────────────────────────────────────────────
@@ -388,7 +435,7 @@ if __name__ == "__main__":
 
     # ── Axicon config ────────────────────────────────────────────────────────
     Axicon_grating_pitch = 1.396e-6
-    upsample_factor      = 20
+    upsample_factor      = 24
     Axicon_NA            = beam_config.lambda_ / Axicon_grating_pitch
     Cone_angle           = float(np.arcsin(Axicon_NA))
 
@@ -399,7 +446,7 @@ if __name__ == "__main__":
     # z_eval_planes covers a small window around it so ASM is consistent.
     z_camera      = 0.009
     z_min, z_max  = z_camera - 0.002, z_camera + 0.002
-    z_steps       = 3
+    z_steps       = 1
     z_eval_planes = torch.linspace(z_min, z_max, steps=z_steps,
                                     device=beam_config.device)
     z_target_idx  = z_steps // 2    # center plane = z_camera
@@ -449,20 +496,22 @@ if __name__ == "__main__":
 
     # ── Train ────────────────────────────────────────────────────────────────
     print("4. Training proxy model...")
+    CENTER_CROP_RATIO = 0.7     # 1.0 = full frame, 0.7 = central 70%
     loss_history = train_proxy_model_axicon(
-        beam            = beam,
-        dataloader      = dataloader,
-        H_asm           = H_asm,
-        cone_angle      = Cone_angle,
-        upsample_factor = upsample_factor,
-        roi_size        = roi_size,
-        z_target_idx    = z_target_idx,
-        epochs          = 200,
-        device          = DEVICE,
-        loss_normalize  = 'per_sample_rms',
+        beam              = beam,
+        dataloader        = dataloader,
+        H_asm             = H_asm,
+        cone_angle        = Cone_angle,
+        upsample_factor   = upsample_factor,
+        roi_size          = roi_size,
+        z_target_idx      = z_target_idx,
+        epochs            = 25,
+        device            = DEVICE,
+        loss_normalize    = 'per_sample_rms',
+        center_crop_ratio = CENTER_CROP_RATIO,
     )
     save_proxy_params(beam, 'proxy_model_params_axicon.pt')
-
+ 
     # ── Proxy snapshot (after training) ──────────────────────────────────────
     print(">>> Snapshotting proxy after training...")
     with torch.no_grad():
@@ -474,10 +523,10 @@ if __name__ == "__main__":
         proxy_norm     = quantile_normalize(proxy_raw, q_max=0.999)
         proxy_resized  = force_resize(proxy_norm, target_res=(500, 500))
         target_resized = force_resize(fixed_target, target_res=(500, 500))
-
+ 
         proxy_snapshot  = proxy_resized.detach().cpu().numpy()
         target_snapshot = target_resized.detach().cpu().numpy()
-
+ 
     # ── Plots ────────────────────────────────────────────────────────────────
     print("5. Saving plots...")
     plt.figure()
@@ -487,23 +536,39 @@ if __name__ == "__main__":
     plt.grid(True)
     plt.savefig('Loss_curve_axicon.png')
     plt.close()
-
+ 
     mse_base  = np.mean((target_snapshot - baseline_snapshot)**2)
     mse_proxy = np.mean((target_snapshot - proxy_snapshot)**2)
-
+ 
+    # Dataset transposes camera images to match (Nx, Ny) phase convention.
+    # Revert .T so plots show the ORIGINAL camera orientation (row=y, col=x),
+    # matching how the PNG looks in a file viewer.
+    target_disp   = target_snapshot.T
+    baseline_disp = baseline_snapshot.T
+    proxy_disp    = proxy_snapshot.T
+ 
+    # ROI bounds (on display-space array, same shape as *_disp)
+    _, _, roi_bounds = get_center_crop_slice(target_disp.shape, CENTER_CROP_RATIO)
+ 
     fig, ax = plt.subplots(1, 3, figsize=(18, 7))
-    ax[0].imshow(target_snapshot,   cmap='gray', vmin=0, vmax=1)
+    ax[0].imshow(target_disp,   cmap='gray', vmin=0, vmax=1)
     ax[0].set_title("Target (Camera)")
-    ax[1].imshow(baseline_snapshot, cmap='gray', vmin=0, vmax=1)
+    draw_roi_overlay(ax[0], roi_bounds)
+ 
+    ax[1].imshow(baseline_disp, cmap='gray', vmin=0, vmax=1)
     ax[1].set_title(f"Baseline (Before)\nMSE: {mse_base:.4f}")
-    ax[2].imshow(proxy_snapshot,    cmap='gray', vmin=0, vmax=1)
+    draw_roi_overlay(ax[1], roi_bounds)
+ 
+    ax[2].imshow(proxy_disp,    cmap='gray', vmin=0, vmax=1)
     ax[2].set_title(f"Proxy (After)\nMSE: {mse_proxy:.4f}")
+    draw_roi_overlay(ax[2], roi_bounds)
+ 
     plt.tight_layout()
-    plt.savefig('before_after_comparison_axicon.png')
+    plt.savefig('before_after_comparison_axicon.png', dpi=150)
     plt.close()
-
+ 
     analyze_zernike_results(beam, save_path='zernike_analysis_axicon.png')
-
+ 
     source_map = beam.source_modulation_map.detach().cpu().squeeze().numpy()
     plt.figure(figsize=(6, 6))
     plt.imshow(source_map, cmap='inferno', aspect='auto',
@@ -513,7 +578,7 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.savefig('trained_source_map_axicon.png')
     plt.close()
-
+ 
     # ── Per-sample MSE diagnostic ────────────────────────────────────────────
     print("Calculating per-sample MSE...")
     names, mses = [], []
@@ -522,7 +587,7 @@ if __name__ == "__main__":
             phase, real, name = dataset[i]
             phase = phase.to(DEVICE)
             real  = real.to(DEVICE)
-
+ 
             pred = axicon_forward_proxy(
                 beam, phase, H_asm, Cone_angle,
                 upsample_factor, roi_size, z_target_idx,
@@ -531,14 +596,14 @@ if __name__ == "__main__":
             if pred.shape != real.shape:
                 pred = F.interpolate(pred.unsqueeze(0).unsqueeze(0),
                                       size=real.shape, mode='area').squeeze()
-
+ 
             # Per-sample RMS normalize (consistent with training loss)
             pred_n = pred / (torch.sqrt((pred**2).mean()) + 1e-8)
             real_n = real / (torch.sqrt((real**2).mean()) + 1e-8)
-
+ 
             names.append(name)
             mses.append(F.mse_loss(pred_n, real_n).item())
-
+ 
     plt.figure(figsize=(12, 6))
     plt.plot(names, mses, marker='o', linestyle='None', color='blue', markersize=8)
     plt.xlabel("Sample"); plt.ylabel("MSE (RMS-normalized)")
@@ -548,5 +613,6 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.savefig('MSE_per_sample_axicon.png')
     plt.close()
-
+ 
     print("Done.")
+
