@@ -22,18 +22,43 @@ def _prepare_target(target_np, roi_size, device, fdtype):
     return t / (t.max() + 1e-8)
 
 
-def _axicon_phase_map(Nx_up, Ny_up, ps_up, cone_angle, lambda_, device, fdtype):
+def _axicon_radial_frequency(cone_angle, lambda_, device, fdtype, n_medium=1.0,
+                             axicon_angle_in_medium=False,
+                             axicon_transverse_frequency=None):
+    if axicon_transverse_frequency is not None:
+        return torch.as_tensor(axicon_transverse_frequency, dtype=fdtype, device=device)
+
+    angle = torch.as_tensor(cone_angle, dtype=fdtype, device=device)
+    n_medium = torch.as_tensor(n_medium, dtype=fdtype, device=device)
+    if torch.any(n_medium <= 0):
+        raise ValueError("n_medium must be positive.")
+
+    if axicon_angle_in_medium:
+        return n_medium * torch.sin(angle) / lambda_
+    return torch.sin(angle) / lambda_
+
+
+def _axicon_phase_map(Nx_up, Ny_up, ps_up, cone_angle, lambda_, device, fdtype,
+                      n_medium=1.0, axicon_angle_in_medium=False,
+                      axicon_transverse_frequency=None):
     x = torch.linspace(-(Nx_up-1)/2, (Nx_up-1)/2, Nx_up, device=device, dtype=fdtype) * ps_up
     y = torch.linspace(-(Ny_up-1)/2, (Ny_up-1)/2, Ny_up, device=device, dtype=fdtype) * ps_up
     X, Y = torch.meshgrid(x, y, indexing='ij')
     R = torch.sqrt(X**2 + Y**2)
-    k_sin_a = (2 * torch.pi / lambda_) * torch.sin(
-        torch.tensor(cone_angle, dtype=fdtype, device=device))
+    radial_frequency = _axicon_radial_frequency(
+        cone_angle, lambda_, device, fdtype,
+        n_medium=n_medium,
+        axicon_angle_in_medium=axicon_angle_in_medium,
+        axicon_transverse_frequency=axicon_transverse_frequency,
+    )
+    k_sin_a = 2 * torch.pi * radial_frequency
     return -k_sin_a * R
 
 
 @torch.no_grad()
-def _forward_complex_volume(phase, beam_obj, cone_angle, upsample_factor, H_asm, roi_size):
+def _forward_complex_volume(phase, beam_obj, cone_angle, upsample_factor, H_asm, roi_size,
+                            n_medium=1.0, axicon_angle_in_medium=False,
+                            axicon_transverse_frequency=None):
     """Forward pass → complex volume [roi, roi, Nz]. No gradient."""
     return beam_obj.propagateToVolume_Axicon2(
         axicon_angle=cone_angle,
@@ -42,12 +67,17 @@ def _forward_complex_volume(phase, beam_obj, cone_angle, upsample_factor, H_asm,
         roi_size=roi_size,
         H_asm=H_asm,
         convert_to_intensity=False,
+        n_medium=n_medium,
+        axicon_angle_in_medium=axicon_angle_in_medium,
+        axicon_transverse_frequency=axicon_transverse_frequency,
     )
 
 
 @torch.no_grad()
 def _backward_adjoint_single(E_out_z, z_idx, beam_obj, cone_angle,
-                              upsample_factor, H_asm, roi_size):
+                              upsample_factor, H_asm, roi_size,
+                              n_medium=1.0, axicon_angle_in_medium=False,
+                              axicon_transverse_frequency=None):
     """
     Adjoint back-projection for a single z-plane.
     Returns E_slm contribution [Nx, Ny] complex.
@@ -84,7 +114,10 @@ def _backward_adjoint_single(E_out_z, z_idx, beam_obj, cone_angle,
 
     # Step 5: adjoint of ×axicon_phase → ×conj(axicon_phase)
     phi_ax = _axicon_phase_map(Nx_up, Ny_up, ps_up, cone_angle,
-                                cfg.lambda_, device, fdtype)
+                                cfg.lambda_, device, fdtype,
+                                n_medium=n_medium,
+                                axicon_angle_in_medium=axicon_angle_in_medium,
+                                axicon_transverse_frequency=axicon_transverse_frequency)
     E_slm_up = E_ax_back * torch.exp(-1j * phi_ax)
 
     # Step 6: adjoint of repeat_interleave → reshape + sum + normalize
@@ -99,7 +132,9 @@ def _backward_adjoint_single(E_out_z, z_idx, beam_obj, cone_angle,
 
 def gs_axicon_init_3d(beam_obj, target_image_np, cone_angle, H_asm,
                       num_iters=15, upsample_factor=6, roi_size=1600,
-                      verbose=True):
+                      verbose=True, n_medium=1.0,
+                      axicon_angle_in_medium=False,
+                      axicon_transverse_frequency=None):
     """
     GS-adjoint warm-up for multiple z-planes.
 
@@ -132,7 +167,10 @@ def gs_axicon_init_3d(beam_obj, target_image_np, cone_angle, H_asm,
 
         # ── Forward: full volume ─────────────────────────────────────────────
         E_vol = _forward_complex_volume(phase, beam_obj, cone_angle,
-                                         upsample_factor, H_asm, roi_size)
+                                         upsample_factor, H_asm, roi_size,
+                                         n_medium=n_medium,
+                                         axicon_angle_in_medium=axicon_angle_in_medium,
+                                         axicon_transverse_frequency=axicon_transverse_frequency)
         # E_vol: [roi, roi, Nz] complex
 
         # ── Accumulate adjoint contributions from all z-planes ───────────────
@@ -149,7 +187,10 @@ def gs_axicon_init_3d(beam_obj, target_image_np, cone_angle, H_asm,
 
             # Adjoint back-projection for this plane
             E_slm_z = _backward_adjoint_single(E_out_c, z, beam_obj, cone_angle,
-                                                upsample_factor, H_asm, roi_size)
+                                                upsample_factor, H_asm, roi_size,
+                                                n_medium=n_medium,
+                                                axicon_angle_in_medium=axicon_angle_in_medium,
+                                                axicon_transverse_frequency=axicon_transverse_frequency)
             E_slm_accum += E_slm_z
 
         # ── SLM amplitude constraint (normalize accumulation by Nz) ──────────
@@ -161,7 +202,10 @@ def gs_axicon_init_3d(beam_obj, target_image_np, cone_angle, H_asm,
         # ── Verbose: evaluate per-slice normalized MSE ───────────────────────
         if verbose and (i + 1) % 5 == 0:
             E_check = _forward_complex_volume(phase, beam_obj, cone_angle,
-                                               upsample_factor, H_asm, roi_size)
+                                               upsample_factor, H_asm, roi_size,
+                                               n_medium=n_medium,
+                                               axicon_angle_in_medium=axicon_angle_in_medium,
+                                               axicon_transverse_frequency=axicon_transverse_frequency)
             mse_per_z = []
             for z in range(Nz):
                 I_z    = torch.abs(E_check[:, :, z]) ** 2
@@ -232,7 +276,9 @@ def _loss_3d(recon_vol, target_I, mode='per_slice_norm'):
 def optimize_hybrid_gs_adam_3d(beam_obj, target_image_np, cone_angle, H_asm,
                                 gs_iters=15, adam_iters=300, lr=0.05,
                                 upsample_factor=6, roi_size=1600,
-                                loss_mode='per_slice_norm'):
+                                loss_mode='per_slice_norm', n_medium=1.0,
+                                axicon_angle_in_medium=False,
+                                axicon_transverse_frequency=None):
     """
     Two-stage 3D phase optimizer for SLM + Axicon system.
 
@@ -273,12 +319,18 @@ def optimize_hybrid_gs_adam_3d(beam_obj, target_image_np, cone_angle, H_asm,
         beam_obj, target_image_np, cone_angle, H_asm,
         num_iters=gs_iters, upsample_factor=upsample_factor,
         roi_size=roi_size, verbose=True,
+        n_medium=n_medium,
+        axicon_angle_in_medium=axicon_angle_in_medium,
+        axicon_transverse_frequency=axicon_transverse_frequency,
     )
 
     # Snapshot after GS for visualization
     with torch.no_grad():
         E_gs_vol = _forward_complex_volume(init_phase, beam_obj, cone_angle,
-                                            upsample_factor, H_asm, roi_size)
+                                            upsample_factor, H_asm, roi_size,
+                                            n_medium=n_medium,
+                                            axicon_angle_in_medium=axicon_angle_in_medium,
+                                            axicon_transverse_frequency=axicon_transverse_frequency)
         I_gs_vol = torch.abs(E_gs_vol) ** 2   # [roi, roi, Nz]
 
     # ══ Stage 2: Adam refinement (3D) ════════════════════════════════════════
@@ -301,6 +353,9 @@ def optimize_hybrid_gs_adam_3d(beam_obj, target_image_np, cone_angle, H_asm,
             roi_size=roi_size,
             H_asm=H_asm,
             convert_to_intensity=False,
+            n_medium=n_medium,
+            axicon_angle_in_medium=axicon_angle_in_medium,
+            axicon_transverse_frequency=axicon_transverse_frequency,
         )
         recon_I_vol = torch.abs(recon_vol) ** 2   # [roi, roi, Nz]
 
@@ -378,23 +433,35 @@ def _prepare_target(target_np, roi_size, device, fdtype):
     return t / (t.max() + 1e-8)
 
 
-def _forward_complex(phase, beam_obj, cone_angle, upsample_factor, H_asm, roi_size, z_idx):
+def _forward_complex(phase, beam_obj, cone_angle, upsample_factor, H_asm, roi_size, z_idx,
+                     n_medium=1.0, axicon_angle_in_medium=False,
+                     axicon_transverse_frequency=None):
     vol = beam_obj.propagateToVolume_Axicon2(
         axicon_angle=cone_angle, upsample_factor=upsample_factor,
         phase_mask=phase, roi_size=roi_size, H_asm=H_asm, convert_to_intensity=False,
+        n_medium=n_medium,
+        axicon_angle_in_medium=axicon_angle_in_medium,
+        axicon_transverse_frequency=axicon_transverse_frequency,
     )
     return vol[:, :, z_idx]
 
 
 def _backward_adjoint(E_out, beam_obj, cone_angle, upsample_factor,
-                       H_asm, roi_size, z_idx):
+                       H_asm, roi_size, z_idx, n_medium=1.0,
+                       axicon_angle_in_medium=False,
+                       axicon_transverse_frequency=None):
     return _backward_adjoint_single(E_out, z_idx, beam_obj, cone_angle,
-                                    upsample_factor, H_asm, roi_size)
+                                    upsample_factor, H_asm, roi_size,
+                                    n_medium=n_medium,
+                                    axicon_angle_in_medium=axicon_angle_in_medium,
+                                    axicon_transverse_frequency=axicon_transverse_frequency)
 
 
 def gs_axicon_init(beam_obj, target_image_np, cone_angle, H_asm,
-                   num_iters=10, upsample_factor=6, roi_size=1600,
-                   z_target_idx=0, verbose=True):
+                    num_iters=10, upsample_factor=6, roi_size=1600,
+                    z_target_idx=0, verbose=True, n_medium=1.0,
+                    axicon_angle_in_medium=False,
+                    axicon_transverse_frequency=None):
     cfg = beam_obj.beam_config
     device, fdtype, cdtype = cfg.device, cfg.fdtype, cfg.cdtype
     target_I = _prepare_target(target_image_np, roi_size, device, fdtype)
@@ -404,18 +471,27 @@ def gs_axicon_init(beam_obj, target_image_np, cone_angle, H_asm,
 
     for i in range(num_iters):
         E_out = _forward_complex(phase, beam_obj, cone_angle,
-                                  upsample_factor, H_asm, roi_size, z_target_idx)
+                                  upsample_factor, H_asm, roi_size, z_target_idx,
+                                  n_medium=n_medium,
+                                  axicon_angle_in_medium=axicon_angle_in_medium,
+                                  axicon_transverse_frequency=axicon_transverse_frequency)
         E_rms   = torch.sqrt((torch.abs(E_out)**2).mean() + 1e-30)
         tgt_rms = torch.sqrt((target_A**2).mean() + 1e-30)
         scale   = E_rms / (tgt_rms + 1e-30)
         E_out_c = target_A * scale * torch.exp(1j * torch.angle(E_out))
         E_slm   = _backward_adjoint(E_out_c, beam_obj, cone_angle,
-                                     upsample_factor, H_asm, roi_size, z_target_idx)
+                                     upsample_factor, H_asm, roi_size, z_target_idx,
+                                     n_medium=n_medium,
+                                     axicon_angle_in_medium=axicon_angle_in_medium,
+                                     axicon_transverse_frequency=axicon_transverse_frequency)
         phase   = torch.angle(amp_prof * torch.exp(1j * torch.angle(E_slm)))
 
         if verbose and (i + 1) % 5 == 0:
             E_c  = _forward_complex(phase, beam_obj, cone_angle,
-                                     upsample_factor, H_asm, roi_size, z_target_idx)
+                                     upsample_factor, H_asm, roi_size, z_target_idx,
+                                     n_medium=n_medium,
+                                     axicon_angle_in_medium=axicon_angle_in_medium,
+                                     axicon_transverse_frequency=axicon_transverse_frequency)
             I_n  = torch.abs(E_c)**2
             I_n  = I_n / (I_n.max() + 1e-8)
             mse  = torch.nn.functional.mse_loss(I_n, target_I).item()
@@ -425,7 +501,9 @@ def gs_axicon_init(beam_obj, target_image_np, cone_angle, H_asm,
 
 def optimize_hybrid_gs_adam(beam_obj, target_image_np, cone_angle, H_asm,
                              gs_iters=10, adam_iters=100, lr=0.02,
-                             upsample_factor=6, roi_size=1600, z_target_idx=0):
+                             upsample_factor=6, roi_size=1600, z_target_idx=0,
+                             n_medium=1.0, axicon_angle_in_medium=False,
+                             axicon_transverse_frequency=None):
     device = beam_obj.beam_config.device
     fdtype = beam_obj.beam_config.fdtype
     target_I = _prepare_target(target_image_np, roi_size, device, fdtype)
@@ -435,10 +513,16 @@ def optimize_hybrid_gs_adam(beam_obj, target_image_np, cone_angle, H_asm,
     print("=" * 55)
     init_phase = gs_axicon_init(beam_obj, target_image_np, cone_angle, H_asm,
                                  num_iters=gs_iters, upsample_factor=upsample_factor,
-                                 roi_size=roi_size, z_target_idx=z_target_idx)
+                                  roi_size=roi_size, z_target_idx=z_target_idx,
+                                  n_medium=n_medium,
+                                  axicon_angle_in_medium=axicon_angle_in_medium,
+                                  axicon_transverse_frequency=axicon_transverse_frequency)
     with torch.no_grad():
         E_gs = _forward_complex(init_phase, beam_obj, cone_angle,
-                                  upsample_factor, H_asm, roi_size, z_target_idx)
+                                  upsample_factor, H_asm, roi_size, z_target_idx,
+                                  n_medium=n_medium,
+                                  axicon_angle_in_medium=axicon_angle_in_medium,
+                                  axicon_transverse_frequency=axicon_transverse_frequency)
         I_gs = torch.abs(E_gs)**2
 
     print()
@@ -453,7 +537,10 @@ def optimize_hybrid_gs_adam(beam_obj, target_image_np, cone_angle, H_asm,
         optimizer.zero_grad()
         recon_field = beam_obj.propagateToVolume_Axicon2(
             axicon_angle=cone_angle, upsample_factor=upsample_factor,
-            phase_mask=slm_phase_var, roi_size=roi_size, H_asm=H_asm)
+            phase_mask=slm_phase_var, roi_size=roi_size, H_asm=H_asm,
+            n_medium=n_medium,
+            axicon_angle_in_medium=axicon_angle_in_medium,
+            axicon_transverse_frequency=axicon_transverse_frequency)
         recon_I      = torch.abs(recon_field[:, :, z_target_idx])**2
         recon_I_norm = recon_I / (recon_I.max() + 1e-8)
         loss = torch.nn.functional.mse_loss(recon_I_norm, target_I)
@@ -493,10 +580,10 @@ if __name__ == '__main__':
     save_directory = r"C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment\03_24_2026_Axicon_phase_opt\HollowRect100um"
 
     beam_config = HoloBeamConfig()
-    beam_config.psSLM_physical = 8e-6 * 0.8 
     beam_config.lambda_ = 0.473e-6
     assert beam_config.focal_SLM is not False, 'Effective Focal length needs to be set.'
     beam_config.binningFactor = 1
+    beam_config.psSLM_physical = 8e-6 * 0.8
     beam_config.Nx_physical = 1600
     beam_config.Ny_physical = 1200
     beam_config.axis_angle = [1, 0, 0]
@@ -544,19 +631,34 @@ if __name__ == '__main__':
     # ── Axicon / z config ─────────────────────────────────────────────────────
     Axicon_grating_pitch = 1.396e-6 # for testing
     upsample_factor = 20
-    Axicon_NA       = beam.lambda_ /Axicon_grating_pitch  #0.08
-    Cone_angle      = np.arcsin(Axicon_NA)
+    propagation_medium_index = 1.48  # resin. Use 1.0 for free-space propagation.
+    axicon_angle_in_medium = False   # Cone_angle below is derived from grating pitch in air-equivalent NA.
+    Axicon_transverse_frequency = 1.0 / Axicon_grating_pitch
+    Axicon_NA_air_equiv = beam_config.lambda_ * Axicon_transverse_frequency
+    if Axicon_NA_air_equiv >= 1.0:
+        raise ValueError("Axicon grating pitch gives an invalid free-space NA >= 1.")
+    Cone_angle = float(np.arcsin(Axicon_NA_air_equiv))
+    Cone_angle_in_medium = float(np.arcsin(Axicon_NA_air_equiv / propagation_medium_index))
+    print(f"Axicon air-equivalent NA={Axicon_NA_air_equiv:.4f}, "
+          f"theta_air={Cone_angle:.4f} rad, "
+          f"theta_medium={Cone_angle_in_medium:.4f} rad at n={propagation_medium_index:.3f}")
 
+    # Physical propagation distances in the selected medium [m].
+    # These are not optical path lengths and are not free-space-equivalent z.
     z_min   = 0.001
     z_max   = 0.015
     z_steps = 15
     z_eval_planes = torch.linspace(z_min, z_max, steps=z_steps,
-                                    device=beam_config.device)
+                                    device=beam_config.device,
+                                    dtype=beam_config.fdtype)
 
     H_asm = beam.build_axicon_ASM_TF(
         upsample_factor=upsample_factor,
         z_query=z_eval_planes,
+        n_medium=propagation_medium_index,
         axicon_angle=Cone_angle,
+        axicon_angle_in_medium=axicon_angle_in_medium,
+        axicon_transverse_frequency=Axicon_transverse_frequency,
         margin_factor=8000,
     )
 
@@ -566,6 +668,9 @@ if __name__ == '__main__':
     #     cone_angle=Cone_angle, H_asm=H_asm,
     #     gs_iters=10, adam_iters=100, lr=0.02,
     #     upsample_factor=upsample_factor, roi_size=1600, z_target_idx=0,
+    #     n_medium=propagation_medium_index,
+    #     axicon_angle_in_medium=axicon_angle_in_medium,
+    #     axicon_transverse_frequency=Axicon_transverse_frequency,
     # )
 
     # ── 3D optimization (all z-planes) ───────────────────────────────────────
@@ -578,6 +683,9 @@ if __name__ == '__main__':
         upsample_factor=upsample_factor,
         roi_size=1600,
         loss_mode='per_slice_norm',   # 'per_slice_norm' | 'raw_mean' | 'worst_slice'
+        n_medium=propagation_medium_index,
+        axicon_angle_in_medium=axicon_angle_in_medium,
+        axicon_transverse_frequency=Axicon_transverse_frequency,
     )
 
     # ── Save ──────────────────────────────────────────────────────────────────

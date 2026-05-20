@@ -34,6 +34,37 @@ class HoloBeam(Beam):
         self.source_modulation_map = None
         self.camera_scale_factor = None
 
+    def _resolve_axicon_radial_frequency(self, axicon_angle=None, n_medium=1.0,
+                                         axicon_angle_in_medium=False,
+                                         axicon_transverse_frequency=None):
+        """
+        Return the axicon radial spatial frequency in cycles/m.
+
+        By default axicon_angle is interpreted as the free-space/equivalent
+        angle used by a phase grating: f_r = sin(theta_air) / lambda0. If the
+        supplied angle is already the physical cone angle inside the medium,
+        set axicon_angle_in_medium=True so f_r = n sin(theta_medium) / lambda0.
+        Passing axicon_transverse_frequency is the least ambiguous option for
+        grating-pitch-defined axicons.
+        """
+        device = self.beam_config.device
+        fdtype = self.beam_config.fdtype
+
+        if axicon_transverse_frequency is not None:
+            return torch.as_tensor(axicon_transverse_frequency, device=device, dtype=fdtype)
+
+        if axicon_angle is None:
+            raise ValueError('Either axicon_angle or axicon_transverse_frequency must be provided.')
+
+        angle = torch.as_tensor(axicon_angle, device=device, dtype=fdtype)
+        n = torch.as_tensor(n_medium, device=device, dtype=fdtype)
+        if torch.any(n <= 0):
+            raise ValueError('n_medium must be positive.')
+
+        if axicon_angle_in_medium:
+            return n * torch.sin(angle) / self.beam_config.lambda_
+        return torch.sin(angle) / self.beam_config.lambda_
+
     def _get_zernike_phase(self, shape):
         """
         return zernike phase from zernike coefficients
@@ -201,11 +232,20 @@ class HoloBeam(Beam):
         
     def build_true_ASM_TF(self, z_query: torch.Tensor, upsample_factor=8, n_medium=1.0):
         '''
-        Real spatial frequency based ASM transfer function, whereas current buildEffectiveTF was based on pupil/focal plane of objective lens.
+        Real spatial frequency based ASM transfer function.
+
+        z_query is the physical propagation distance in the selected
+        homogeneous medium, not an optical path length or free-space-equivalent
+        distance. Use n_medium=1.0 for air/free space and n_medium=1.48 for the
+        current resin setup.
         '''
         Nx, Ny = self.beam_config.Nx, self.beam_config.Ny
         ps = self.beam_config.psSLM
         lambda_ = self.beam_config.lambda_
+        z_query = torch.atleast_1d(torch.as_tensor(z_query, device=self.beam_config.device, dtype=self.beam_config.fdtype))
+        n_medium = torch.as_tensor(n_medium, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+        if torch.any(n_medium <= 0):
+            raise ValueError('n_medium must be positive.')
         Nx_orig, Ny_orig = self.beam_config.Nx, self.beam_config.Ny
         ps_orig = self.beam_config.psSLM
         
@@ -235,13 +275,26 @@ class HoloBeam(Beam):
         
         return H_asm.to(self.beam_config.cdtype)
 
-    def build_axicon_ASM_TF(self, z_query: torch.Tensor, upsample_factor=8, n_medium=1.0, axicon_angle=None, margin_factor=5):
+    def build_axicon_ASM_TF(self, z_query: torch.Tensor, upsample_factor=8, n_medium=1.0,
+                            axicon_angle=None, margin_factor=5,
+                            axicon_angle_in_medium=False,
+                            axicon_transverse_frequency=None):
         '''
-        Real spatial frequency based ASM transfer function with Sparse Ring Masking
+        Real spatial frequency based ASM transfer function with Sparse Ring Masking.
+
+        z_query is the physical propagation distance in the selected
+        homogeneous medium. The wavelength is the vacuum wavelength lambda_;
+        n_medium changes kz = sqrt((n*k0)^2 - kx^2 - ky^2), so z_min/z_max
+        should be entered as actual distances in resin/air.
         '''
         Nx_orig, Ny_orig = self.beam_config.Nx, self.beam_config.Ny
         ps_orig = self.beam_config.psSLM
         lambda_ = self.beam_config.lambda_
+        z_query = torch.atleast_1d(torch.as_tensor(z_query, device=self.beam_config.device, dtype=self.beam_config.fdtype))
+        n_medium = torch.as_tensor(n_medium, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+        if torch.any(n_medium <= 0):
+            raise ValueError('n_medium must be positive.')
+        n_medium_value = float(n_medium.detach().cpu().item())
         
         Nx_up = Nx_orig * int(upsample_factor)
         Ny_up = Ny_orig * int(upsample_factor)
@@ -254,8 +307,13 @@ class HoloBeam(Beam):
         FY2 = fy.view(1, -1) ** 2
         KR = torch.sqrt(FX2 + FY2)
         
-        if axicon_angle is not None:
-            k_ring_radius = torch.sin(torch.tensor(axicon_angle)) / lambda_
+        if axicon_angle is not None or axicon_transverse_frequency is not None:
+            k_ring_radius = self._resolve_axicon_radial_frequency(
+                axicon_angle=axicon_angle,
+                n_medium=n_medium,
+                axicon_angle_in_medium=axicon_angle_in_medium,
+                axicon_transverse_frequency=axicon_transverse_frequency,
+            )
             df = 1.0 / (Nx_orig * ps_orig)
             ring_mask = torch.abs(KR - k_ring_radius) <= (df * margin_factor)
             
@@ -284,7 +342,7 @@ class HoloBeam(Beam):
             H_asm_sparse = H_asm_sparse * valid_mask_sparse
             
             retention = ring_mask.sum().item() / (Nx_up * Ny_up) * 100
-            print(f"[Method B] K-space Sparse Masking Active! Using only {retention:.3f}% of K-space memory.")
+            print(f"[Method B] K-space Sparse Masking Active! Using only {retention:.3f}% of K-space memory. n_medium={n_medium_value:.4g}")
             
             # Delete redundant files
             del FX2, FY2, KR, KR_sparse, gamma_sq_sparse, gamma_sparse
@@ -293,7 +351,11 @@ class HoloBeam(Beam):
                 'type': 'sparse',
                 'ring_mask': ring_mask,
                 'H_asm_sparse': H_asm_sparse.to(self.beam_config.cdtype),
-                'Nx_up': Nx_up, 'Ny_up': Ny_up
+                'Nx_up': Nx_up, 'Ny_up': Ny_up,
+                'n_medium': n_medium_value,
+                'z_query': z_query.detach(),
+                'axicon_transverse_frequency': float(k_ring_radius.detach().cpu().item()),
+                'axicon_angle_in_medium': axicon_angle_in_medium,
             }
         else:
             gamma_sq = 1 - (lambda_**2 * KR**2 / n_medium**2)
@@ -373,7 +435,9 @@ class HoloBeam(Beam):
 
     @torch.no_grad()
     def propagateToVolume_Axicon(self, axicon_angle: float,  upsample_factor=int,  phase_mask=None, beam_mean_amplitude=None, 
-                                 slm_amplitude_profile=None, H_asm=None, convert_to_intensity=False):
+                                 slm_amplitude_profile=None, H_asm=None, convert_to_intensity=False,
+                                 n_medium=1.0, axicon_angle_in_medium=False,
+                                 axicon_transverse_frequency=None):
         '''
         Axicon lens forward propagation
         '''
@@ -416,10 +480,15 @@ class HoloBeam(Beam):
         X, Y = torch.meshgrid(x, y, indexing='ij')
         R = torch.sqrt(X**2 + Y**2)
         
-        k = 2 * torch.pi / self.beam_config.lambda_
-        
-        # Axicon phase: exp(-i * k * gamma * R)
-        axicon_phase_mask = -k * torch.sin(torch.tensor(axicon_angle)) * R
+        radial_frequency = self._resolve_axicon_radial_frequency(
+            axicon_angle=axicon_angle,
+            n_medium=n_medium,
+            axicon_angle_in_medium=axicon_angle_in_medium,
+            axicon_transverse_frequency=axicon_transverse_frequency,
+        )
+
+        # Axicon phase: exp(-i * 2*pi*f_r*R)
+        axicon_phase_mask = -(2 * torch.pi * radial_frequency) * R
         field_after_axicon = slm_field_up * torch.exp(1j * axicon_phase_mask)
 
         # 3. Space to Space True ASM propagation 
@@ -434,7 +503,10 @@ class HoloBeam(Beam):
         return vol_field
 
     def propagateToVolume_Axicon2(self, axicon_angle: float, upsample_factor=int, phase_mask=None, beam_mean_amplitude=None, 
-                                 slm_amplitude_profile=None, H_asm=None, convert_to_intensity=False, roi_size=1000, apply_spatial_filter=True):
+                                 slm_amplitude_profile=None, H_asm=None, convert_to_intensity=False, roi_size=1000,
+                                 apply_spatial_filter=False, n_medium=1.0,
+                                 axicon_angle_in_medium=False,
+                                 axicon_transverse_frequency=None):
         '''
         Axicon lens forward propagation (ULTIMATE FIX: ROI-only Storage & Slice-by-Slice IFFT)
         '''
@@ -493,7 +565,13 @@ class HoloBeam(Beam):
             y = torch.linspace(-(Ny_up-1)/2, (Ny_up-1)/2, Ny_up, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps_up
             
             Y2 = y.view(1, -1) ** 2  
-            k_sin_alpha = (2 * torch.math.pi / self.beam_config.lambda_) * torch.sin(torch.tensor(axicon_angle))
+            radial_frequency = self._resolve_axicon_radial_frequency(
+                axicon_angle=axicon_angle,
+                n_medium=n_medium,
+                axicon_angle_in_medium=axicon_angle_in_medium,
+                axicon_transverse_frequency=axicon_transverse_frequency,
+            )
+            k_sin_alpha = 2 * torch.pi * radial_frequency
             
             chunk_size = 1024
             for i in range(0, Nx_up, chunk_size):
@@ -877,7 +955,10 @@ class HoloBeam(Beam):
         else:
             return reconstructed_intensity
 
-    def forward_proxy_2D_Axicon(self, slm_phase, axicon_angle=0.0174, axicon_n=1.5, upsample_factor=8, source_profile=None, defocus=0):
+    def forward_proxy_2D_Axicon(self, slm_phase, axicon_angle=0.0835, upsample_factor=20,
+                                source_profile=None, defocus=0, n_medium=1.0,
+                                axicon_angle_in_medium=False,
+                                axicon_transverse_frequency=None):
         """
         Return intensity at a specific focal plane.
         
@@ -899,13 +980,16 @@ class HoloBeam(Beam):
 
         vol_field = self.propagateToVolume_Axicon2(
                                                 axicon_angle=axicon_angle, 
-                                                axicon_n=axicon_n,
                                                 upsample_factor=upsample_factor,
                                                 phase_mask=slm_phase, 
                                                 beam_mean_amplitude=beam_amp, 
                                                 slm_amplitude_profile=use_profile,
                                                 H_asm=self.H_asm,
-                                                convert_to_intensity=True
+                                                convert_to_intensity=True,
+                                                roi_size=1600,
+                                                n_medium=n_medium,
+                                                axicon_angle_in_medium=axicon_angle_in_medium,
+                                                axicon_transverse_frequency=axicon_transverse_frequency
         )
 
         # get focal plane
