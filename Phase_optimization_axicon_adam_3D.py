@@ -8,7 +8,7 @@ import numpy as np
 import torchvision.transforms.functional as TF
 from PIL import Image
 from scipy.ndimage import zoom
-import os
+from pathlib import Path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -20,6 +20,32 @@ def _prepare_target(target_np, roi_size, device, fdtype):
     if t.shape != (roi_size, roi_size):
         t = TF.resize(t.unsqueeze(0), [roi_size, roi_size]).squeeze()
     return t / (t.max() + 1e-8)
+
+
+def _load_rescaled_target_image(image_path, beam_config, original_pixel_size=2e-6):
+    image = Image.open(image_path).convert("L")
+    image_array = np.array(image)
+
+    desired_pixel_size = (beam_config.abbe_res_x, beam_config.abbe_res_y)
+    desired_resolution = (beam_config.Nx, beam_config.Ny)
+    rescaled_img = zoom(image_array,
+                        (original_pixel_size / desired_pixel_size[1],
+                         original_pixel_size / desired_pixel_size[0]), order=1)
+
+    target_w, target_h = desired_resolution
+    cur_h, cur_w = rescaled_img.shape
+    final_image = np.zeros((target_h, target_w), dtype=rescaled_img.dtype)
+
+    off_y = (target_h - cur_h) // 2
+    off_x = (target_w - cur_w) // 2
+    dy0, dx0 = max(0, off_y), max(0, off_x)
+    sy0, sx0 = max(0, -off_y), max(0, -off_x)
+    ch = min(cur_h - sy0, target_h - dy0)
+    cw = min(cur_w - sx0, target_w - dx0)
+    if ch > 0 and cw > 0:
+        final_image[dy0:dy0+ch, dx0:dx0+cw] = rescaled_img[sy0:sy0+ch, sx0:sx0+cw]
+
+    return (final_image.T / 255.0).astype(np.float32)
 
 
 def _axicon_radial_frequency(cone_angle, lambda_, device, fdtype, n_medium=1.0,
@@ -278,7 +304,8 @@ def optimize_hybrid_gs_adam_3d(beam_obj, target_image_np, cone_angle, H_asm,
                                 upsample_factor=6, roi_size=1600,
                                 loss_mode='per_slice_norm', n_medium=1.0,
                                 axicon_angle_in_medium=False,
-                                axicon_transverse_frequency=None):
+                                axicon_transverse_frequency=None,
+                                visualize=True):
     """
     Two-stage 3D phase optimizer for SLM + Axicon system.
 
@@ -324,14 +351,14 @@ def optimize_hybrid_gs_adam_3d(beam_obj, target_image_np, cone_angle, H_asm,
         axicon_transverse_frequency=axicon_transverse_frequency,
     )
 
-    # Snapshot after GS for visualization
-    with torch.no_grad():
-        E_gs_vol = _forward_complex_volume(init_phase, beam_obj, cone_angle,
-                                            upsample_factor, H_asm, roi_size,
-                                            n_medium=n_medium,
-                                            axicon_angle_in_medium=axicon_angle_in_medium,
-                                            axicon_transverse_frequency=axicon_transverse_frequency)
-        I_gs_vol = torch.abs(E_gs_vol) ** 2   # [roi, roi, Nz]
+    if visualize:
+        with torch.no_grad():
+            E_gs_vol = _forward_complex_volume(init_phase, beam_obj, cone_angle,
+                                                upsample_factor, H_asm, roi_size,
+                                                n_medium=n_medium,
+                                                axicon_angle_in_medium=axicon_angle_in_medium,
+                                                axicon_transverse_frequency=axicon_transverse_frequency)
+            I_gs_vol = torch.abs(E_gs_vol) ** 2   # [roi, roi, Nz]
 
     # ══ Stage 2: Adam refinement (3D) ════════════════════════════════════════
     print()
@@ -378,42 +405,42 @@ def optimize_hybrid_gs_adam_3d(beam_obj, target_image_np, cone_angle, H_asm,
     # ── Post-processing ───────────────────────────────────────────────────────
     final_phase  = (slm_phase_var.detach() % (2 * torch.pi)).cpu().numpy()
     recon_vol_np = recon_I_vol.detach().cpu().numpy()
-    I_gs_np      = I_gs_vol.cpu().numpy()
-    target_np    = target_I.cpu().numpy()
+    if visualize:
+        I_gs_np = I_gs_vol.cpu().numpy()
+        target_np = target_I.cpu().numpy()
 
-    # ── Visualization ─────────────────────────────────────────────────────────
-    # Row 0: loss curve / target / final phase
-    # Row 1: GS result at z[0], z[Nz//2], z[-1]
-    # Row 2: Adam result at z[0], z[Nz//2], z[-1]
-    z_show = [0, Nz // 2, Nz - 1]
+        # Row 0: loss curve / target / final phase
+        # Row 1: GS result at z[0], z[Nz//2], z[-1]
+        # Row 2: Adam result at z[0], z[Nz//2], z[-1]
+        z_show = [0, Nz // 2, Nz - 1]
 
-    fig, axes = plt.subplots(3, 3, figsize=(18, 15))
+        fig, axes = plt.subplots(3, 3, figsize=(18, 15))
 
-    axes[0, 0].plot(loss_adam, color='steelblue')
-    axes[0, 0].set_title(f'Adam Loss ({loss_mode})')
-    axes[0, 0].set_xlabel('Iteration')
-    axes[0, 0].set_yscale('log')
+        axes[0, 0].plot(loss_adam, color='steelblue')
+        axes[0, 0].set_title(f'Adam Loss ({loss_mode})')
+        axes[0, 0].set_xlabel('Iteration')
+        axes[0, 0].set_yscale('log')
 
-    axes[0, 1].imshow(target_np, cmap='hot')
-    axes[0, 1].set_title('Target')
+        axes[0, 1].imshow(target_np, cmap='hot')
+        axes[0, 1].set_title('Target')
 
-    im_ph = axes[0, 2].imshow(final_phase, cmap='hsv', vmin=0, vmax=2*np.pi)
-    axes[0, 2].set_title('Final SLM Phase')
-    fig.colorbar(im_ph, ax=axes[0, 2])
+        im_ph = axes[0, 2].imshow(final_phase, cmap='hsv', vmin=0, vmax=2*np.pi)
+        axes[0, 2].set_title('Final SLM Phase')
+        fig.colorbar(im_ph, ax=axes[0, 2])
 
-    for col, z in enumerate(z_show):
-        # GS snapshot (normalized for display)
-        I_gs_z = I_gs_np[:, :, z]
-        axes[1, col].imshow(I_gs_z / (I_gs_z.max() + 1e-8), cmap='hot')
-        axes[1, col].set_title(f'GS warm-up | z idx {z} (norm)')
+        for col, z in enumerate(z_show):
+            # GS snapshot (normalized for display)
+            I_gs_z = I_gs_np[:, :, z]
+            axes[1, col].imshow(I_gs_z / (I_gs_z.max() + 1e-8), cmap='hot')
+            axes[1, col].set_title(f'GS warm-up | z idx {z} (norm)')
 
-        # Adam final (normalized for display)
-        I_ad_z = recon_vol_np[:, :, z]
-        axes[2, col].imshow(I_ad_z / (I_ad_z.max() + 1e-8), cmap='hot')
-        axes[2, col].set_title(f'Adam final | z idx {z} (norm)')
+            # Adam final (normalized for display)
+            I_ad_z = recon_vol_np[:, :, z]
+            axes[2, col].imshow(I_ad_z / (I_ad_z.max() + 1e-8), cmap='hot')
+            axes[2, col].set_title(f'Adam final | z idx {z} (norm)')
 
-    plt.tight_layout()
-    plt.show()
+        plt.tight_layout()
+        plt.show()
 
     # ── SLM integer format ────────────────────────────────────────────────────
     phase_slm = final_phase * (1023 / (2 * np.pi))
@@ -503,7 +530,8 @@ def optimize_hybrid_gs_adam(beam_obj, target_image_np, cone_angle, H_asm,
                              gs_iters=10, adam_iters=100, lr=0.02,
                              upsample_factor=6, roi_size=1600, z_target_idx=0,
                              n_medium=1.0, axicon_angle_in_medium=False,
-                             axicon_transverse_frequency=None):
+                             axicon_transverse_frequency=None,
+                             visualize=True):
     device = beam_obj.beam_config.device
     fdtype = beam_obj.beam_config.fdtype
     target_I = _prepare_target(target_image_np, roi_size, device, fdtype)
@@ -553,21 +581,22 @@ def optimize_hybrid_gs_adam(beam_obj, target_image_np, cone_angle, H_asm,
     print("Optimization complete!")
     final_phase = (slm_phase_var.detach() % (2 * torch.pi)).cpu().numpy()
     final_I     = recon_I.detach().cpu().numpy()
-    I_gs_np     = I_gs.cpu().numpy()
-    target_np_  = target_I.cpu().numpy()
+    if visualize:
+        I_gs_np = I_gs.cpu().numpy()
+        target_np_ = target_I.cpu().numpy()
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    axes[0,0].plot(loss_adam, color='steelblue'); axes[0,0].set_yscale('log')
-    axes[0,0].set_title('Adam Loss')
-    axes[0,1].imshow(target_np_, cmap='hot'); axes[0,1].set_title('Target')
-    im_ph = axes[0,2].imshow(final_phase, cmap='hsv', vmin=0, vmax=2*np.pi)
-    axes[0,2].set_title('Final Phase'); fig.colorbar(im_ph, ax=axes[0,2])
-    axes[1,0].imshow(I_gs_np/(I_gs_np.max()+1e-8), cmap='hot')
-    axes[1,0].set_title(f'After GS ({gs_iters} iters)')
-    axes[1,1].imshow(final_I/(final_I.max()+1e-8), cmap='hot')
-    axes[1,1].set_title(f'After Adam ({adam_iters} iters, norm)')
-    axes[1,2].imshow(final_I, cmap='hot'); axes[1,2].set_title('Final raw')
-    plt.tight_layout(); plt.show()
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        axes[0,0].plot(loss_adam, color='steelblue'); axes[0,0].set_yscale('log')
+        axes[0,0].set_title('Adam Loss')
+        axes[0,1].imshow(target_np_, cmap='hot'); axes[0,1].set_title('Target')
+        im_ph = axes[0,2].imshow(final_phase, cmap='hsv', vmin=0, vmax=2*np.pi)
+        axes[0,2].set_title('Final Phase'); fig.colorbar(im_ph, ax=axes[0,2])
+        axes[1,0].imshow(I_gs_np/(I_gs_np.max()+1e-8), cmap='hot')
+        axes[1,0].set_title(f'After GS ({gs_iters} iters)')
+        axes[1,1].imshow(final_I/(final_I.max()+1e-8), cmap='hot')
+        axes[1,1].set_title(f'After Adam ({adam_iters} iters, norm)')
+        axes[1,2].imshow(final_I, cmap='hot'); axes[1,2].set_title('Final raw')
+        plt.tight_layout(); plt.show()
 
     phase_slm = np.round(final_phase*(1023/(2*np.pi))).astype(np.int16).T
     return final_phase, final_I, loss_adam, phase_slm
@@ -578,6 +607,17 @@ def optimize_hybrid_gs_adam(beam_obj, target_image_np, cone_angle, H_asm,
 ################
 if __name__ == '__main__':
     save_directory = r"C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment\03_24_2026_Axicon_phase_opt\HollowRect100um"
+    target_directory = Path(
+        r"C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment"
+        r"\Proxy_calibration_AltBeam_1image\Proxy_train_pool\HollowRectangle"
+    )
+    target_image_path = None  # Set to a PNG path for single-file mode.
+    target_patterns = ("*.png", "*.PNG")
+    output_directory = Path(save_directory)
+    original_pixel_size = 2e-6
+    visualize = False
+    save_recon_volume = False
+    output_directory.mkdir(parents=True, exist_ok=True)
 
     beam_config = HoloBeamConfig()
     beam_config.lambda_ = 0.473e-6
@@ -597,36 +637,6 @@ if __name__ == '__main__':
     beam.slm_amplitude_profile = beam.buildSLMAmplitudeProfile()
     beam.beam_mean_amplitude_iter = torch.tensor(
         1.0, device=beam_config.device, dtype=beam_config.fdtype)
-
-    # ── Target image ──────────────────────────────────────────────────────────
-    image = Image.open(
-        r"C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment"
-        r"\Proxy_calibration_AltBeam_1image\Proxy_train_pool\HollowRectangle\Raw_target.png"
-    ).convert("L")
-
-    original_pixel_size = 2e-6
-    desired_pixel_size  = (beam_config.abbe_res_x, beam_config.abbe_res_y)
-    desired_resolution  = (beam.beam_config.Nx, beam.beam_config.Ny)
-
-    image_array  = np.array(image)
-    rescaled_img = zoom(image_array,
-                        (original_pixel_size / desired_pixel_size[1],
-                         original_pixel_size / desired_pixel_size[0]), order=1)
-
-    target_w, target_h = desired_resolution
-    cur_h, cur_w = rescaled_img.shape
-    final_image  = np.zeros((target_h, target_w), dtype=rescaled_img.dtype)
-
-    off_y = (target_h - cur_h) // 2
-    off_x = (target_w - cur_w) // 2
-    dy0, dx0 = max(0, off_y),  max(0, off_x)
-    sy0, sx0 = max(0, -off_y), max(0, -off_x)
-    ch = min(cur_h - sy0, target_h - dy0)
-    cw = min(cur_w - sx0, target_w - dx0)
-    if ch > 0 and cw > 0:
-        final_image[dy0:dy0+ch, dx0:dx0+cw] = rescaled_img[sy0:sy0+ch, sx0:sx0+cw]
-
-    rescaled_image = (final_image.T / 255.0).astype(np.float32)
 
     # ── Axicon / z config ─────────────────────────────────────────────────────
     Axicon_grating_pitch = 1.396e-6 # for testing
@@ -662,33 +672,51 @@ if __name__ == '__main__':
         margin_factor=8000,
     )
 
-    # ── 2D optimization (single z-plane) ─────────────────────────────────────
-    # optimized_phase, recon_img, loss, phase_slm = optimize_hybrid_gs_adam(
-    #     beam_obj=beam, target_image_np=rescaled_image,
-    #     cone_angle=Cone_angle, H_asm=H_asm,
-    #     gs_iters=10, adam_iters=100, lr=0.02,
-    #     upsample_factor=upsample_factor, roi_size=1600, z_target_idx=0,
-    #     n_medium=propagation_medium_index,
-    #     axicon_angle_in_medium=axicon_angle_in_medium,
-    #     axicon_transverse_frequency=Axicon_transverse_frequency,
-    # )
-
     # ── 3D optimization (all z-planes) ───────────────────────────────────────
-    optimized_phase, recon_vol, loss, phase_slm = optimize_hybrid_gs_adam_3d(
-        beam_obj=beam, target_image_np=rescaled_image,
-        cone_angle=Cone_angle, H_asm=H_asm,
-        gs_iters=50,          
-        adam_iters=200,       
-        lr=0.01,              
-        upsample_factor=upsample_factor,
-        roi_size=1600,
-        loss_mode='per_slice_norm',   # 'per_slice_norm' | 'raw_mean' | 'worst_slice'
-        n_medium=propagation_medium_index,
-        axicon_angle_in_medium=axicon_angle_in_medium,
-        axicon_transverse_frequency=Axicon_transverse_frequency,
-    )
+    if target_image_path is not None:
+        target_paths = [Path(target_image_path)]
+    else:
+        target_paths = sorted({
+            path
+            for pattern in target_patterns
+            for path in target_directory.glob(pattern)
+        })
 
-    # ── Save ──────────────────────────────────────────────────────────────────
-    np.save(os.path.join(save_directory, 'phase_mask_3d_gs_adam_moreGS.npy'), phase_slm)
-    np.save(os.path.join(save_directory, 'recon_vol_3d.npy'), recon_vol)
-    print(f"Saved to {save_directory}")
+    if not target_paths:
+        raise FileNotFoundError(f"No PNG targets found in {target_directory} with patterns {target_patterns}")
+
+    print(f"Found {len(target_paths)} target image(s). Saving phase masks to {output_directory}")
+
+    for target_idx, target_path in enumerate(target_paths, start=1):
+        print("=" * 80)
+        print(f"[{target_idx}/{len(target_paths)}] Optimizing {target_path.name}")
+        rescaled_image = _load_rescaled_target_image(
+            target_path, beam_config, original_pixel_size=original_pixel_size)
+
+        optimized_phase, recon_vol, loss, phase_slm = optimize_hybrid_gs_adam_3d(
+            beam_obj=beam, target_image_np=rescaled_image,
+            cone_angle=Cone_angle, H_asm=H_asm,
+            gs_iters=50,
+            adam_iters=200,
+            lr=0.01,
+            upsample_factor=upsample_factor,
+            roi_size=1600,
+            loss_mode='per_slice_norm',   # 'per_slice_norm' | 'raw_mean' | 'worst_slice'
+            n_medium=propagation_medium_index,
+            axicon_angle_in_medium=axicon_angle_in_medium,
+            axicon_transverse_frequency=Axicon_transverse_frequency,
+            visualize=visualize,
+        )
+
+        phase_output_path = output_directory / f"{target_path.stem}.npy"
+        np.save(phase_output_path, phase_slm)
+
+        if save_recon_volume:
+            recon_output_path = output_directory / f"{target_path.stem}_recon_vol.npy"
+            np.save(recon_output_path, recon_vol)
+
+        print(f"Saved phase mask to {phase_output_path}")
+
+        del optimized_phase, recon_vol, loss, phase_slm, rescaled_image
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
