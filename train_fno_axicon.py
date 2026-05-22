@@ -36,6 +36,7 @@ E_out and use |E_out|^2 as the final intensity.
 import csv
 import json
 import math
+import os
 import random
 from datetime import datetime
 from pathlib import Path
@@ -880,6 +881,26 @@ def split_dataset(dataset, train_ratio=0.8, seed=42):
     return Subset(dataset, train_idx), Subset(dataset, val_idx), train_idx, val_idx
 
 
+def print_torch_device_diagnostics():
+    cuda_available = torch.cuda.is_available()
+    print("=== Torch device diagnostics ===")
+    print(f"Torch version: {torch.__version__}")
+    print(f"Torch CUDA build: {torch.version.cuda}")
+    print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
+    print(f"torch.cuda.is_available(): {cuda_available}")
+    print(f"torch.cuda.device_count(): {torch.cuda.device_count()}")
+    if cuda_available:
+        current = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(current)
+        print(f"Active CUDA device: cuda:{current} - {props.name}")
+        print(f"CUDA capability: {props.major}.{props.minor}")
+        print(f"Total VRAM: {props.total_memory / 1024**3:.2f} GiB")
+        print(f"cuDNN version: {torch.backends.cudnn.version()}")
+    else:
+        print("No CUDA accelerator is visible to this Python process; training will run on CPU.")
+    print("================================")
+
+
 # ---------------------------------------------------------------------------
 # Training / evaluation
 # ---------------------------------------------------------------------------
@@ -893,7 +914,8 @@ def prepare_batch(batch, device, model_size):
 
 
 def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_dir):
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg['use_amp'] and device == 'cuda')
+    amp_enabled = cfg['use_amp'] and device == 'cuda'
+    scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
     best_val = float('inf')
     history = {
         'train': [], 'val': [],
@@ -917,7 +939,7 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
             field, _, phase, camera = prepare_batch(batch, device, cfg['model_size'])
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=cfg['use_amp'] and device == 'cuda'):
+            with torch.amp.autocast('cuda', enabled=amp_enabled):
                 pred, _ = predict_camera(model, field, phase, cfg, train_noise=True)
                 loss, comps = visual_loss(
                     pred, camera,
@@ -1153,6 +1175,7 @@ if __name__ == '__main__':
     DIRECT_FIELD_NOISE_STD = 0.05
 
     # Training
+    REQUIRE_CUDA = False
     TRAIN_RATIO = 0.8
     BATCH_SIZE = 1
     EPOCHS = 50
@@ -1186,7 +1209,10 @@ if __name__ == '__main__':
     np.random.seed(SEED)
     random.seed(SEED)
 
+    print_torch_device_diagnostics()
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if REQUIRE_CUDA and DEVICE != 'cuda':
+        raise RuntimeError("REQUIRE_CUDA=True but CUDA is not available to this Python process.")
     eval_only = EVAL_ONLY_RUN_DIR is not None
     run_dir = Path(EVAL_ONLY_RUN_DIR) if eval_only else Path(OUTPUT_DIR) / RUN_NAME
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1235,6 +1261,7 @@ if __name__ == '__main__':
         'lr': LR,
         'weight_decay': WEIGHT_DECAY,
         'num_workers': NUM_WORKERS,
+        'require_cuda': REQUIRE_CUDA,
         'use_amp': USE_AMP,
         'grad_clip': GRAD_CLIP,
         'w_photo': W_PHOTO,
@@ -1306,10 +1333,11 @@ if __name__ == '__main__':
     with open(run_dir / 'config.json', 'w', encoding='utf-8') as f:
         json.dump(cfg, f, indent=2)
 
+    pin_memory = DEVICE == 'cuda'
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=NUM_WORKERS, pin_memory=True)
+                              num_workers=NUM_WORKERS, pin_memory=pin_memory)
     val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False,
-                            num_workers=NUM_WORKERS, pin_memory=True)
+                            num_workers=NUM_WORKERS, pin_memory=pin_memory)
 
     in_ch = infer_input_channels(
         use_slm_phase=USE_SLM_PHASE,
