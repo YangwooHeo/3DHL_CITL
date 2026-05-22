@@ -76,7 +76,7 @@ def propagate_axicon_field(beam, phase_tensor, cone_angle, upsample_factor, h_as
             phase_mask=phase_tensor,
             H_asm=h_asm,
             roi_size=roi_size,
-            apply_spatial_filter=False,
+            apply_spatial_filter=True,
             n_medium=propagation_medium_index,
             axicon_angle_in_medium=axicon_angle_in_medium,
             axicon_transverse_frequency=axicon_transverse_frequency,
@@ -283,7 +283,7 @@ def build_beam_config():
 
 if __name__ == "__main__":
 
-    RUN_MODE = "export_field"  # "export_field" or "viewer"
+    RUN_MODE = "viewer"  # "export_field" or "viewer"
 
     #PHASE_MASK = r"C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment\Proxy_calibration_AltBeam_1image\Epoch_500\Proxy_train_pool\HollowRectangle\slm_phase.npy"
     PHASE_MASK = r"C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment\Checkerboard_generation\files\phase_mask_pitch2x.npy"
@@ -291,14 +291,14 @@ if __name__ == "__main__":
 
     SLM_PHASE_DIRECTORY = Path(PHASE_MASK).parent
     PHASE_GLOB = "*.npy"
-    Z_TARGET = 0.012  # Physical propagation distance in the selected medium [m].
+    Z_TARGET = 0.01149  # Physical propagation distance in the selected medium [m], 11.49mm for cuvette condition
     SAVE_DIRECTORY = SLM_PHASE_DIRECTORY / f"electric_fields_z{Z_TARGET * 1000:.1f}mm"
 
     TRANSPOSE_PHASE = True
     FLIP_PHASE_FIRST_AXIS = True
     PHASE_LEVEL_MAX = 1023.0
     EXPORT_ROI_SIZE = 1024
-    VIEWER_ROI_SIZE = 600
+    VIEWER_ROI_SIZE = 1024
     OVERWRITE_OUTPUTS = True
     MATCH_VIEWER_ORIENTATION = True
     SHOW_TRANSFER_FUNCTION_PLOT = RUN_MODE.lower() == "viewer"
@@ -306,7 +306,7 @@ if __name__ == "__main__":
     beam_config = build_beam_config()
 
     axicon_grating_pitch = 1.396e-6
-    upsample_factor = 10
+    upsample_factor = 20
     propagation_medium_index = 1.471
     axicon_angle_in_medium = False
     axicon_transverse_frequency = 1.0 / axicon_grating_pitch

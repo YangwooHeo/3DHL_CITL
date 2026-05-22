@@ -694,6 +694,33 @@ def predict_camera(model, field, phase, cfg, train_noise=False):
     return pred.clamp_min(0.0), field_like
 
 
+def center_roi_bounds(height, width, fraction):
+    if fraction is None:
+        return 0, height, 0, width
+    fraction = float(fraction)
+    if fraction <= 0:
+        raise ValueError(f"ROI fraction must be > 0 or None; got {fraction}")
+    if fraction >= 1:
+        return 0, height, 0, width
+
+    roi_h = max(1, int(round(height * fraction)))
+    roi_w = max(1, int(round(width * fraction)))
+    y0 = (height - roi_h) // 2
+    x0 = (width - roi_w) // 2
+    return y0, y0 + roi_h, x0, x0 + roi_w
+
+
+def crop_center_roi(x, fraction):
+    y0, y1, x0, x1 = center_roi_bounds(x.shape[-2], x.shape[-1], fraction)
+    return x[..., y0:y1, x0:x1]
+
+
+def apply_loss_roi(pred, target, fraction):
+    if fraction is None or float(fraction) >= 1.0:
+        return pred, target
+    return crop_center_roi(pred, fraction), crop_center_roi(target, fraction)
+
+
 def infer_input_channels(use_slm_phase=True, use_grid=True,
                          use_radial_coord=True, use_axicon_phase_map=False,
                          axicon_slope_rad_per_pixel=None):
@@ -915,6 +942,7 @@ def prepare_batch(batch, device, model_size):
 
 def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_dir):
     amp_enabled = cfg['use_amp'] and device == 'cuda'
+    loss_roi_fraction = cfg.get('loss_roi_fraction', 1.0)
     scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
     best_val = float('inf')
     history = {
@@ -941,8 +969,9 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast('cuda', enabled=amp_enabled):
                 pred, _ = predict_camera(model, field, phase, cfg, train_noise=True)
+                pred_loss, camera_loss = apply_loss_roi(pred, camera, loss_roi_fraction)
                 loss, comps = visual_loss(
-                    pred, camera,
+                    pred_loss, camera_loss,
                     w_photo=cfg['w_photo'],
                     w_ssim=cfg['w_ssim'],
                     w_grad=cfg['w_grad'],
@@ -981,8 +1010,9 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
             for batch in val_loader:
                 field, _, phase, camera = prepare_batch(batch, device, cfg['model_size'])
                 pred, _ = predict_camera(model, field, phase, cfg, train_noise=False)
+                pred_loss, camera_loss = apply_loss_roi(pred, camera, loss_roi_fraction)
                 loss, comps = visual_loss(
-                    pred, camera,
+                    pred_loss, camera_loss,
                     w_photo=cfg['w_photo'],
                     w_ssim=cfg['w_ssim'],
                     w_grad=cfg['w_grad'],
@@ -1037,6 +1067,8 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
 def visualize_samples(model, dataset, indices, device, cfg, save_dir):
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+    roi_fraction = cfg.get('loss_roi_fraction', 1.0)
+    has_roi = roi_fraction is not None and float(roi_fraction) < 1.0
 
     model.eval()
     with torch.no_grad():
@@ -1051,18 +1083,23 @@ def visualize_samples(model, dataset, indices, device, cfg, save_dir):
                                cfg['model_size'], mode='bilinear')
 
             pred, _ = predict_camera(model, field, phase, cfg, train_noise=False)
+            pred_roi, cam_roi = apply_loss_roi(pred, cam, roi_fraction)
 
             sim_np = sim[0, 0].cpu().numpy()
             cam_np = cam[0, 0].cpu().numpy()
             pred_np = pred[0, 0].cpu().numpy()
+            cam_roi_np = cam_roi[0, 0].cpu().numpy()
+            pred_roi_np = pred_roi[0, 0].cpu().numpy()
 
             sim_d = quantile_normalize_np(sim_np, q_max=0.999)
             cam_d = quantile_normalize_np(cam_np, q_max=0.999)
             pred_d = quantile_normalize_np(pred_np, q_max=0.999)
             err_d = np.abs(pred_d - cam_d)
+            cam_roi_d = quantile_normalize_np(cam_roi_np, q_max=0.999)
+            pred_roi_d = quantile_normalize_np(pred_roi_np, q_max=0.999)
 
-            display_mse = float(np.mean((pred_d - cam_d) ** 2))
-            raw_mse = float(np.mean((pred_np - cam_np) ** 2))
+            display_mse = float(np.mean((pred_roi_d - cam_roi_d) ** 2))
+            raw_mse = float(np.mean((pred_roi_np - cam_roi_np) ** 2))
 
             fig, ax = plt.subplots(1, 4, figsize=(20, 5))
             ax[0].imshow(sim_d, cmap='gray', vmin=0, vmax=1)
@@ -1070,9 +1107,23 @@ def visualize_samples(model, dataset, indices, device, cfg, save_dir):
             ax[1].imshow(cam_d, cmap='gray', vmin=0, vmax=1)
             ax[1].set_title("Camera (target)")
             ax[2].imshow(pred_d, cmap='gray', vmin=0, vmax=1)
-            ax[2].set_title(f"FNO\nRaw-MSE: {raw_mse:.4f}\nDisplay-MSE: {display_mse:.4f}")
+            metric_prefix = "ROI " if has_roi else ""
+            ax[2].set_title(f"FNO\n{metric_prefix}Raw-MSE: {raw_mse:.4f}\n{metric_prefix}Display-MSE: {display_mse:.4f}")
             ax[3].imshow(err_d, cmap='hot', vmin=0, vmax=0.5)
             ax[3].set_title("|Pred - Cam|")
+            if has_roi:
+                y0, y1, x0, x1 = center_roi_bounds(pred_d.shape[0], pred_d.shape[1], roi_fraction)
+                for a in ax:
+                    a.add_patch(plt.Rectangle(
+                        (x0 - 0.5, y0 - 0.5),
+                        x1 - x0,
+                        y1 - y0,
+                        fill=False,
+                        edgecolor='deepskyblue',
+                        linewidth=0.8,
+                        linestyle=(0, (3, 3)),
+                        alpha=0.9,
+                    ))
             for a in ax:
                 a.axis('off')
             plt.tight_layout()
@@ -1093,10 +1144,11 @@ def evaluate_all(model, dataset, device, cfg):
             cam = resize_batch(batch['camera'].unsqueeze(0).to(device),
                                cfg['model_size'], mode='bilinear')
             pred, _ = predict_camera(model, field, phase, cfg, train_noise=False)
-            pred_d = log_display_tensor(pred)
-            cam_d = log_display_tensor(cam)
+            pred_eval, cam_eval = apply_loss_roi(pred, cam, cfg.get('loss_roi_fraction', 1.0))
+            pred_d = log_display_tensor(pred_eval)
+            cam_d = log_display_tensor(cam_eval)
             display_mse = F.mse_loss(pred_d, cam_d).item()
-            raw_mse = F.mse_loss(pred, cam).item()
+            raw_mse = F.mse_loss(pred_eval, cam_eval).item()
             rows.append((batch['id'], raw_mse, display_mse))
     return rows
 
@@ -1199,6 +1251,7 @@ if __name__ == '__main__':
     DARK_MARGIN = 0.10
     DARK_TOP_FRACTION = 0.002
     SI_LOG_EPS = 1e-4
+    LOSS_ROI_FRACTION = 0.80  # center crop for loss/metrics; set to 1.0 to use the full image
 
     # Visualization
     N_VIS_TRAIN = 5
@@ -1277,6 +1330,7 @@ if __name__ == '__main__':
         'dark_margin': DARK_MARGIN,
         'dark_top_fraction': DARK_TOP_FRACTION,
         'si_log_eps': SI_LOG_EPS,
+        'loss_roi_fraction': LOSS_ROI_FRACTION,
         'seed': SEED,
         'device': DEVICE,
     }
@@ -1379,9 +1433,11 @@ if __name__ == '__main__':
         model.load_state_dict(ckpt['model_state_dict'])
 
     rows = evaluate_all(model, dataset, DEVICE, cfg)
+    roi_fraction = cfg.get('loss_roi_fraction', 1.0)
+    metric_prefix = 'roi_' if roi_fraction is not None and float(roi_fraction) < 1.0 else ''
     with open(run_dir / 'per_sample_metrics.csv', 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(['id', 'raw_mse', 'display_log_mse', 'split'])
+        writer.writerow(['id', f'{metric_prefix}raw_mse', f'{metric_prefix}display_log_mse', 'split'])
         train_ids = {dataset.samples[i]['id'] for i in train_idx}
         for sid, raw_mse, display_mse in rows:
             writer.writerow([sid, raw_mse, display_mse,
