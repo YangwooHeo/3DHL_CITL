@@ -449,7 +449,7 @@ class SpectralConv2d(nn.Module):
 
 
 class FNOBlock2d(nn.Module):
-    def __init__(self, width, modes_y, modes_x, groups=8):
+    def __init__(self, width, modes_y, modes_x, groups=4):
         super().__init__()
         self.spectral = SpectralConv2d(width, width, modes_y, modes_x)
         self.local = nn.Conv2d(width, width, kernel_size=1)
@@ -1174,8 +1174,8 @@ def plot_loss_curve(history, run_dir):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    POOL_DIR = r'G:\공유 드라이브\taylorlab\3DHL\CITL\Fourier Neural Operator_Training phase masks\05_22_2026_sample1'
-    OUTPUT_DIR = r'C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment\05_18_2026_FNO_training'
+    POOL_DIR = r'H:\Shared drives\taylorlab\3DHL\CITL\Fourier Neural Operator_Training phase masks\05_22_2026_sample1'
+    OUTPUT_DIR = r'C:\REVAMP\Yangwoo Heo\SLM_to_Axicon_Optimiaztion\FNO_train_59simple_patterns'
     RUN_NAME = datetime.now().strftime('%Y%m%d_%H%M%S')
     EVAL_ONLY_RUN_DIR = None
 
@@ -1201,11 +1201,11 @@ if __name__ == '__main__':
 
     # FNO architecture
     PREDICTION_MODE = 'intensity'  # 'intensity' or 'direct_field'
-    WIDTH = 24
+    WIDTH = 12
     INTENSITY_ACTIVATION = 'softplus'
-    DEPTH = 5
-    MODES_Y = 72  # isolated blur trial: previous good run used 32
-    MODES_X = 72
+    DEPTH = 3
+    MODES_Y = 120  # isolated blur trial: previous good run used 32
+    MODES_X = 120
     MLP_WIDTH = 128
     OUTPUT_BIAS_INIT = -4.0  # softplus(-4) gives a dark, nonzero initial output
 
@@ -1228,9 +1228,9 @@ if __name__ == '__main__':
 
     # Training
     REQUIRE_CUDA = False
-    TRAIN_RATIO = 0.8
-    BATCH_SIZE = 1
-    EPOCHS = 50
+    TRAIN_RATIO = 0.9
+    BATCH_SIZE = 4
+    EPOCHS = 100
     LR = 2e-4
     WEIGHT_DECAY = 1e-5
     NUM_WORKERS = 1
@@ -1243,9 +1243,9 @@ if __name__ == '__main__':
     W_GRAD = 0.10
     W_FFT = 0.50
     W_RAW = 0.05
-    W_PEAK = 0.15
+    W_PEAK = 0.1
     W_DARK = 0.1
-    W_SI_LOG = 0.25
+    W_SI_LOG = 0 #.3
     PEAK_MARGIN = 0.10
     PEAK_TOP_FRACTION = 0.002
     DARK_MARGIN = 0.10
