@@ -896,15 +896,53 @@ def quantile_normalize_np(arr, q_min=0.001, q_max=0.999, eps=1e-8):
     return (arr - v_min) / (v_max - v_min + eps)
 
 
+def sample_type_from_id(sample_id):
+    sample_id = str(sample_id)
+    if sample_id.startswith('sys_'):
+        return 'systematic'
+    if sample_id.startswith('real_'):
+        return 'real'
+    return 'other'
+
+
 def split_dataset(dataset, train_ratio=0.8, seed=42):
-    n = len(dataset)
-    n_train = int(round(n * train_ratio))
     rng = random.Random(seed)
-    indices = list(range(n))
-    rng.shuffle(indices)
-    train_idx = indices[:n_train]
-    val_idx = indices[n_train:]
-    print(f"Split: {len(train_idx)} train / {len(val_idx)} val (ratio={train_ratio})")
+
+    sys_idx = []
+    real_idx = []
+    other_idx = []
+    for idx, sample in enumerate(dataset.samples):
+        sample_type = sample_type_from_id(sample['id'])
+        if sample_type == 'systematic':
+            sys_idx.append(idx)
+        elif sample_type == 'real':
+            real_idx.append(idx)
+        else:
+            other_idx.append(idx)
+
+    if sys_idx or real_idx:
+        rng.shuffle(real_idx)
+        rng.shuffle(other_idx)
+        n_real_train = int(round(len(real_idx) * train_ratio))
+        n_other_train = int(round(len(other_idx) * train_ratio))
+        train_idx = sys_idx + real_idx[:n_real_train] + other_idx[:n_other_train]
+        val_idx = real_idx[n_real_train:] + other_idx[n_other_train:]
+        print(
+            f"Prefix split: {len(train_idx)} train / {len(val_idx)} val "
+            f"(sys train-fixed={len(sys_idx)}, "
+            f"real train/val={n_real_train}/{len(real_idx) - n_real_train}, "
+            f"other train/val={n_other_train}/{len(other_idx) - n_other_train}, "
+            f"ratio={train_ratio})"
+        )
+    else:
+        n = len(dataset)
+        n_train = int(round(n * train_ratio))
+        indices = list(range(n))
+        rng.shuffle(indices)
+        train_idx = indices[:n_train]
+        val_idx = indices[n_train:]
+        print(f"Split: {len(train_idx)} train / {len(val_idx)} val (ratio={train_ratio})")
+
     return Subset(dataset, train_idx), Subset(dataset, val_idx), train_idx, val_idx
 
 
@@ -1169,6 +1207,143 @@ def plot_loss_curve(history, run_dir):
     plt.close()
 
 
+def write_per_sample_metrics(rows, dataset, train_idx, val_idx, run_dir, metric_prefix=''):
+    run_dir = Path(run_dir)
+    train_ids = {dataset.samples[i]['id'] for i in train_idx}
+    val_ids = {dataset.samples[i]['id'] for i in val_idx}
+    records = []
+
+    for sid, raw_mse, display_mse in rows:
+        if sid in train_ids:
+            split = 'train'
+        elif sid in val_ids:
+            split = 'val'
+        else:
+            split = 'unknown'
+        records.append({
+            'id': sid,
+            'type': sample_type_from_id(sid),
+            'split': split,
+            'raw_mse': float(raw_mse),
+            'display_log_mse': float(display_mse),
+        })
+
+    with open(run_dir / 'per_sample_metrics.csv', 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'id', 'type', 'split',
+            f'{metric_prefix}raw_mse',
+            f'{metric_prefix}display_log_mse',
+        ])
+        for record in records:
+            writer.writerow([
+                record['id'],
+                record['type'],
+                record['split'],
+                record['raw_mse'],
+                record['display_log_mse'],
+            ])
+
+    summary = {}
+    for record in records:
+        key = (record['type'], record['split'])
+        bucket = summary.setdefault(key, {'n': 0, 'raw': [], 'display': []})
+        bucket['n'] += 1
+        bucket['raw'].append(record['raw_mse'])
+        bucket['display'].append(record['display_log_mse'])
+
+    with open(run_dir / 'per_sample_metrics_summary.csv', 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'type', 'split', 'n',
+            f'mean_{metric_prefix}raw_mse',
+            f'median_{metric_prefix}raw_mse',
+            f'mean_{metric_prefix}display_log_mse',
+            f'median_{metric_prefix}display_log_mse',
+        ])
+        for (sample_type, split), bucket in sorted(summary.items()):
+            writer.writerow([
+                sample_type, split, bucket['n'],
+                float(np.mean(bucket['raw'])),
+                float(np.median(bucket['raw'])),
+                float(np.mean(bucket['display'])),
+                float(np.median(bucket['display'])),
+            ])
+
+    return records
+
+
+def plot_per_sample_metrics(records, run_dir, metric_prefix=''):
+    if not records:
+        return
+    run_dir = Path(run_dir)
+
+    color_map = {
+        ('systematic', 'train'): 'steelblue',
+        ('systematic', 'val'): 'lightskyblue',
+        ('real', 'train'): 'seagreen',
+        ('real', 'val'): 'coral',
+        ('other', 'train'): 'gray',
+        ('other', 'val'): 'darkorange',
+        ('unknown', 'unknown'): 'black',
+    }
+
+    def record_color(record):
+        return color_map.get((record['type'], record['split']),
+                             color_map.get((record['type'], 'train'), 'black'))
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
+    for ax, metric_key, title in [
+        (axes[0], 'display_log_mse', f"{metric_prefix}display log MSE"),
+        (axes[1], 'raw_mse', f"{metric_prefix}raw MSE"),
+    ]:
+        sorted_records = sorted(records, key=lambda r: r[metric_key])
+        values = [r[metric_key] for r in sorted_records]
+        colors = [record_color(r) for r in sorted_records]
+        ax.scatter(np.arange(len(sorted_records)), values, c=colors, s=12, alpha=0.85)
+        ax.set_title(f"Per-sample {title} (sorted low to high)")
+        ax.set_xlabel("sample rank")
+        ax.set_ylabel(title)
+        if any(v > 0 for v in values):
+            ax.set_yscale('log')
+        ax.grid(True, alpha=0.25)
+
+    legend_items = []
+    seen = set()
+    for record in records:
+        label = f"{record['type']} / {record['split']}"
+        if label in seen:
+            continue
+        seen.add(label)
+        legend_items.append(plt.Line2D(
+            [0], [0], marker='o', linestyle='',
+            markerfacecolor=record_color(record),
+            markeredgecolor='none', label=label,
+        ))
+    axes[0].legend(handles=legend_items, fontsize=8, loc='best')
+    plt.tight_layout()
+    plt.savefig(run_dir / 'per_sample_mse_plot.png', dpi=150)
+    plt.close(fig)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    for ax, metric_key, title in [
+        (axes[0], 'display_log_mse', f"{metric_prefix}display log MSE"),
+        (axes[1], 'raw_mse', f"{metric_prefix}raw MSE"),
+    ]:
+        for sample_type in sorted({r['type'] for r in records}):
+            vals = [r[metric_key] for r in records if r['type'] == sample_type]
+            if vals:
+                ax.hist(vals, bins=30, alpha=0.5, label=sample_type)
+        ax.set_title(f"Distribution of {title}")
+        ax.set_xlabel(title)
+        ax.set_ylabel("count")
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(run_dir / 'per_sample_mse_hist.png', dpi=150)
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1380,6 +1555,8 @@ if __name__ == '__main__':
         if not eval_only:
             with open(split_path, 'w', encoding='utf-8') as f:
                 json.dump({
+                    'split_rule': 'sys_* -> train fixed; real_* -> random train/val; others -> random train/val',
+                    'train_ratio_for_real_and_other': TRAIN_RATIO,
                     'train': [dataset.samples[i]['id'] for i in train_idx],
                     'val': [dataset.samples[i]['id'] for i in val_idx],
                 }, f, indent=2)
@@ -1435,13 +1612,9 @@ if __name__ == '__main__':
     rows = evaluate_all(model, dataset, DEVICE, cfg)
     roi_fraction = cfg.get('loss_roi_fraction', 1.0)
     metric_prefix = 'roi_' if roi_fraction is not None and float(roi_fraction) < 1.0 else ''
-    with open(run_dir / 'per_sample_metrics.csv', 'w', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        writer.writerow(['id', f'{metric_prefix}raw_mse', f'{metric_prefix}display_log_mse', 'split'])
-        train_ids = {dataset.samples[i]['id'] for i in train_idx}
-        for sid, raw_mse, display_mse in rows:
-            writer.writerow([sid, raw_mse, display_mse,
-                             'train' if sid in train_ids else 'val'])
+    metric_records = write_per_sample_metrics(
+        rows, dataset, train_idx, val_idx, run_dir, metric_prefix=metric_prefix)
+    plot_per_sample_metrics(metric_records, run_dir, metric_prefix=metric_prefix)
 
     vis_train = train_idx[:N_VIS_TRAIN]
     vis_val = val_idx[:N_VIS_VAL]
