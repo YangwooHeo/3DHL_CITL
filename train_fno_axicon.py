@@ -745,20 +745,31 @@ def dark_deficit_loss(pred, target, margin=0.10, top_fraction=0.002, eps=1e-6):
     return deficit.mean()
 
 
-def visual_loss(pred, target, w_photo=0.0, w_ssim=1.0, w_grad=0.1, w_fft=0.0,
-                w_raw=1.0, w_peak=0.0, w_dark=0.0,
+def target_mean_normalized_smooth_l1_loss(pred, target, eps=1e-6):
+    scale = target.mean(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    return F.smooth_l1_loss(pred / scale, target / scale)
+
+
+def visual_loss(pred, target, w_log_display_smooth_l1=0.0, w_ssim=1.0, w_grad=0.1, w_fft=0.0,
+                w_mean_norm_l1=1.0, w_peak=0.0, w_dark=0.0,
                 peak_margin=0.10, peak_top_fraction=0.002,
                 dark_margin=0.10, dark_top_fraction=0.002):
     pred_d = target_d = None
-    if w_photo > 0 or w_fft > 0:
+    if w_log_display_smooth_l1 > 0 or w_fft > 0:
         pred_d = log_display_tensor(pred)
         target_d = log_display_tensor(target)
 
-    photo = F.smooth_l1_loss(pred_d, target_d) if w_photo > 0 else pred.new_tensor(0.0)
+    log_display_smooth_l1 = (
+        F.smooth_l1_loss(pred_d, target_d)
+        if w_log_display_smooth_l1 > 0 else pred.new_tensor(0.0)
+    )
     ssim = simple_ssim_loss(pred, target) if w_ssim > 0 else pred.new_tensor(0.0)
     grad = gradient_loss(pred, target) if w_grad > 0 else pred.new_tensor(0.0)
     fft = fft_texture_loss(pred_d, target_d) if w_fft > 0 else pred.new_tensor(0.0)
-    raw = F.mse_loss(pred, target) if w_raw > 0 else pred.new_tensor(0.0)
+    mean_norm_l1 = (
+        target_mean_normalized_smooth_l1_loss(pred, target)
+        if w_mean_norm_l1 > 0 else pred.new_tensor(0.0)
+    )
     peak = bright_excess_loss(
         pred, target,
         margin=peak_margin,
@@ -769,14 +780,16 @@ def visual_loss(pred, target, w_photo=0.0, w_ssim=1.0, w_grad=0.1, w_fft=0.0,
         margin=dark_margin,
         top_fraction=dark_top_fraction,
     ) if w_dark > 0 else pred.new_tensor(0.0)
-    total = (w_photo * photo + w_ssim * ssim + w_grad * grad +
-             w_fft * fft + w_raw * raw + w_peak * peak + w_dark * dark)
+    total = (w_log_display_smooth_l1 * log_display_smooth_l1 +
+             w_ssim * ssim + w_grad * grad + w_fft * fft +
+             w_mean_norm_l1 * mean_norm_l1 +
+             w_peak * peak + w_dark * dark)
     return total, {
-        'photo': photo.item(),
+        'log_display_smooth_l1': log_display_smooth_l1.item(),
         'ssim': ssim.item(),
         'grad': grad.item(),
         'fft': fft.item(),
-        'raw': raw.item(),
+        'mean_norm_l1': mean_norm_l1.item(),
         'peak': peak.item(),
         'dark': dark.item(),
         'raw_mse': F.mse_loss(pred, target).item(),
@@ -911,11 +924,11 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
     best_val = float('inf')
     history = {
         'train': [], 'val': [],
-        'train_photo': [], 'val_photo': [],
+        'train_log_display_smooth_l1': [], 'val_log_display_smooth_l1': [],
         'train_ssim': [], 'val_ssim': [],
         'train_grad': [], 'val_grad': [],
         'train_fft': [], 'val_fft': [],
-        'train_raw': [], 'val_raw': [],
+        'train_mean_norm_l1': [], 'val_mean_norm_l1': [],
         'train_peak': [], 'val_peak': [],
         'train_dark': [], 'val_dark': [],
         'train_raw_mse': [], 'val_raw_mse': [],
@@ -923,8 +936,8 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
 
     for epoch in range(cfg['epochs']):
         model.train()
-        sums = {k: 0.0 for k in ['loss', 'photo', 'ssim', 'grad', 'fft',
-                                  'raw', 'peak', 'dark', 'raw_mse']}
+        sums = {k: 0.0 for k in ['loss', 'log_display_smooth_l1', 'ssim', 'grad', 'fft',
+                                  'mean_norm_l1', 'peak', 'dark', 'raw_mse']}
         n_seen = 0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{cfg['epochs']} [train]"):
             field, _, phase, camera = prepare_batch(batch, device, cfg['model_size'])
@@ -935,11 +948,11 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
                 pred_loss, camera_loss = apply_loss_roi(pred, camera, loss_roi_fraction)
                 loss, comps = visual_loss(
                     pred_loss, camera_loss,
-                    w_photo=cfg['w_photo'],
+                    w_log_display_smooth_l1=cfg['w_log_display_smooth_l1'],
                     w_ssim=cfg['w_ssim'],
                     w_grad=cfg['w_grad'],
                     w_fft=cfg['w_fft'],
-                    w_raw=cfg['w_raw'],
+                    w_mean_norm_l1=cfg['w_mean_norm_l1'],
                     w_peak=cfg['w_peak'],
                     w_dark=cfg['w_dark'],
                     peak_margin=cfg['peak_margin'],
@@ -964,8 +977,8 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
         train_stats = {k: v / max(n_seen, 1) for k, v in sums.items()}
 
         model.eval()
-        sums = {k: 0.0 for k in ['loss', 'photo', 'ssim', 'grad', 'fft',
-                                  'raw', 'peak', 'dark', 'raw_mse']}
+        sums = {k: 0.0 for k in ['loss', 'log_display_smooth_l1', 'ssim', 'grad', 'fft',
+                                  'mean_norm_l1', 'peak', 'dark', 'raw_mse']}
         n_seen = 0
         with torch.no_grad():
             for batch in val_loader:
@@ -974,11 +987,11 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
                 pred_loss, camera_loss = apply_loss_roi(pred, camera, loss_roi_fraction)
                 loss, comps = visual_loss(
                     pred_loss, camera_loss,
-                    w_photo=cfg['w_photo'],
+                    w_log_display_smooth_l1=cfg['w_log_display_smooth_l1'],
                     w_ssim=cfg['w_ssim'],
                     w_grad=cfg['w_grad'],
                     w_fft=cfg['w_fft'],
-                    w_raw=cfg['w_raw'],
+                    w_mean_norm_l1=cfg['w_mean_norm_l1'],
                     w_peak=cfg['w_peak'],
                     w_dark=cfg['w_dark'],
                     peak_margin=cfg['peak_margin'],
@@ -996,14 +1009,16 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
 
         history['train'].append(train_stats['loss'])
         history['val'].append(val_stats['loss'])
-        for k in ['photo', 'ssim', 'grad', 'fft', 'raw', 'peak', 'dark', 'raw_mse']:
+        for k in ['log_display_smooth_l1', 'ssim', 'grad', 'fft', 'mean_norm_l1',
+                  'peak', 'dark', 'raw_mse']:
             history[f'train_{k}'].append(train_stats[k])
             history[f'val_{k}'].append(val_stats[k])
 
         print(
             f"  Epoch {epoch + 1}: "
             f"train_loss={train_stats['loss']:.5f} val_loss={val_stats['loss']:.5f} "
-            f"val_raw={val_stats['raw']:.5f} val_ssim={val_stats['ssim']:.5f} "
+            f"val_mean_norm_l1={val_stats['mean_norm_l1']:.5f} "
+            f"val_ssim={val_stats['ssim']:.5f} "
             f"val_grad={val_stats['grad']:.5f} "
             f"raw_mse={val_stats['raw_mse']:.5f}"
         )
@@ -1344,11 +1359,11 @@ if __name__ == '__main__':
     GRAD_CLIP = 1.0
 
     # Loss
-    W_PHOTO = 0.0
+    W_LOG_DISPLAY_SMOOTH_L1 = 0.0
     W_SSIM = 1.0
     W_GRAD = 0.10
     W_FFT = 0.0
-    W_RAW = 1.0
+    W_MEAN_NORM_L1 = 1.0
     W_PEAK = 0.0
     W_DARK = 0.0
     PEAK_MARGIN = 0.10
@@ -1416,11 +1431,11 @@ if __name__ == '__main__':
         'require_cuda': REQUIRE_CUDA,
         'use_amp': USE_AMP,
         'grad_clip': GRAD_CLIP,
-        'w_photo': W_PHOTO,
+        'w_log_display_smooth_l1': W_LOG_DISPLAY_SMOOTH_L1,
         'w_ssim': W_SSIM,
         'w_grad': W_GRAD,
         'w_fft': W_FFT,
-        'w_raw': W_RAW,
+        'w_mean_norm_l1': W_MEAN_NORM_L1,
         'w_peak': W_PEAK,
         'w_dark': W_DARK,
         'peak_margin': PEAK_MARGIN,
