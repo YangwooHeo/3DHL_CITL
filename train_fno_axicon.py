@@ -10,18 +10,11 @@ Workflow-folder layout:
     pool/
       0.Phase_Mask/*.npy
       2.Aligned_Camera/*.npy
-      3.Forward_Sim/*.npy
+      1.Forward_Sim/*.npy
 
 Files are paired by normalized stem, so minor naming differences such as
 `sine80_890_0.npy` vs `sine_80_890_0.npy` and `..._09.npy` vs `..._9.npy`
 can still be matched.
-
-Legacy sample-folder layout:
-
-    pool/sample_id/
-      slm_phase.npy
-      simulation_field.npy   # complex, 2ch real/imag, or 3ch amp/cos/sin
-      camera.npy
 
 Default model behavior is non-residual:
 
@@ -43,7 +36,6 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-from PIL import Image
 from tqdm import tqdm
 
 import torch
@@ -58,14 +50,9 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 class AxiconFieldDataset(Dataset):
     def __init__(self, root_dir,
-                 dataset_layout='auto',
-                 field_filename='simulation_field.npy',
-                 cam_filename='camera.npy',
-                 phase_filename='slm_phase.npy',
-                 workflow_field_dir='3.Forward_Sim',
+                 workflow_field_dir='1.Forward_Sim',
                  workflow_camera_dir='2.Aligned_Camera',
                  workflow_phase_dir='0.Phase_Mask',
-                 require_phase=True,
                  sim_size=1024,
                  phase_flip_lr=True,
                  field_scale_mode='global_percentile',
@@ -76,14 +63,9 @@ class AxiconFieldDataset(Dataset):
                  camera_scale=None,
                  camera_black_level=0.0):
         self.root_dir = Path(root_dir)
-        self.dataset_layout = dataset_layout
-        self.field_filename = field_filename
-        self.cam_filename = cam_filename
-        self.phase_filename = phase_filename
         self.workflow_field_dir = workflow_field_dir
         self.workflow_camera_dir = workflow_camera_dir
         self.workflow_phase_dir = workflow_phase_dir
-        self.require_phase = require_phase
         self.sim_size = int(sim_size)
         self.phase_flip_lr = phase_flip_lr
         self.field_scale_mode = field_scale_mode
@@ -100,8 +82,8 @@ class AxiconFieldDataset(Dataset):
         self._validate_scale_mode(self.field_scale_mode, 'field_scale_mode')
         self._validate_scale_mode(self.camera_scale_mode, 'camera_scale_mode')
 
-        self.samples = self._discover_samples()
-        print(f">>> Loaded {len(self.samples)} samples from {self.root_dir} ({self.dataset_layout} layout)")
+        self.samples = self._discover_workflow_samples()
+        print(f">>> Loaded {len(self.samples)} workflow samples from {self.root_dir}")
         if self.samples:
             print(f">>> First sample ids: {', '.join(s['id'] for s in self.samples[:5])}")
         if self.camera_scale_mode == 'global_percentile' and self.camera_scale is None:
@@ -110,48 +92,6 @@ class AxiconFieldDataset(Dataset):
             self.field_amp_scale = self._compute_global_field_amp_scale()
         print(f">>> Camera scale mode: {self.camera_scale_mode}, scale={self.camera_scale}")
         print(f">>> Field scale mode: {self.field_scale_mode}, amp_scale={self.field_amp_scale}")
-
-    def _discover_samples(self):
-        layout = self.dataset_layout.lower()
-        if layout not in {'auto', 'sample', 'workflow'}:
-            raise ValueError("dataset_layout must be one of {'auto', 'sample', 'workflow'}")
-
-        if layout == 'auto':
-            workflow_ready = (self.root_dir / self.workflow_field_dir).is_dir() and \
-                             (self.root_dir / self.workflow_camera_dir).is_dir()
-            layout = 'workflow' if workflow_ready else 'sample'
-            self.dataset_layout = layout
-
-        if layout == 'workflow':
-            self.dataset_layout = layout
-            return self._discover_workflow_samples()
-
-        self.dataset_layout = layout
-        return self._discover_sample_folder_samples()
-
-    def _discover_sample_folder_samples(self):
-        samples = []
-        for d in sorted(p for p in self.root_dir.iterdir() if p.is_dir()):
-            field_p = d / self.field_filename
-            cam_p = d / self.cam_filename
-            phase_p = d / self.phase_filename
-
-            if not field_p.exists() and (d / 'simulation.png').exists():
-                field_p = d / 'simulation.png'
-            if not cam_p.exists() and (d / 'camera.png').exists():
-                cam_p = d / 'camera.png'
-
-            has_phase = phase_p.exists()
-            if field_p.exists() and cam_p.exists() and (has_phase or not self.require_phase):
-                samples.append({
-                    'id': d.name,
-                    'field': field_p,
-                    'camera': cam_p,
-                    'phase': phase_p if has_phase else None,
-                })
-            else:
-                print(f"[skip] {d.name} (missing files)")
-        return samples
 
     def _normalized_stem(self, path):
         stem = Path(path).stem
@@ -181,15 +121,15 @@ class AxiconFieldDataset(Dataset):
         return path_map
 
     def _discover_workflow_samples(self):
-        field_map = self._path_map_by_normalized_stem(self.workflow_field_dir, ('*.npy', '*.png'))
-        camera_map = self._path_map_by_normalized_stem(self.workflow_camera_dir, ('*.npy', '*.png'))
+        field_map = self._path_map_by_normalized_stem(self.workflow_field_dir, ('*.npy',))
+        camera_map = self._path_map_by_normalized_stem(self.workflow_camera_dir, ('*.npy',))
         phase_map = self._path_map_by_normalized_stem(self.workflow_phase_dir, ('*.npy',))
 
         common_ids = sorted(set(field_map) & set(camera_map))
         samples = []
         for sample_id in common_ids:
             phase_p = phase_map.get(sample_id)
-            if phase_p is None and self.require_phase:
+            if phase_p is None:
                 print(f"[skip] {sample_id} (missing phase)")
                 continue
             samples.append({
@@ -246,18 +186,15 @@ class AxiconFieldDataset(Dataset):
         return None
 
     def _load_camera_array(self, path):
-        if path.suffix.lower() == '.npy':
-            arr = np.load(path)
-            if np.iscomplexobj(arr):
-                arr = np.abs(arr) ** 2
-            arr = np.squeeze(arr)
-            if arr.ndim != 2:
-                raise ValueError(f"{path} must be 2D camera data; got {arr.shape}")
-            return np.nan_to_num(arr.astype(np.float32))
-
-        img = Image.open(path).convert('L')
-        arr = np.asarray(img, dtype=np.float32) / 255.0
-        return arr
+        if path.suffix.lower() != '.npy':
+            raise ValueError(f"Camera files must be .npy in workflow layout; got {path}")
+        arr = np.load(path)
+        if np.iscomplexobj(arr):
+            arr = np.abs(arr) ** 2
+        arr = np.squeeze(arr)
+        if arr.ndim != 2:
+            raise ValueError(f"{path} must be 2D camera data; got {arr.shape}")
+        return np.nan_to_num(arr.astype(np.float32))
 
     def _camera_to_training_scale(self, arr, eps=1e-8):
         arr = np.nan_to_num(np.asarray(arr, dtype=np.float32))
@@ -306,11 +243,7 @@ class AxiconFieldDataset(Dataset):
     def _compute_global_field_amp_scale(self, eps=1e-8):
         values = []
         for s in self.samples:
-            if s['field'].suffix.lower() == '.npy':
-                arr = np.load(s['field'])
-            else:
-                img = Image.open(s['field']).convert('L')
-                arr = np.asarray(img, dtype=np.float32) / 255.0
+            arr = np.load(s['field'])
             amp = self._extract_field_amplitude(arr)
             finite = amp[np.isfinite(amp)]
             if finite.size:
@@ -373,18 +306,12 @@ class AxiconFieldDataset(Dataset):
         return field.float(), sim_intensity.float()
 
     def _load_field(self, path):
-        if path.suffix.lower() == '.npy':
-            arr = np.load(path)
-        else:
-            img = Image.open(path).convert('L')
-            if img.size != (self.sim_size, self.sim_size):
-                img = img.resize((self.sim_size, self.sim_size), Image.BILINEAR)
-            arr = np.asarray(img, dtype=np.float32) / 255.0
+        if path.suffix.lower() != '.npy':
+            raise ValueError(f"Simulation field files must be .npy in workflow layout; got {path}")
+        arr = np.load(path)
         return self._field_to_channels(arr)
 
     def _load_phase(self, path):
-        if path is None:
-            return torch.zeros((1, self.sim_size, self.sim_size), dtype=torch.float32)
         phase = np.load(path).astype(np.float32)
         if self.phase_flip_lr:
             phase = phase[:, ::-1].copy()
@@ -787,34 +714,6 @@ def fft_texture_loss(pred, target, highpass_kernel=31):
                      per_image_standardize(target_mag))
 
 
-def masked_mean(x, mask=None, dim=(-2, -1), keepdim=True, eps=1e-8):
-    if mask is None:
-        return x.mean(dim=dim, keepdim=keepdim)
-
-    mask = mask.to(dtype=x.dtype, device=x.device)
-    while mask.ndim < x.ndim:
-        mask = mask.unsqueeze(1)
-    total = (x * mask).sum(dim=dim, keepdim=keepdim)
-    count = mask.sum(dim=dim, keepdim=keepdim).clamp_min(eps)
-    return total / count
-
-
-def centered_log_shape(x, mask=None, eps=1e-4):
-    log_x = torch.log(x.clamp_min(eps))
-    return log_x - masked_mean(log_x, mask=mask)
-
-
-def scale_invariant_log_shape_loss(pred, target, mask=None, eps=1e-4):
-    pred0 = centered_log_shape(pred, mask=mask, eps=eps)
-    target0 = centered_log_shape(target, mask=mask, eps=eps)
-    return F.l1_loss(pred0, target0)
-
-
-def raw_scaled_l1_loss(pred, target, eps=1e-6):
-    scale = target.mean(dim=(-2, -1), keepdim=True).clamp_min(eps)
-    return F.smooth_l1_loss(pred / scale, target / scale)
-
-
 def bright_excess_loss(pred, target, margin=0.10, top_fraction=0.002, eps=1e-6):
     """
     Penalize small, very bright hallucinations that visual/log losses can miss.
@@ -846,22 +745,20 @@ def dark_deficit_loss(pred, target, margin=0.10, top_fraction=0.002, eps=1e-6):
     return deficit.mean()
 
 
-def visual_loss(pred, target, w_photo=1.0, w_ssim=0.25, w_grad=0.1, w_fft=0.5,
-                w_raw=0.0, w_peak=0.0, w_dark=0.0, w_si_log=0.0,
+def visual_loss(pred, target, w_photo=0.0, w_ssim=1.0, w_grad=0.1, w_fft=0.0,
+                w_raw=1.0, w_peak=0.0, w_dark=0.0,
                 peak_margin=0.10, peak_top_fraction=0.002,
-                dark_margin=0.10, dark_top_fraction=0.002,
-                si_log_eps=1e-4):
-    pred_d = log_display_tensor(pred)
-    target_d = log_display_tensor(target)
-    photo = F.smooth_l1_loss(pred_d, target_d)
-    ssim = simple_ssim_loss(pred_d, target_d) if w_ssim > 0 else pred.new_tensor(0.0)
-    grad = gradient_loss(pred_d, target_d) if w_grad > 0 else pred.new_tensor(0.0)
+                dark_margin=0.10, dark_top_fraction=0.002):
+    pred_d = target_d = None
+    if w_photo > 0 or w_fft > 0:
+        pred_d = log_display_tensor(pred)
+        target_d = log_display_tensor(target)
+
+    photo = F.smooth_l1_loss(pred_d, target_d) if w_photo > 0 else pred.new_tensor(0.0)
+    ssim = simple_ssim_loss(pred, target) if w_ssim > 0 else pred.new_tensor(0.0)
+    grad = gradient_loss(pred, target) if w_grad > 0 else pred.new_tensor(0.0)
     fft = fft_texture_loss(pred_d, target_d) if w_fft > 0 else pred.new_tensor(0.0)
-    raw = raw_scaled_l1_loss(pred, target) if w_raw > 0 else pred.new_tensor(0.0)
-    si_log = scale_invariant_log_shape_loss(
-        pred, target,
-        eps=si_log_eps,
-    ) if w_si_log > 0 else pred.new_tensor(0.0)
+    raw = F.mse_loss(pred, target) if w_raw > 0 else pred.new_tensor(0.0)
     peak = bright_excess_loss(
         pred, target,
         margin=peak_margin,
@@ -873,8 +770,7 @@ def visual_loss(pred, target, w_photo=1.0, w_ssim=0.25, w_grad=0.1, w_fft=0.5,
         top_fraction=dark_top_fraction,
     ) if w_dark > 0 else pred.new_tensor(0.0)
     total = (w_photo * photo + w_ssim * ssim + w_grad * grad +
-             w_fft * fft + w_raw * raw + w_peak * peak +
-             w_dark * dark + w_si_log * si_log)
+             w_fft * fft + w_raw * raw + w_peak * peak + w_dark * dark)
     return total, {
         'photo': photo.item(),
         'ssim': ssim.item(),
@@ -883,7 +779,6 @@ def visual_loss(pred, target, w_photo=1.0, w_ssim=0.25, w_grad=0.1, w_fft=0.5,
         'raw': raw.item(),
         'peak': peak.item(),
         'dark': dark.item(),
-        'si_log': si_log.item(),
         'raw_mse': F.mse_loss(pred, target).item(),
     }
 
@@ -902,6 +797,37 @@ def sample_type_from_id(sample_id):
         return 'systematic'
     if sample_id.startswith('real_'):
         return 'real'
+    return 'other'
+
+
+def sample_group_from_id(sample_id):
+    sample_id = str(sample_id)
+    if sample_id.startswith('real_'):
+        return 'real'
+    if sample_id.startswith('sys_zernike_combo'):
+        return 'zernike_combo'
+    if sample_id.startswith('sys_zernike_j'):
+        return 'zernike_single'
+    if sample_id.startswith('sys_ramp') or sample_id.startswith('sys_linear_ramp'):
+        return 'linear_ramp'
+    if sample_id.startswith('sys_checker'):
+        return 'checkerboard'
+    if sample_id.startswith('sys_square_ring'):
+        return 'square_ring'
+    if sample_id.startswith('sys_radial_ring'):
+        return 'radial_ring'
+    if sample_id.startswith('sys_local_bump'):
+        return 'local_bump'
+    if sample_id.startswith('sys_sine'):
+        return 'sine'
+    if sample_id.startswith('sys_'):
+        return 'systematic_other'
+    if sample_id.startswith('sine'):
+        return 'sine'
+    if sample_id.startswith('checker'):
+        return 'checkerboard'
+    if sample_id.startswith('linear_ramp'):
+        return 'linear_ramp'
     return 'other'
 
 
@@ -992,14 +918,13 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
         'train_raw': [], 'val_raw': [],
         'train_peak': [], 'val_peak': [],
         'train_dark': [], 'val_dark': [],
-        'train_si_log': [], 'val_si_log': [],
         'train_raw_mse': [], 'val_raw_mse': [],
     }
 
     for epoch in range(cfg['epochs']):
         model.train()
         sums = {k: 0.0 for k in ['loss', 'photo', 'ssim', 'grad', 'fft',
-                                  'raw', 'peak', 'dark', 'si_log', 'raw_mse']}
+                                  'raw', 'peak', 'dark', 'raw_mse']}
         n_seen = 0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{cfg['epochs']} [train]"):
             field, _, phase, camera = prepare_batch(batch, device, cfg['model_size'])
@@ -1017,12 +942,10 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
                     w_raw=cfg['w_raw'],
                     w_peak=cfg['w_peak'],
                     w_dark=cfg['w_dark'],
-                    w_si_log=cfg['w_si_log'],
                     peak_margin=cfg['peak_margin'],
                     peak_top_fraction=cfg['peak_top_fraction'],
                     dark_margin=cfg['dark_margin'],
                     dark_top_fraction=cfg['dark_top_fraction'],
-                    si_log_eps=cfg['si_log_eps'],
                 )
 
             scaler.scale(loss).backward()
@@ -1042,7 +965,7 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
 
         model.eval()
         sums = {k: 0.0 for k in ['loss', 'photo', 'ssim', 'grad', 'fft',
-                                  'raw', 'peak', 'dark', 'si_log', 'raw_mse']}
+                                  'raw', 'peak', 'dark', 'raw_mse']}
         n_seen = 0
         with torch.no_grad():
             for batch in val_loader:
@@ -1058,12 +981,10 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
                     w_raw=cfg['w_raw'],
                     w_peak=cfg['w_peak'],
                     w_dark=cfg['w_dark'],
-                    w_si_log=cfg['w_si_log'],
                     peak_margin=cfg['peak_margin'],
                     peak_top_fraction=cfg['peak_top_fraction'],
                     dark_margin=cfg['dark_margin'],
                     dark_top_fraction=cfg['dark_top_fraction'],
-                    si_log_eps=cfg['si_log_eps'],
                 )
                 b = field.shape[0]
                 sums['loss'] += loss.item() * b
@@ -1075,17 +996,15 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
 
         history['train'].append(train_stats['loss'])
         history['val'].append(val_stats['loss'])
-        for k in ['photo', 'ssim', 'grad', 'fft', 'raw', 'peak',
-                  'dark', 'si_log', 'raw_mse']:
+        for k in ['photo', 'ssim', 'grad', 'fft', 'raw', 'peak', 'dark', 'raw_mse']:
             history[f'train_{k}'].append(train_stats[k])
             history[f'val_{k}'].append(val_stats[k])
 
         print(
             f"  Epoch {epoch + 1}: "
             f"train_loss={train_stats['loss']:.5f} val_loss={val_stats['loss']:.5f} "
-            f"val_photo={val_stats['photo']:.5f} val_fft={val_stats['fft']:.5f} "
-            f"val_si_log={val_stats['si_log']:.5f} "
-            f"val_peak={val_stats['peak']:.5f} val_dark={val_stats['dark']:.5f} "
+            f"val_raw={val_stats['raw']:.5f} val_ssim={val_stats['ssim']:.5f} "
+            f"val_grad={val_stats['grad']:.5f} "
             f"raw_mse={val_stats['raw_mse']:.5f}"
         )
 
@@ -1187,7 +1106,8 @@ def evaluate_all(model, dataset, device, cfg):
             cam_d = log_display_tensor(cam_eval)
             display_mse = F.mse_loss(pred_d, cam_d).item()
             raw_mse = F.mse_loss(pred_eval, cam_eval).item()
-            rows.append((batch['id'], raw_mse, display_mse))
+            ssim = 1.0 - simple_ssim_loss(pred_eval, cam_eval).item()
+            rows.append((idx, batch['id'], raw_mse, display_mse, ssim))
     return rows
 
 
@@ -1198,7 +1118,7 @@ def plot_loss_curve(history, run_dir):
     plt.plot(history['train'], label='train', color='steelblue')
     plt.plot(history['val'], label='val', color='coral')
     plt.xlabel('Epoch')
-    plt.ylabel('Visual loss')
+    plt.ylabel('Loss')
     plt.yscale('log')
     plt.grid(True, alpha=0.3)
     plt.legend()
@@ -1213,7 +1133,7 @@ def write_per_sample_metrics(rows, dataset, train_idx, val_idx, run_dir, metric_
     val_ids = {dataset.samples[i]['id'] for i in val_idx}
     records = []
 
-    for sid, raw_mse, display_mse in rows:
+    for idx, sid, raw_mse, display_mse, ssim in rows:
         if sid in train_ids:
             split = 'train'
         elif sid in val_ids:
@@ -1221,53 +1141,65 @@ def write_per_sample_metrics(rows, dataset, train_idx, val_idx, run_dir, metric_
         else:
             split = 'unknown'
         records.append({
+            'index': int(idx),
             'id': sid,
             'type': sample_type_from_id(sid),
+            'group': sample_group_from_id(sid),
             'split': split,
             'raw_mse': float(raw_mse),
             'display_log_mse': float(display_mse),
+            'ssim': float(ssim),
         })
 
     with open(run_dir / 'per_sample_metrics.csv', 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow([
-            'id', 'type', 'split',
+            'index', 'id', 'type', 'group', 'split',
             f'{metric_prefix}raw_mse',
             f'{metric_prefix}display_log_mse',
+            f'{metric_prefix}ssim',
         ])
         for record in records:
             writer.writerow([
+                record['index'],
                 record['id'],
                 record['type'],
+                record['group'],
                 record['split'],
                 record['raw_mse'],
                 record['display_log_mse'],
+                record['ssim'],
             ])
 
     summary = {}
     for record in records:
-        key = (record['type'], record['split'])
-        bucket = summary.setdefault(key, {'n': 0, 'raw': [], 'display': []})
+        key = (record['type'], record['group'], record['split'])
+        bucket = summary.setdefault(key, {'n': 0, 'raw': [], 'display': [], 'ssim': []})
         bucket['n'] += 1
         bucket['raw'].append(record['raw_mse'])
         bucket['display'].append(record['display_log_mse'])
+        bucket['ssim'].append(record['ssim'])
 
     with open(run_dir / 'per_sample_metrics_summary.csv', 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow([
-            'type', 'split', 'n',
+            'type', 'group', 'split', 'n',
             f'mean_{metric_prefix}raw_mse',
             f'median_{metric_prefix}raw_mse',
             f'mean_{metric_prefix}display_log_mse',
             f'median_{metric_prefix}display_log_mse',
+            f'mean_{metric_prefix}ssim',
+            f'median_{metric_prefix}ssim',
         ])
-        for (sample_type, split), bucket in sorted(summary.items()):
+        for (sample_type, group, split), bucket in sorted(summary.items()):
             writer.writerow([
-                sample_type, split, bucket['n'],
+                sample_type, group, split, bucket['n'],
                 float(np.mean(bucket['raw'])),
                 float(np.median(bucket['raw'])),
                 float(np.mean(bucket['display'])),
                 float(np.median(bucket['display'])),
+                float(np.mean(bucket['ssim'])),
+                float(np.median(bucket['ssim'])),
             ])
 
     return records
@@ -1278,62 +1210,66 @@ def plot_per_sample_metrics(records, run_dir, metric_prefix=''):
         return
     run_dir = Path(run_dir)
 
-    color_map = {
-        ('systematic', 'train'): 'steelblue',
-        ('systematic', 'val'): 'lightskyblue',
-        ('real', 'train'): 'seagreen',
-        ('real', 'val'): 'coral',
-        ('other', 'train'): 'gray',
-        ('other', 'val'): 'darkorange',
-        ('unknown', 'unknown'): 'black',
+    group_colors = {
+        'sine': 'tab:blue',
+        'linear_ramp': 'tab:cyan',
+        'checkerboard': 'tab:orange',
+        'square_ring': 'tab:brown',
+        'radial_ring': 'tab:red',
+        'zernike_single': 'tab:purple',
+        'zernike_combo': 'tab:pink',
+        'local_bump': 'tab:green',
+        'real': 'black',
+        'systematic_other': 'tab:gray',
+        'other': 'tab:gray',
     }
+    split_markers = {'train': 'o', 'val': 'x', 'unknown': '.'}
 
-    def record_color(record):
-        return color_map.get((record['type'], record['split']),
-                             color_map.get((record['type'], 'train'), 'black'))
-
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
-    for ax, metric_key, title in [
-        (axes[0], 'display_log_mse', f"{metric_prefix}display log MSE"),
-        (axes[1], 'raw_mse', f"{metric_prefix}raw MSE"),
+    fig, axes = plt.subplots(3, 1, figsize=(13, 10), sharex=True)
+    for ax, metric_key, title, log_y in [
+        (axes[0], 'raw_mse', f"{metric_prefix}raw MSE", True),
+        (axes[1], 'display_log_mse', f"{metric_prefix}display log MSE", True),
+        (axes[2], 'ssim', f"{metric_prefix}SSIM", False),
     ]:
-        sorted_records = sorted(records, key=lambda r: r[metric_key])
-        values = [r[metric_key] for r in sorted_records]
-        colors = [record_color(r) for r in sorted_records]
-        ax.scatter(np.arange(len(sorted_records)), values, c=colors, s=12, alpha=0.85)
-        ax.set_title(f"Per-sample {title} (sorted low to high)")
-        ax.set_xlabel("sample rank")
+        for group in sorted({r['group'] for r in records}):
+            for split in ['train', 'val', 'unknown']:
+                subset = [r for r in records if r['group'] == group and r['split'] == split]
+                if not subset:
+                    continue
+                ax.scatter(
+                    [r['index'] for r in subset],
+                    [r[metric_key] for r in subset],
+                    c=group_colors.get(group, 'tab:gray'),
+                    marker=split_markers.get(split, '.'),
+                    s=14 if split == 'train' else 28,
+                    alpha=0.8,
+                    label=f"{group} / {split}",
+                )
+        ax.set_title(f"Per-sample {title} by dataset index")
         ax.set_ylabel(title)
-        if any(v > 0 for v in values):
+        if log_y and any(r[metric_key] > 0 for r in records):
             ax.set_yscale('log')
         ax.grid(True, alpha=0.25)
+    axes[-1].set_xlabel("dataset index")
 
-    legend_items = []
-    seen = set()
-    for record in records:
-        label = f"{record['type']} / {record['split']}"
-        if label in seen:
-            continue
-        seen.add(label)
-        legend_items.append(plt.Line2D(
-            [0], [0], marker='o', linestyle='',
-            markerfacecolor=record_color(record),
-            markeredgecolor='none', label=label,
-        ))
-    axes[0].legend(handles=legend_items, fontsize=8, loc='best')
+    handles, labels = axes[0].get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    axes[0].legend(by_label.values(), by_label.keys(), fontsize=7, loc='best', ncol=3)
     plt.tight_layout()
     plt.savefig(run_dir / 'per_sample_mse_plot.png', dpi=150)
     plt.close(fig)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     for ax, metric_key, title in [
-        (axes[0], 'display_log_mse', f"{metric_prefix}display log MSE"),
-        (axes[1], 'raw_mse', f"{metric_prefix}raw MSE"),
+        (axes[0], 'raw_mse', f"{metric_prefix}raw MSE"),
+        (axes[1], 'display_log_mse', f"{metric_prefix}display log MSE"),
+        (axes[2], 'ssim', f"{metric_prefix}SSIM"),
     ]:
-        for sample_type in sorted({r['type'] for r in records}):
-            vals = [r[metric_key] for r in records if r['type'] == sample_type]
+        for group in sorted({r['group'] for r in records}):
+            vals = [r[metric_key] for r in records if r['group'] == group]
             if vals:
-                ax.hist(vals, bins=30, alpha=0.5, label=sample_type)
+                ax.hist(vals, bins=30, alpha=0.45, label=group,
+                        color=group_colors.get(group, 'tab:gray'))
         ax.set_title(f"Distribution of {title}")
         ax.set_xlabel(title)
         ax.set_ylabel("count")
@@ -1355,14 +1291,9 @@ if __name__ == '__main__':
     EVAL_ONLY_RUN_DIR = None
 
     # Data
-    DATASET_LAYOUT = 'workflow'  # 'workflow', 'sample', or 'auto'
-    WORKFLOW_FIELD_DIR = '3.Forward_Sim'
+    WORKFLOW_FIELD_DIR = '1.Forward_Sim'
     WORKFLOW_CAMERA_DIR = '2.Aligned_Camera'
     WORKFLOW_PHASE_DIR = '0.Phase_Mask'
-    REQUIRE_PHASE = True
-    FIELD_FILENAME = 'simulation_field.npy'
-    CAMERA_FILENAME = 'camera.npy'
-    PHASE_FILENAME = 'slm_phase.npy'
     SIM_SIZE = 1024
     MODEL_SIZE = 1024  # lower to 512 if FFT memory is too high
     PHASE_FLIP = True
@@ -1412,20 +1343,18 @@ if __name__ == '__main__':
     USE_AMP = False  # FFT + complex weights are safer in full fp32 for the first run
     GRAD_CLIP = 1.0
 
-    # Visual loss
-    W_PHOTO = 1.0
-    W_SSIM = 0.25
+    # Loss
+    W_PHOTO = 0.0
+    W_SSIM = 1.0
     W_GRAD = 0.10
-    W_FFT = 0.50
-    W_RAW = 0.05
-    W_PEAK = 0.1
-    W_DARK = 0.1
-    W_SI_LOG = 0 #.3
+    W_FFT = 0.0
+    W_RAW = 1.0
+    W_PEAK = 0.0
+    W_DARK = 0.0
     PEAK_MARGIN = 0.10
     PEAK_TOP_FRACTION = 0.002
     DARK_MARGIN = 0.10
     DARK_TOP_FRACTION = 0.002
-    SI_LOG_EPS = 1e-4
     LOSS_ROI_FRACTION = 0.80  # center crop for loss/metrics; set to 1.0 to use the full image
 
     # Visualization
@@ -1447,14 +1376,9 @@ if __name__ == '__main__':
 
     cfg = {
         'pool_dir': str(POOL_DIR),
-        'dataset_layout': DATASET_LAYOUT,
         'workflow_field_dir': WORKFLOW_FIELD_DIR,
         'workflow_camera_dir': WORKFLOW_CAMERA_DIR,
         'workflow_phase_dir': WORKFLOW_PHASE_DIR,
-        'require_phase': REQUIRE_PHASE,
-        'field_filename': FIELD_FILENAME,
-        'camera_filename': CAMERA_FILENAME,
-        'phase_filename': PHASE_FILENAME,
         'sim_size': SIM_SIZE,
         'model_size': MODEL_SIZE,
         'phase_flip': PHASE_FLIP,
@@ -1499,12 +1423,10 @@ if __name__ == '__main__':
         'w_raw': W_RAW,
         'w_peak': W_PEAK,
         'w_dark': W_DARK,
-        'w_si_log': W_SI_LOG,
         'peak_margin': PEAK_MARGIN,
         'peak_top_fraction': PEAK_TOP_FRACTION,
         'dark_margin': DARK_MARGIN,
         'dark_top_fraction': DARK_TOP_FRACTION,
-        'si_log_eps': SI_LOG_EPS,
         'loss_roi_fraction': LOSS_ROI_FRACTION,
         'seed': SEED,
         'device': DEVICE,
@@ -1516,14 +1438,9 @@ if __name__ == '__main__':
 
     dataset = AxiconFieldDataset(
         root_dir=POOL_DIR,
-        dataset_layout=DATASET_LAYOUT,
-        field_filename=FIELD_FILENAME,
-        cam_filename=CAMERA_FILENAME,
-        phase_filename=PHASE_FILENAME,
         workflow_field_dir=WORKFLOW_FIELD_DIR,
         workflow_camera_dir=WORKFLOW_CAMERA_DIR,
         workflow_phase_dir=WORKFLOW_PHASE_DIR,
-        require_phase=REQUIRE_PHASE,
         sim_size=SIM_SIZE,
         phase_flip_lr=PHASE_FLIP,
         field_scale_mode=FIELD_SCALE_MODE,
