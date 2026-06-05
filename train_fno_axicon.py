@@ -885,6 +885,36 @@ def split_dataset(dataset, train_ratio=0.8, seed=42):
     return Subset(dataset, train_idx), Subset(dataset, val_idx), train_idx, val_idx
 
 
+def evenly_spaced_sample_indices(indices, n_samples):
+    """Pick visualization samples across the full dataset-index span."""
+    if n_samples is None or n_samples <= 0 or not indices:
+        return []
+
+    ordered = sorted(int(i) for i in indices)
+    if len(ordered) <= n_samples:
+        return ordered
+    if n_samples == 1:
+        return [ordered[len(ordered) // 2]]
+
+    positions = np.linspace(0, len(ordered) - 1, int(n_samples))
+    selected = []
+    seen = set()
+    for pos in positions:
+        idx = ordered[int(round(float(pos)))]
+        if idx not in seen:
+            selected.append(idx)
+            seen.add(idx)
+
+    if len(selected) < n_samples:
+        for idx in ordered:
+            if idx not in seen:
+                selected.append(idx)
+                seen.add(idx)
+                if len(selected) == n_samples:
+                    break
+    return selected
+
+
 def print_torch_device_diagnostics():
     cuda_available = torch.cuda.is_available()
     print("=== Torch device diagnostics ===")
@@ -1548,8 +1578,8 @@ if __name__ == '__main__':
         rows, dataset, train_idx, val_idx, run_dir, metric_prefix=metric_prefix)
     plot_per_sample_metrics(metric_records, run_dir, metric_prefix=metric_prefix)
 
-    vis_train = train_idx[:N_VIS_TRAIN]
-    vis_val = val_idx[:N_VIS_VAL]
+    vis_train = evenly_spaced_sample_indices(train_idx, N_VIS_TRAIN)
+    vis_val = evenly_spaced_sample_indices(val_idx, N_VIS_VAL)
     if vis_train:
         visualize_samples(model, dataset, vis_train, DEVICE, cfg,
                           save_dir=run_dir / 'samples_train')
