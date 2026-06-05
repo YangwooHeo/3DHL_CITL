@@ -29,6 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from PIL import Image
+from scipy.ndimage import zoom
 
 from axicon_simulator import build_axicon_transfer_function, load_fno_proxy
 from mbvam.Beam.holobeam import HoloBeam
@@ -100,6 +101,10 @@ SCRIPT_CONFIG = {
     "transpose_phase": True,
     "flip_phase_first_axis": True,
     "transpose_output_field": True,
+    "target_preprocess_mode": "phase_optimization",
+    "target_original_pixel_size": 2e-6,
+    "phase_optimization_roi_size": 1600,
+    "phase_optimization_crop_to_current_roi": True,
     "transpose_target": False,
     "flip_target_ud": False,
     "flip_target_lr": False,
@@ -147,15 +152,7 @@ def build_beam_config_from_args(args: argparse.Namespace) -> HoloBeamConfig:
     return beam_config
 
 
-def load_target_image(
-    target_path: Path,
-    target_size: int,
-    device: torch.device,
-    dtype: torch.dtype = torch.float32,
-    transpose: bool = False,
-    flip_ud: bool = False,
-    flip_lr: bool = False,
-) -> torch.Tensor:
+def load_target_array(target_path: Path) -> np.ndarray:
     target_path = Path(target_path)
     if target_path.suffix.lower() == ".npy":
         arr = np.load(target_path)
@@ -172,8 +169,127 @@ def load_target_image(
 
     if arr.ndim != 2:
         raise ValueError(f"{target_path} must resolve to a 2D target; got shape {arr.shape}")
+    return np.nan_to_num(np.asarray(arr, dtype=np.float32))
 
-    arr = np.nan_to_num(np.asarray(arr, dtype=np.float32))
+
+def center_crop_or_pad_tensor(x: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
+    height, width = x.shape[-2:]
+    if height > target_h:
+        y0 = (height - target_h) // 2
+        x = x[..., y0:y0 + target_h, :]
+        height = target_h
+    if width > target_w:
+        x0 = (width - target_w) // 2
+        x = x[..., :, x0:x0 + target_w]
+        width = target_w
+
+    pad_top = max(0, (target_h - height) // 2)
+    pad_bottom = max(0, target_h - height - pad_top)
+    pad_left = max(0, (target_w - width) // 2)
+    pad_right = max(0, target_w - width - pad_left)
+    if pad_top or pad_bottom or pad_left or pad_right:
+        x = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom))
+    return x
+
+
+def center_crop_or_pad_numpy(arr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    height, width = arr.shape
+    out = np.zeros((target_h, target_w), dtype=arr.dtype)
+    y0_dst = max(0, (target_h - height) // 2)
+    x0_dst = max(0, (target_w - width) // 2)
+    y0_src = max(0, (height - target_h) // 2)
+    x0_src = max(0, (width - target_w) // 2)
+    copy_h = min(height - y0_src, target_h - y0_dst)
+    copy_w = min(width - x0_src, target_w - x0_dst)
+    if copy_h > 0 and copy_w > 0:
+        out[y0_dst:y0_dst + copy_h, x0_dst:x0_dst + copy_w] = arr[
+            y0_src:y0_src + copy_h,
+            x0_src:x0_src + copy_w,
+        ]
+    return out
+
+
+def phase_optimization_target_array(
+    arr: np.ndarray,
+    beam_config: HoloBeamConfig,
+    original_pixel_size: float = 2e-6,
+) -> np.ndarray:
+    desired_pixel_size = (beam_config.abbe_res_x, beam_config.abbe_res_y)
+    rescaled = zoom(
+        arr,
+        (
+            float(original_pixel_size) / float(desired_pixel_size[1]),
+            float(original_pixel_size) / float(desired_pixel_size[0]),
+        ),
+        order=1,
+    )
+    final_image = center_crop_or_pad_numpy(
+        rescaled.astype(np.float32, copy=False),
+        target_h=beam_config.Ny,
+        target_w=beam_config.Nx,
+    )
+    return final_image.T.astype(np.float32, copy=False)
+
+
+def target_preprocess_report(
+    source_shape: tuple[int, int],
+    beam_config: HoloBeamConfig,
+    original_pixel_size: float,
+    phase_optimization_roi_size: int,
+    current_roi_size: int,
+    target_size: int,
+) -> dict[str, float]:
+    source_h, source_w = source_shape
+    target_resize = float(target_size) / float(current_roi_size)
+    source_horizontal_scale = (
+        float(original_pixel_size)
+        / float(beam_config.abbe_res_x)
+        * float(phase_optimization_roi_size)
+        / float(beam_config.Nx)
+        * target_resize
+    )
+    source_vertical_scale = (
+        float(original_pixel_size)
+        / float(beam_config.abbe_res_y)
+        * float(phase_optimization_roi_size)
+        / float(beam_config.Ny)
+        * target_resize
+    )
+    direct_horizontal_scale = float(target_size) / float(source_w)
+    direct_vertical_scale = float(target_size) / float(source_h)
+    return {
+        "abbe_res_x_um": float(beam_config.abbe_res_x) * 1e6,
+        "abbe_res_y_um": float(beam_config.abbe_res_y) * 1e6,
+        "source_horizontal_scale_px_per_source_px": source_horizontal_scale,
+        "source_vertical_scale_px_per_source_px": source_vertical_scale,
+        "direct_horizontal_scale_px_per_source_px": direct_horizontal_scale,
+        "direct_vertical_scale_px_per_source_px": direct_vertical_scale,
+        "relative_horizontal_magnification_vs_direct_resize": (
+            source_horizontal_scale / max(direct_horizontal_scale, 1e-12)
+        ),
+        "relative_vertical_magnification_vs_direct_resize": (
+            source_vertical_scale / max(direct_vertical_scale, 1e-12)
+        ),
+    }
+
+
+def load_target_image(
+    target_path: Path,
+    target_size: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    beam_config: HoloBeamConfig | None = None,
+    preprocess_mode: str = "direct",
+    original_pixel_size: float = 2e-6,
+    phase_optimization_roi_size: int = 1600,
+    current_roi_size: int | None = None,
+    crop_phase_optimization_to_current_roi: bool = True,
+    transpose: bool = False,
+    flip_ud: bool = False,
+    flip_lr: bool = False,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    arr = load_target_array(target_path)
+
     if transpose:
         arr = arr.T
     if flip_ud:
@@ -184,8 +300,55 @@ def load_target_image(
     arr = np.ascontiguousarray(arr)
     arr = arr - float(arr.min())
     arr = arr / (float(arr.max()) + 1e-8)
+    source_shape = arr.shape
+
+    if preprocess_mode == "direct":
+        target = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).to(device=device, dtype=dtype)
+        target = resize_batch(target, int(target_size), mode="bilinear").clamp(0.0, 1.0)
+        report = {
+            "mode": "direct",
+            "direct_horizontal_scale_px_per_source_px": float(target_size) / float(source_shape[1]),
+            "direct_vertical_scale_px_per_source_px": float(target_size) / float(source_shape[0]),
+        }
+        return target, report
+
+    if preprocess_mode != "phase_optimization":
+        raise ValueError(
+            "target_preprocess_mode must be 'direct' or 'phase_optimization'; "
+            f"got {preprocess_mode!r}"
+        )
+    if beam_config is None:
+        raise ValueError("beam_config is required when target_preprocess_mode='phase_optimization'.")
+    if current_roi_size is None:
+        current_roi_size = int(target_size)
+
+    arr = phase_optimization_target_array(
+        arr,
+        beam_config,
+        original_pixel_size=float(original_pixel_size),
+    )
     target = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).to(device=device, dtype=dtype)
-    return resize_batch(target, int(target_size), mode="bilinear").clamp(0.0, 1.0)
+    target = resize_batch(target, int(phase_optimization_roi_size), mode="bilinear")
+    if crop_phase_optimization_to_current_roi:
+        target = center_crop_or_pad_tensor(target, int(current_roi_size), int(current_roi_size))
+    target = resize_batch(target, int(target_size), mode="bilinear").clamp(0.0, 1.0)
+    target = target / target.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+    report = target_preprocess_report(
+        source_shape=source_shape,
+        beam_config=beam_config,
+        original_pixel_size=float(original_pixel_size),
+        phase_optimization_roi_size=int(phase_optimization_roi_size),
+        current_roi_size=int(current_roi_size),
+        target_size=int(target_size),
+    )
+    report.update({
+        "mode": "phase_optimization",
+        "phase_optimization_roi_size": int(phase_optimization_roi_size),
+        "current_roi_size": int(current_roi_size),
+        "target_size": int(target_size),
+        "crop_phase_optimization_to_current_roi": bool(crop_phase_optimization_to_current_roi),
+    })
+    return target, report
 
 
 def _image_phase_to_levels(path: Path, phase_level_max: float) -> np.ndarray:
@@ -843,6 +1006,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=SCRIPT_CONFIG["transpose_output_field"],
         help="Match axicon_simulator.py FNO field orientation.",
     )
+    parser.add_argument(
+        "--target-preprocess-mode",
+        choices=("direct", "phase_optimization"),
+        default=SCRIPT_CONFIG["target_preprocess_mode"],
+    )
+    parser.add_argument(
+        "--target-original-pixel-size",
+        type=float,
+        default=SCRIPT_CONFIG["target_original_pixel_size"],
+        help="Physical pixel size of source target PNG used by phase optimization [m].",
+    )
+    parser.add_argument(
+        "--phase-optimization-roi-size",
+        type=int,
+        default=SCRIPT_CONFIG["phase_optimization_roi_size"],
+        help="ROI size used when the phase mask was originally optimized.",
+    )
+    parser.add_argument(
+        "--phase-optimization-crop-to-current-roi",
+        action=argparse.BooleanOptionalAction,
+        default=SCRIPT_CONFIG["phase_optimization_crop_to_current_roi"],
+    )
     parser.add_argument("--transpose-target", action=argparse.BooleanOptionalAction, default=SCRIPT_CONFIG["transpose_target"])
     parser.add_argument("--flip-target-ud", action=argparse.BooleanOptionalAction, default=SCRIPT_CONFIG["flip_target_ud"])
     parser.add_argument("--flip-target-lr", action=argparse.BooleanOptionalAction, default=SCRIPT_CONFIG["flip_target_lr"])
@@ -902,15 +1087,33 @@ def main():
         transpose_phase=args.transpose_phase,
         flip_phase_first_axis=args.flip_phase_first_axis,
     )
-    target = load_target_image(
+    target, preprocess_report = load_target_image(
         args.target,
         target_size=int(fno_cfg["model_size"]),
         device=device,
         dtype=torch.float32,
+        beam_config=beam_config,
+        preprocess_mode=args.target_preprocess_mode,
+        original_pixel_size=float(args.target_original_pixel_size),
+        phase_optimization_roi_size=int(args.phase_optimization_roi_size),
+        current_roi_size=int(args.roi_size),
+        crop_phase_optimization_to_current_roi=bool(args.phase_optimization_crop_to_current_roi),
         transpose=args.transpose_target,
         flip_ud=args.flip_target_ud,
         flip_lr=args.flip_target_lr,
     )
+    args.target_preprocess_report = preprocess_report
+    if preprocess_report.get("mode") == "phase_optimization":
+        print(
+            "[Target] phase-optimization scale correction: "
+            f"abbe=({preprocess_report['abbe_res_x_um']:.6f}, "
+            f"{preprocess_report['abbe_res_y_um']:.6f}) um; "
+            f"relative magnification vs direct resize="
+            f"({preprocess_report['relative_horizontal_magnification_vs_direct_resize']:.6f}x, "
+            f"{preprocess_report['relative_vertical_magnification_vs_direct_resize']:.6f}x)"
+        )
+    else:
+        print("[Target] using direct target resize; phase-optimization scale correction disabled.")
 
     solver = AxiconFNOCITLSolver(
         beam=beam,
