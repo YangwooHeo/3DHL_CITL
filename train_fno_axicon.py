@@ -755,7 +755,7 @@ def visual_loss(pred, target, w_log_display_smooth_l1=0.0, w_ssim=1.0, w_grad=0.
                 peak_margin=0.10, peak_top_fraction=0.002,
                 dark_margin=0.10, dark_top_fraction=0.002):
     pred_d = target_d = None
-    if w_log_display_smooth_l1 > 0 or w_fft > 0:
+    if w_log_display_smooth_l1 > 0 or w_ssim > 0 or w_grad > 0 or w_fft > 0:
         pred_d = log_display_tensor(pred)
         target_d = log_display_tensor(target)
 
@@ -763,8 +763,8 @@ def visual_loss(pred, target, w_log_display_smooth_l1=0.0, w_ssim=1.0, w_grad=0.
         F.smooth_l1_loss(pred_d, target_d)
         if w_log_display_smooth_l1 > 0 else pred.new_tensor(0.0)
     )
-    ssim = simple_ssim_loss(pred, target) if w_ssim > 0 else pred.new_tensor(0.0)
-    grad = gradient_loss(pred, target) if w_grad > 0 else pred.new_tensor(0.0)
+    ssim = simple_ssim_loss(pred_d, target_d) if w_ssim > 0 else pred.new_tensor(0.0)
+    grad = gradient_loss(pred_d, target_d) if w_grad > 0 else pred.new_tensor(0.0)
     fft = fft_texture_loss(pred_d, target_d) if w_fft > 0 else pred.new_tensor(0.0)
     mean_norm_l1 = (
         target_mean_normalized_smooth_l1_loss(pred, target)
@@ -1330,14 +1330,14 @@ def plot_per_sample_metrics(records, run_dir, metric_prefix=''):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    POOL_DIR = r'H:\Shared drives\taylorlab\3DHL\CITL\Fourier Neural Operator_Training phase masks\05_22_2026_sample1'
-    OUTPUT_DIR = r'C:\REVAMP\Yangwoo Heo\SLM_to_Axicon_Optimiaztion\FNO_train_59simple_patterns'
+    POOL_DIR = r'H:\Shared drives\taylorlab\3DHL\CITL\Fourier Neural Operator_Training phase masks\05_28_2026_sample2'
+    OUTPUT_DIR = r'C:\REVAMP\Yangwoo Heo\SLM_to_Axicon_Optimiaztion\FNO_train_650sample'
     RUN_NAME = datetime.now().strftime('%Y%m%d_%H%M%S')
     EVAL_ONLY_RUN_DIR = None
 
     # Data
     WORKFLOW_FIELD_DIR = '1.Forward_Sim'
-    WORKFLOW_CAMERA_DIR = '2.Aligned_Camera'
+    WORKFLOW_CAMERA_DIR = '3.Aligned_Camera'
     WORKFLOW_PHASE_DIR = '0.Phase_Mask'
     SIM_SIZE = 1024
     MODEL_SIZE = 1024  # lower to 512 if FFT memory is too high
@@ -1379,10 +1379,10 @@ if __name__ == '__main__':
 
     # Training
     REQUIRE_CUDA = False
-    TRAIN_RATIO = 0.9
-    BATCH_SIZE = 4
+    TRAIN_RATIO = 0.6
+    BATCH_SIZE = 3
     EPOCHS = 100
-    LR = 2e-4
+    LR = 1e-3
     WEIGHT_DECAY = 1e-5
     NUM_WORKERS = 1
     USE_AMP = False  # FFT + complex weights are safer in full fp32 for the first run
@@ -1403,8 +1403,8 @@ if __name__ == '__main__':
     LOSS_ROI_FRACTION = 0.80  # center crop for loss/metrics; set to 1.0 to use the full image
 
     # Visualization
-    N_VIS_TRAIN = 5
-    N_VIS_VAL = 5
+    N_VIS_TRAIN = 30
+    N_VIS_VAL = 10
     SEED = 42
 
     torch.manual_seed(SEED)
