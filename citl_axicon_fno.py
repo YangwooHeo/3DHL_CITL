@@ -105,6 +105,7 @@ SCRIPT_CONFIG = {
     "target_original_pixel_size": 2e-6,
     "phase_optimization_roi_size": 1600,
     "phase_optimization_crop_to_current_roi": True,
+    "phase_optimization_internal_transpose": False,
     "transpose_target": False,
     "flip_target_ud": False,
     "flip_target_lr": False,
@@ -213,7 +214,17 @@ def phase_optimization_target_array(
     arr: np.ndarray,
     beam_config: HoloBeamConfig,
     original_pixel_size: float = 2e-6,
+    internal_transpose: bool = False,
 ) -> np.ndarray:
+    """
+    Match the physical target scaling used for GS phase optimization.
+
+    Phase_optimization_axicon_adam_3D.py returns final_image.T because the GS
+    optimizer works in HoloBeam's internal (x, y) array order.  The FNO/CITL
+    camera path normally has transpose_output_field=True, so its prediction is
+    already in image/display (y, x) order.  For target loss against that FNO
+    camera output, keep internal_transpose=False.
+    """
     desired_pixel_size = (beam_config.abbe_res_x, beam_config.abbe_res_y)
     rescaled = zoom(
         arr,
@@ -228,7 +239,9 @@ def phase_optimization_target_array(
         target_h=beam_config.Ny,
         target_w=beam_config.Nx,
     )
-    return final_image.T.astype(np.float32, copy=False)
+    if internal_transpose:
+        final_image = final_image.T
+    return final_image.astype(np.float32, copy=False)
 
 
 def target_preprocess_report(
@@ -284,6 +297,7 @@ def load_target_image(
     phase_optimization_roi_size: int = 1600,
     current_roi_size: int | None = None,
     crop_phase_optimization_to_current_roi: bool = True,
+    phase_optimization_internal_transpose: bool = False,
     transpose: bool = False,
     flip_ud: bool = False,
     flip_lr: bool = False,
@@ -326,6 +340,7 @@ def load_target_image(
         arr,
         beam_config,
         original_pixel_size=float(original_pixel_size),
+        internal_transpose=bool(phase_optimization_internal_transpose),
     )
     target = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).to(device=device, dtype=dtype)
     target = resize_batch(target, int(phase_optimization_roi_size), mode="bilinear")
@@ -347,6 +362,7 @@ def load_target_image(
         "current_roi_size": int(current_roi_size),
         "target_size": int(target_size),
         "crop_phase_optimization_to_current_roi": bool(crop_phase_optimization_to_current_roi),
+        "phase_optimization_internal_transpose": bool(phase_optimization_internal_transpose),
     })
     return target, report
 
@@ -1028,6 +1044,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=SCRIPT_CONFIG["phase_optimization_crop_to_current_roi"],
     )
+    parser.add_argument(
+        "--phase-optimization-internal-transpose",
+        action=argparse.BooleanOptionalAction,
+        default=SCRIPT_CONFIG["phase_optimization_internal_transpose"],
+        help="Use the GS optimizer's internal x/y target orientation. Leave false for FNO camera/display loss.",
+    )
     parser.add_argument("--transpose-target", action=argparse.BooleanOptionalAction, default=SCRIPT_CONFIG["transpose_target"])
     parser.add_argument("--flip-target-ud", action=argparse.BooleanOptionalAction, default=SCRIPT_CONFIG["flip_target_ud"])
     parser.add_argument("--flip-target-lr", action=argparse.BooleanOptionalAction, default=SCRIPT_CONFIG["flip_target_lr"])
@@ -1098,6 +1120,7 @@ def main():
         phase_optimization_roi_size=int(args.phase_optimization_roi_size),
         current_roi_size=int(args.roi_size),
         crop_phase_optimization_to_current_roi=bool(args.phase_optimization_crop_to_current_roi),
+        phase_optimization_internal_transpose=bool(args.phase_optimization_internal_transpose),
         transpose=args.transpose_target,
         flip_ud=args.flip_target_ud,
         flip_lr=args.flip_target_lr,
