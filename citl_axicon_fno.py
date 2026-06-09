@@ -101,7 +101,8 @@ SCRIPT_CONFIG = {
     "transpose_phase": True,
     "flip_phase_first_axis": True,
     "transpose_output_field": True,
-    "target_preprocess_mode": "phase_optimization",
+    # "auto": direct for .npy / already-grid-sized targets, phase_optimization for raw PNG targets.
+    "target_preprocess_mode": "auto",
     "target_original_pixel_size": 2e-6,
     "phase_optimization_roi_size": 1600,
     "phase_optimization_crop_to_current_roi": True,
@@ -286,6 +287,35 @@ def target_preprocess_report(
     }
 
 
+def resolve_target_preprocess_mode(
+    target_path: Path,
+    source_shape: tuple[int, int],
+    requested_mode: str,
+    target_size: int,
+    current_roi_size: int | None,
+) -> str:
+    if requested_mode in {"direct", "phase_optimization"}:
+        return requested_mode
+    if requested_mode != "auto":
+        raise ValueError(
+            "target_preprocess_mode must be 'auto', 'direct', or 'phase_optimization'; "
+            f"got {requested_mode!r}"
+        )
+
+    source_h, source_w = source_shape
+    grid_sizes = {int(target_size)}
+    if current_roi_size is not None:
+        grid_sizes.add(int(current_roi_size))
+
+    # NPY targets are usually already simulated/camera-grid data. Do not apply
+    # the raw-PNG physical magnification correction unless explicitly requested.
+    if Path(target_path).suffix.lower() == ".npy":
+        return "direct"
+    if source_h in grid_sizes and source_w in grid_sizes:
+        return "direct"
+    return "phase_optimization"
+
+
 def load_target_image(
     target_path: Path,
     target_size: int,
@@ -320,21 +350,44 @@ def load_target_image(
         target = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).to(device=device, dtype=dtype)
         target = resize_batch(target, int(target_size), mode="bilinear").clamp(0.0, 1.0)
         report = {
+            "requested_mode": preprocess_mode,
             "mode": "direct",
+            "source_shape": list(source_shape),
             "direct_horizontal_scale_px_per_source_px": float(target_size) / float(source_shape[1]),
             "direct_vertical_scale_px_per_source_px": float(target_size) / float(source_shape[0]),
         }
         return target, report
 
+    if current_roi_size is None:
+        current_roi_size = int(target_size)
+    requested_mode = preprocess_mode
+    preprocess_mode = resolve_target_preprocess_mode(
+        target_path=target_path,
+        source_shape=source_shape,
+        requested_mode=requested_mode,
+        target_size=int(target_size),
+        current_roi_size=int(current_roi_size),
+    )
+
+    if preprocess_mode == "direct":
+        target = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).to(device=device, dtype=dtype)
+        target = resize_batch(target, int(target_size), mode="bilinear").clamp(0.0, 1.0)
+        report = {
+            "requested_mode": requested_mode,
+            "mode": "direct",
+            "source_shape": list(source_shape),
+            "direct_horizontal_scale_px_per_source_px": float(target_size) / float(source_shape[1]),
+            "direct_vertical_scale_px_per_source_px": float(target_size) / float(source_shape[0]),
+            "auto_reason": "npy_or_already_grid_sized_target",
+        }
+        return target, report
+
     if preprocess_mode != "phase_optimization":
-        raise ValueError(
-            "target_preprocess_mode must be 'direct' or 'phase_optimization'; "
-            f"got {preprocess_mode!r}"
+        raise RuntimeError(
+            f"Unhandled resolved target preprocessing mode: {preprocess_mode!r}"
         )
     if beam_config is None:
         raise ValueError("beam_config is required when target_preprocess_mode='phase_optimization'.")
-    if current_roi_size is None:
-        current_roi_size = int(target_size)
 
     arr = phase_optimization_target_array(
         arr,
@@ -357,7 +410,9 @@ def load_target_image(
         target_size=int(target_size),
     )
     report.update({
+        "requested_mode": requested_mode,
         "mode": "phase_optimization",
+        "source_shape": list(source_shape),
         "phase_optimization_roi_size": int(phase_optimization_roi_size),
         "current_roi_size": int(current_roi_size),
         "target_size": int(target_size),
@@ -1024,7 +1079,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target-preprocess-mode",
-        choices=("direct", "phase_optimization"),
+        choices=("auto", "direct", "phase_optimization"),
         default=SCRIPT_CONFIG["target_preprocess_mode"],
     )
     parser.add_argument(
@@ -1126,6 +1181,8 @@ def main():
         flip_lr=args.flip_target_lr,
     )
     args.target_preprocess_report = preprocess_report
+    if preprocess_report.get("requested_mode") == "auto":
+        print(f"[Target] auto preprocessing selected: {preprocess_report.get('mode')}")
     if preprocess_report.get("mode") == "phase_optimization":
         print(
             "[Target] phase-optimization scale correction: "
