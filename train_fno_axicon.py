@@ -810,11 +810,32 @@ def sample_type_from_id(sample_id):
         return 'systematic'
     if sample_id.startswith('real_'):
         return 'real'
+    if sample_id.startswith('pert_'):
+        return 'pert'
     return 'other'
+
+
+def pert_parent_id_from_id(sample_id, real_ids=None):
+    sample_id = str(sample_id)
+    if not sample_id.startswith('pert_'):
+        return None
+
+    if real_ids:
+        for real_id in sorted((str(r) for r in real_ids), key=len, reverse=True):
+            if sample_id.startswith(f"pert_{real_id}_"):
+                return real_id
+
+    stem = sample_id[len('pert_'):]
+    for marker in ['_annrand_', '_anngradflow_']:
+        if marker in stem:
+            return stem.split(marker, 1)[0]
+    return stem
 
 
 def sample_group_from_id(sample_id):
     sample_id = str(sample_id)
+    if sample_id.startswith('pert_'):
+        return 'pert'
     if sample_id.startswith('real_'):
         return 'real'
     if sample_id.startswith('sys_zernike_combo'):
@@ -848,31 +869,80 @@ def split_dataset(dataset, train_ratio=0.8, seed=42):
     rng = random.Random(seed)
 
     sys_idx = []
-    real_idx = []
+    real_idx_by_id = {}
+    pert_idx_by_parent = {}
     other_idx = []
+    typed_samples = []
+
     for idx, sample in enumerate(dataset.samples):
         sample_type = sample_type_from_id(sample['id'])
+        typed_samples.append((idx, sample['id'], sample_type))
         if sample_type == 'systematic':
             sys_idx.append(idx)
         elif sample_type == 'real':
-            real_idx.append(idx)
-        else:
+            real_idx_by_id[sample['id']] = idx
+
+    real_ids = set(real_idx_by_id)
+    for idx, sample_id, sample_type in typed_samples:
+        if sample_type == 'pert':
+            parent_id = pert_parent_id_from_id(sample_id, real_ids=real_ids)
+            pert_idx_by_parent.setdefault(parent_id, []).append(idx)
+        elif sample_type not in {'systematic', 'real'}:
             other_idx.append(idx)
 
-    if sys_idx or real_idx:
-        rng.shuffle(real_idx)
+    for indices in pert_idx_by_parent.values():
+        indices.sort()
+
+    real_parent_ids = sorted(set(real_idx_by_id) | set(pert_idx_by_parent))
+
+    if sys_idx or real_parent_ids:
+        rng.shuffle(real_parent_ids)
         rng.shuffle(other_idx)
-        n_real_train = int(round(len(real_idx) * train_ratio))
+
+        n_parent_train = int(round(len(real_parent_ids) * train_ratio))
         n_other_train = int(round(len(other_idx) * train_ratio))
-        train_idx = sys_idx + real_idx[:n_real_train] + other_idx[:n_other_train]
-        val_idx = real_idx[n_real_train:] + other_idx[n_other_train:]
+        train_parent_ids = set(real_parent_ids[:n_parent_train])
+        val_parent_ids = set(real_parent_ids[n_parent_train:])
+
+        def grouped_indices(parent_ids):
+            out = []
+            for parent_id in sorted(parent_ids):
+                if parent_id in real_idx_by_id:
+                    out.append(real_idx_by_id[parent_id])
+                out.extend(pert_idx_by_parent.get(parent_id, []))
+            return out
+
+        grouped_train_idx = grouped_indices(train_parent_ids)
+        grouped_val_idx = grouped_indices(val_parent_ids)
+
+        train_idx = sys_idx + grouped_train_idx + other_idx[:n_other_train]
+        val_idx = grouped_val_idx + other_idx[n_other_train:]
+
+        train_real_count = sum(1 for i in grouped_train_idx
+                               if sample_type_from_id(dataset.samples[i]['id']) == 'real')
+        val_real_count = sum(1 for i in grouped_val_idx
+                             if sample_type_from_id(dataset.samples[i]['id']) == 'real')
+        train_pert_count = sum(1 for i in grouped_train_idx
+                               if sample_type_from_id(dataset.samples[i]['id']) == 'pert')
+        val_pert_count = sum(1 for i in grouped_val_idx
+                             if sample_type_from_id(dataset.samples[i]['id']) == 'pert')
+
         print(
-            f"Prefix split: {len(train_idx)} train / {len(val_idx)} val "
+            f"Prefix/group split: {len(train_idx)} train / {len(val_idx)} val "
             f"(sys train-fixed={len(sys_idx)}, "
-            f"real train/val={n_real_train}/{len(real_idx) - n_real_train}, "
+            f"real-parent train/val={len(train_parent_ids)}/{len(val_parent_ids)}, "
+            f"real samples train/val={train_real_count}/{val_real_count}, "
+            f"pert samples train/val={train_pert_count}/{val_pert_count}, "
             f"other train/val={n_other_train}/{len(other_idx) - n_other_train}, "
             f"ratio={train_ratio})"
         )
+        orphan_parents = sorted(pid for pid in pert_idx_by_parent if pid not in real_idx_by_id)
+        if orphan_parents:
+            print(
+                "[warn] pert samples without matching real parent were split as their own parent groups: "
+                + ", ".join(orphan_parents[:8])
+                + (" ..." if len(orphan_parents) > 8 else "")
+            )
     else:
         n = len(dataset)
         n_train = int(round(n * train_ratio))
@@ -1265,6 +1335,7 @@ def plot_per_sample_metrics(records, run_dir, metric_prefix=''):
         'zernike_combo': 'tab:pink',
         'local_bump': 'tab:green',
         'real': 'black',
+        'pert': 'tab:olive',
         'systematic_other': 'tab:gray',
         'other': 'tab:gray',
     }
@@ -1517,7 +1588,10 @@ if __name__ == '__main__':
         if not eval_only:
             with open(split_path, 'w', encoding='utf-8') as f:
                 json.dump({
-                    'split_rule': 'sys_* -> train fixed; real_* -> random train/val; others -> random train/val',
+                    'split_rule': (
+                        'sys_* -> train fixed; real_* parent groups -> random train/val; '
+                        'pert_* -> same split as matching real_* parent; others -> random train/val'
+                    ),
                     'train_ratio_for_real_and_other': TRAIN_RATIO,
                     'train': [dataset.samples[i]['id'] for i in train_idx],
                     'val': [dataset.samples[i]['id'] for i in val_idx],
