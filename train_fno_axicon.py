@@ -705,15 +705,25 @@ def log_display_tensor(x, eps=1e-6):
     return per_image_standardize(torch.log1p(x / scale), eps=eps)
 
 
-def gradient_loss(pred, target):
+def mean_per_sample(x):
+    return x.flatten(start_dim=1).mean(dim=1)
+
+
+def gradient_loss_per_sample(pred, target):
     pred_dx = pred[..., :, 1:] - pred[..., :, :-1]
     pred_dy = pred[..., 1:, :] - pred[..., :-1, :]
     target_dx = target[..., :, 1:] - target[..., :, :-1]
     target_dy = target[..., 1:, :] - target[..., :-1, :]
-    return F.l1_loss(pred_dx, target_dx) + F.l1_loss(pred_dy, target_dy)
+    return (mean_per_sample(torch.abs(pred_dx - target_dx)) +
+            mean_per_sample(torch.abs(pred_dy - target_dy)))
 
 
-def simple_ssim_loss(pred, target, window=11, c1=0.01 ** 2, c2=0.03 ** 2):
+def gradient_loss(pred, target):
+    return gradient_loss_per_sample(pred, target).mean()
+
+
+def simple_ssim_loss_per_sample(pred, target, window=11,
+                                c1=0.01 ** 2, c2=0.03 ** 2):
     pad = window // 2
     mu_x = F.avg_pool2d(pred, window, stride=1, padding=pad)
     mu_y = F.avg_pool2d(target, window, stride=1, padding=pad)
@@ -723,7 +733,12 @@ def simple_ssim_loss(pred, target, window=11, c1=0.01 ** 2, c2=0.03 ** 2):
     ssim = ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)) / (
         (mu_x ** 2 + mu_y ** 2 + c1) * (sigma_x + sigma_y + c2) + 1e-8
     )
-    return (1.0 - ssim.clamp(-1.0, 1.0)).mean()
+    return mean_per_sample(1.0 - ssim.clamp(-1.0, 1.0))
+
+
+def simple_ssim_loss(pred, target, window=11, c1=0.01 ** 2, c2=0.03 ** 2):
+    return simple_ssim_loss_per_sample(
+        pred, target, window=window, c1=c1, c2=c2).mean()
 
 
 def highpass(x, kernel_size=31):
@@ -733,16 +748,22 @@ def highpass(x, kernel_size=31):
     return x - low
 
 
-def fft_texture_loss(pred, target, highpass_kernel=31):
+def fft_texture_loss_per_sample(pred, target, highpass_kernel=31):
     pred_hp = highpass(pred, kernel_size=highpass_kernel)
     target_hp = highpass(target, kernel_size=highpass_kernel)
     pred_mag = torch.log1p(torch.abs(torch.fft.rfft2(pred_hp, norm='ortho')))
     target_mag = torch.log1p(torch.abs(torch.fft.rfft2(target_hp, norm='ortho')))
-    return F.l1_loss(per_image_standardize(pred_mag),
-                     per_image_standardize(target_mag))
+    return mean_per_sample(torch.abs(
+        per_image_standardize(pred_mag) - per_image_standardize(target_mag)))
 
 
-def bright_excess_loss(pred, target, margin=0.10, top_fraction=0.002, eps=1e-6):
+def fft_texture_loss(pred, target, highpass_kernel=31):
+    return fft_texture_loss_per_sample(
+        pred, target, highpass_kernel=highpass_kernel).mean()
+
+
+def bright_excess_loss_per_sample(pred, target, margin=0.10,
+                                  top_fraction=0.002, eps=1e-6):
     """
     Penalize small, very bright hallucinations that visual/log losses can miss.
 
@@ -755,10 +776,16 @@ def bright_excess_loss(pred, target, margin=0.10, top_fraction=0.002, eps=1e-6):
     if top_fraction is not None and top_fraction > 0:
         k = max(1, int(excess.shape[1] * float(top_fraction)))
         excess = torch.topk(excess, k=k, dim=1).values
-    return excess.mean()
+    return excess.mean(dim=1)
 
 
-def dark_deficit_loss(pred, target, margin=0.10, top_fraction=0.002, eps=1e-6):
+def bright_excess_loss(pred, target, margin=0.10, top_fraction=0.002, eps=1e-6):
+    return bright_excess_loss_per_sample(
+        pred, target, margin=margin, top_fraction=top_fraction, eps=eps).mean()
+
+
+def dark_deficit_loss_per_sample(pred, target, margin=0.10,
+                                 top_fraction=0.002, eps=1e-6):
     """
     Penalize small, very dark hallucinations such as local pore artifacts.
 
@@ -770,57 +797,79 @@ def dark_deficit_loss(pred, target, margin=0.10, top_fraction=0.002, eps=1e-6):
     if top_fraction is not None and top_fraction > 0:
         k = max(1, int(deficit.shape[1] * float(top_fraction)))
         deficit = torch.topk(deficit, k=k, dim=1).values
-    return deficit.mean()
+    return deficit.mean(dim=1)
+
+
+def dark_deficit_loss(pred, target, margin=0.10, top_fraction=0.002, eps=1e-6):
+    return dark_deficit_loss_per_sample(
+        pred, target, margin=margin, top_fraction=top_fraction, eps=eps).mean()
+
+
+def target_mean_normalized_smooth_l1_loss_per_sample(pred, target, eps=1e-6):
+    scale = target.mean(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    loss_map = F.smooth_l1_loss(pred / scale, target / scale, reduction='none')
+    return mean_per_sample(loss_map)
 
 
 def target_mean_normalized_smooth_l1_loss(pred, target, eps=1e-6):
-    scale = target.mean(dim=(-2, -1), keepdim=True).clamp_min(eps)
-    return F.smooth_l1_loss(pred / scale, target / scale)
+    return target_mean_normalized_smooth_l1_loss_per_sample(
+        pred, target, eps=eps).mean()
 
 
-def visual_loss(pred, target, w_log_display_smooth_l1=0.0, w_ssim=1.0, w_grad=0.1, w_fft=0.0,
-                w_mean_norm_l1=1.0, w_peak=0.0, w_dark=0.0,
-                peak_margin=0.10, peak_top_fraction=0.002,
-                dark_margin=0.10, dark_top_fraction=0.002):
+def visual_loss_per_sample(pred, target,
+                           w_log_display_smooth_l1=0.0, w_ssim=1.0,
+                           w_grad=0.1, w_fft=0.0,
+                           w_mean_norm_l1=1.0, w_peak=0.0, w_dark=0.0,
+                           peak_margin=0.10, peak_top_fraction=0.002,
+                           dark_margin=0.10, dark_top_fraction=0.002):
     pred_d = target_d = None
     if w_log_display_smooth_l1 > 0 or w_ssim > 0 or w_grad > 0 or w_fft > 0:
         pred_d = log_display_tensor(pred)
         target_d = log_display_tensor(target)
 
+    zeros = pred.new_zeros(pred.shape[0])
     log_display_smooth_l1 = (
-        F.smooth_l1_loss(pred_d, target_d)
-        if w_log_display_smooth_l1 > 0 else pred.new_tensor(0.0)
+        mean_per_sample(F.smooth_l1_loss(pred_d, target_d, reduction='none'))
+        if w_log_display_smooth_l1 > 0 else zeros
     )
-    ssim = simple_ssim_loss(pred_d, target_d) if w_ssim > 0 else pred.new_tensor(0.0)
-    grad = gradient_loss(pred_d, target_d) if w_grad > 0 else pred.new_tensor(0.0)
-    fft = fft_texture_loss(pred_d, target_d) if w_fft > 0 else pred.new_tensor(0.0)
+    ssim = simple_ssim_loss_per_sample(pred_d, target_d) if w_ssim > 0 else zeros
+    grad = gradient_loss_per_sample(pred_d, target_d) if w_grad > 0 else zeros
+    fft = fft_texture_loss_per_sample(pred_d, target_d) if w_fft > 0 else zeros
     mean_norm_l1 = (
-        target_mean_normalized_smooth_l1_loss(pred, target)
-        if w_mean_norm_l1 > 0 else pred.new_tensor(0.0)
+        target_mean_normalized_smooth_l1_loss_per_sample(pred, target)
+        if w_mean_norm_l1 > 0 else zeros
     )
-    peak = bright_excess_loss(
+    peak = bright_excess_loss_per_sample(
         pred, target,
         margin=peak_margin,
         top_fraction=peak_top_fraction,
-    ) if w_peak > 0 else pred.new_tensor(0.0)
-    dark = dark_deficit_loss(
+    ) if w_peak > 0 else zeros
+    dark = dark_deficit_loss_per_sample(
         pred, target,
         margin=dark_margin,
         top_fraction=dark_top_fraction,
-    ) if w_dark > 0 else pred.new_tensor(0.0)
+    ) if w_dark > 0 else zeros
     total = (w_log_display_smooth_l1 * log_display_smooth_l1 +
              w_ssim * ssim + w_grad * grad + w_fft * fft +
              w_mean_norm_l1 * mean_norm_l1 +
              w_peak * peak + w_dark * dark)
     return total, {
-        'log_display_smooth_l1': log_display_smooth_l1.item(),
-        'ssim': ssim.item(),
-        'grad': grad.item(),
-        'fft': fft.item(),
-        'mean_norm_l1': mean_norm_l1.item(),
-        'peak': peak.item(),
-        'dark': dark.item(),
-        'raw_mse': F.mse_loss(pred, target).item(),
+        'log_display_smooth_l1': log_display_smooth_l1,
+        'ssim': ssim,
+        'grad': grad,
+        'fft': fft,
+        'mean_norm_l1': mean_norm_l1,
+        'peak': peak,
+        'dark': dark,
+        'raw_mse': mean_per_sample((pred - target).pow(2)),
+    }
+
+
+def visual_loss(pred, target, **kwargs):
+    per_sample_loss, per_sample_comps = visual_loss_per_sample(
+        pred, target, **kwargs)
+    return per_sample_loss.mean(), {
+        key: value.mean().item() for key, value in per_sample_comps.items()
     }
 
 
@@ -841,6 +890,31 @@ def sample_type_from_id(sample_id):
     if sample_id.startswith('pert_'):
         return 'pert'
     return 'other'
+
+
+def normalize_group_loss_weights(dataset, train_indices, raw_weights, enabled=True):
+    group_names = ('systematic', 'real', 'pert', 'other')
+    counts = {name: 0 for name in group_names}
+    for idx in train_indices:
+        group = sample_type_from_id(dataset.samples[int(idx)]['id'])
+        counts[group if group in counts else 'other'] += 1
+
+    weights = {
+        name: float(raw_weights.get(name, 1.0)) if enabled else 1.0
+        for name in group_names
+    }
+    total_count = sum(counts.values())
+    if total_count == 0:
+        raise ValueError("Cannot normalize group loss weights for an empty training split")
+    mean_weight = sum(counts[name] * weights[name] for name in group_names) / total_count
+    if mean_weight <= 0:
+        raise ValueError(f"Mean group loss weight must be positive; got {mean_weight}")
+
+    normalized = {name: weights[name] / mean_weight for name in group_names}
+    print(">>> Training group loss weights (count, raw -> normalized):")
+    for name in group_names:
+        print(f">>>   {name}: {counts[name]}, {weights[name]:.4g} -> {normalized[name]:.4g}")
+    return normalized, counts
 
 
 def pert_parent_id_from_id(sample_id, real_ids=None):
@@ -1052,6 +1126,8 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
     best_val = float('inf')
     history = {
         'train': [], 'val': [],
+        'train_unweighted': [],
+        'train_systematic': [], 'train_real_family': [], 'train_other': [],
         'train_log_display_smooth_l1': [], 'val_log_display_smooth_l1': [],
         'train_ssim': [], 'val_ssim': [],
         'train_grad': [], 'val_grad': [],
@@ -1064,8 +1140,11 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
 
     for epoch in range(cfg['epochs']):
         model.train()
-        sums = {k: 0.0 for k in ['loss', 'log_display_smooth_l1', 'ssim', 'grad', 'fft',
+        sums = {k: 0.0 for k in ['loss', 'unweighted_loss',
+                                  'log_display_smooth_l1', 'ssim', 'grad', 'fft',
                                   'mean_norm_l1', 'peak', 'dark', 'raw_mse']}
+        group_loss_sums = {'systematic': 0.0, 'real_family': 0.0, 'other': 0.0}
+        group_counts = {'systematic': 0, 'real_family': 0, 'other': 0}
         n_seen = 0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{cfg['epochs']} [train]"):
             field, _, phase, camera = prepare_batch(batch, device, cfg['model_size'])
@@ -1074,7 +1153,7 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
             with torch.amp.autocast('cuda', enabled=amp_enabled):
                 pred, _ = predict_camera(model, field, phase, cfg, train_noise=True)
                 pred_loss, camera_loss = apply_loss_roi(pred, camera, loss_roi_fraction)
-                loss, comps = visual_loss(
+                per_sample_loss, per_sample_comps = visual_loss_per_sample(
                     pred_loss, camera_loss,
                     w_log_display_smooth_l1=cfg['w_log_display_smooth_l1'],
                     w_ssim=cfg['w_ssim'],
@@ -1088,6 +1167,12 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
                     dark_margin=cfg['dark_margin'],
                     dark_top_fraction=cfg['dark_top_fraction'],
                 )
+                sample_types = [sample_type_from_id(sample_id) for sample_id in batch['id']]
+                sample_weights = pred.new_tensor([
+                    cfg['group_loss_weights_normalized'].get(sample_type, 1.0)
+                    for sample_type in sample_types
+                ])
+                loss = (sample_weights * per_sample_loss).mean()
 
             scaler.scale(loss).backward()
             if cfg['grad_clip'] is not None:
@@ -1098,11 +1183,27 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
 
             b = field.shape[0]
             sums['loss'] += loss.item() * b
-            for k in comps:
-                sums[k] += comps[k] * b
+            sums['unweighted_loss'] += per_sample_loss.detach().sum().item()
+            for key, values in per_sample_comps.items():
+                sums[key] += values.detach().sum().item()
+            for sample_type, sample_loss in zip(
+                    sample_types, per_sample_loss.detach().cpu().tolist()):
+                if sample_type == 'systematic':
+                    family = 'systematic'
+                elif sample_type in {'real', 'pert'}:
+                    family = 'real_family'
+                else:
+                    family = 'other'
+                group_loss_sums[family] += float(sample_loss)
+                group_counts[family] += 1
             n_seen += b
 
         train_stats = {k: v / max(n_seen, 1) for k, v in sums.items()}
+        train_group_stats = {
+            name: (group_loss_sums[name] / group_counts[name]
+                   if group_counts[name] else float('nan'))
+            for name in group_loss_sums
+        }
 
         model.eval()
         sums = {k: 0.0 for k in ['loss', 'log_display_smooth_l1', 'ssim', 'grad', 'fft',
@@ -1137,6 +1238,10 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
 
         history['train'].append(train_stats['loss'])
         history['val'].append(val_stats['loss'])
+        history['train_unweighted'].append(train_stats['unweighted_loss'])
+        history['train_systematic'].append(train_group_stats['systematic'])
+        history['train_real_family'].append(train_group_stats['real_family'])
+        history['train_other'].append(train_group_stats['other'])
         for k in ['log_display_smooth_l1', 'ssim', 'grad', 'fft', 'mean_norm_l1',
                   'peak', 'dark', 'raw_mse']:
             history[f'train_{k}'].append(train_stats[k])
@@ -1144,7 +1249,11 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
 
         print(
             f"  Epoch {epoch + 1}: "
-            f"train_loss={train_stats['loss']:.5f} val_loss={val_stats['loss']:.5f} "
+            f"train_weighted={train_stats['loss']:.5f} "
+            f"train_unweighted={train_stats['unweighted_loss']:.5f} "
+            f"train_sys={train_group_stats['systematic']:.5f} "
+            f"train_real_family={train_group_stats['real_family']:.5f} "
+            f"val_loss={val_stats['loss']:.5f} "
             f"val_mean_norm_l1={val_stats['mean_norm_l1']:.5f} "
             f"val_ssim={val_stats['ssim']:.5f} "
             f"val_grad={val_stats['grad']:.5f} "
@@ -1258,7 +1367,10 @@ def plot_loss_curve(history, run_dir):
     if not history['train']:
         return
     plt.figure(figsize=(8, 5))
-    plt.plot(history['train'], label='train', color='steelblue')
+    plt.plot(history['train'], label='train weighted', color='steelblue')
+    if history.get('train_unweighted'):
+        plt.plot(history['train_unweighted'], label='train unweighted',
+                 color='steelblue', linestyle='--', alpha=0.7)
     plt.plot(history['val'], label='val', color='coral')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
@@ -1267,6 +1379,28 @@ def plot_loss_curve(history, run_dir):
     plt.legend()
     plt.tight_layout()
     plt.savefig(Path(run_dir) / 'loss_curve.png', dpi=140)
+    plt.close()
+
+    group_series = [
+        ('train_systematic', 'systematic', 'tab:blue'),
+        ('train_real_family', 'real + pert', 'tab:green'),
+        ('train_other', 'other', 'tab:gray'),
+    ]
+    plt.figure(figsize=(8, 5))
+    plotted = False
+    for key, label, color in group_series:
+        values = np.asarray(history.get(key, []), dtype=np.float64)
+        if values.size and np.isfinite(values).any():
+            plt.plot(values, label=label, color=color)
+            plotted = True
+    if plotted:
+        plt.xlabel('Epoch')
+        plt.ylabel('Unweighted per-sample loss')
+        plt.yscale('log')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(Path(run_dir) / 'group_loss_curve.png', dpi=140)
     plt.close()
 
 
@@ -1429,15 +1563,15 @@ def plot_per_sample_metrics(records, run_dir, metric_prefix=''):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    POOL_DIR = r'H:\Shared drives\taylorlab\3DHL\CITL\Fourier Neural Operator_Training phase masks\05_28_2026_sample2'
-    OUTPUT_DIR = r'C:\REVAMP\Yangwoo Heo\SLM_to_Axicon_Optimiaztion\FNO_train_650sample'
+    POOL_DIR = r'H:\Shared drives\taylorlab\3DHL\CITL\Fourier Neural Operator_Training phase masks\06_14_2026_sample3_z6mm'
+    OUTPUT_DIR = r'C:\REVAMP\Yangwoo Heo\SLM_to_Axicon_Optimiaztion\FNO_train_898sample_FOVfix'
     RUN_NAME = datetime.now().strftime('%Y%m%d_%H%M%S')
     EVAL_ONLY_RUN_DIR = None
 
     # Data
     WORKFLOW_FIELD_DIR = '1.Forward_Sim'
     WORKFLOW_CAMERA_DIR = '3.Aligned_Camera'
-    WORKFLOW_PHASE_DIR = '0.Phase_Mask'
+    WORKFLOW_PHASE_DIR = '0.Phase_Masks'
     # Set to None for full-frame training. 608 is a native ~60% crop of 1024
     # and avoids resizing the valid FOV back to the original resolution.
     FOV_CROP_SIZE = 608
@@ -1489,6 +1623,13 @@ if __name__ == '__main__':
     NUM_WORKERS = 1
     USE_AMP = False  # FFT + complex weights are safer in full fp32 for the first run
     GRAD_CLIP = 1.0
+    USE_GROUP_LOSS_WEIGHTS = True
+    GROUP_LOSS_WEIGHTS = {
+        'systematic': 1.0,
+        'real': 5.0,
+        'pert': 5.0,
+        'other': 1.0,
+    }
 
     # Loss
     W_LOG_DISPLAY_SMOOTH_L1 = 0.0
@@ -1566,6 +1707,8 @@ if __name__ == '__main__':
         'require_cuda': REQUIRE_CUDA,
         'use_amp': USE_AMP,
         'grad_clip': GRAD_CLIP,
+        'use_group_loss_weights': USE_GROUP_LOSS_WEIGHTS,
+        'group_loss_weights_raw': GROUP_LOSS_WEIGHTS,
         'w_log_display_smooth_l1': W_LOG_DISPLAY_SMOOTH_L1,
         'w_ssim': W_SSIM,
         'w_grad': W_GRAD,
@@ -1631,6 +1774,15 @@ if __name__ == '__main__':
                     'train': [dataset.samples[i]['id'] for i in train_idx],
                     'val': [dataset.samples[i]['id'] for i in val_idx],
                 }, f, indent=2)
+
+    normalized_group_weights, train_group_counts = normalize_group_loss_weights(
+        dataset,
+        train_idx,
+        GROUP_LOSS_WEIGHTS,
+        enabled=USE_GROUP_LOSS_WEIGHTS,
+    )
+    cfg['group_loss_weights_normalized'] = normalized_group_weights
+    cfg['train_group_counts'] = train_group_counts
 
     with open(run_dir / 'config.json', 'w', encoding='utf-8') as f:
         json.dump(cfg, f, indent=2)
