@@ -61,7 +61,8 @@ class AxiconFieldDataset(Dataset):
                  camera_scale_mode='global_percentile',
                  camera_percentile=99.9,
                  camera_scale=None,
-                 camera_black_level=0.0):
+                 camera_black_level=0.0,
+                 fov_crop_size=None):
         self.root_dir = Path(root_dir)
         self.workflow_field_dir = workflow_field_dir
         self.workflow_camera_dir = workflow_camera_dir
@@ -75,12 +76,15 @@ class AxiconFieldDataset(Dataset):
         self.camera_percentile = camera_percentile
         self.camera_scale = camera_scale
         self.camera_black_level = camera_black_level
+        self.fov_crop_size = None if fov_crop_size is None else int(fov_crop_size)
         self.valid_scale_modes = {'sample_norm', 'global_percentile', 'raw'}
 
         if not self.root_dir.exists():
             raise FileNotFoundError(f"Root not found: {self.root_dir}")
         self._validate_scale_mode(self.field_scale_mode, 'field_scale_mode')
         self._validate_scale_mode(self.camera_scale_mode, 'camera_scale_mode')
+        if self.fov_crop_size is not None and self.fov_crop_size <= 0:
+            raise ValueError(f"fov_crop_size must be positive or None; got {self.fov_crop_size}")
 
         self.samples = self._discover_workflow_samples()
         print(f">>> Loaded {len(self.samples)} workflow samples from {self.root_dir}")
@@ -92,6 +96,8 @@ class AxiconFieldDataset(Dataset):
             self.field_amp_scale = self._compute_global_field_amp_scale()
         print(f">>> Camera scale mode: {self.camera_scale_mode}, scale={self.camera_scale}")
         print(f">>> Field scale mode: {self.field_scale_mode}, amp_scale={self.field_amp_scale}")
+        if self.fov_crop_size is not None:
+            print(f">>> Native center FOV crop: {self.fov_crop_size} x {self.fov_crop_size}")
 
     def _normalized_stem(self, path):
         stem = Path(path).stem
@@ -176,6 +182,23 @@ class AxiconFieldDataset(Dataset):
             arr = arr / (max_v + eps)
         return np.clip(arr, 0.0, 1.0).astype(np.float32)
 
+    def _center_crop_2d(self, arr, source_name='array'):
+        arr = np.asarray(arr)
+        if arr.ndim != 2:
+            raise ValueError(f"{source_name} must be 2D before FOV cropping; got {arr.shape}")
+        if self.fov_crop_size is None:
+            return arr
+
+        crop = self.fov_crop_size
+        height, width = arr.shape
+        if crop > height or crop > width:
+            raise ValueError(
+                f"fov_crop_size={crop} exceeds {source_name} shape {arr.shape}"
+            )
+        y0 = (height - crop) // 2
+        x0 = (width - crop) // 2
+        return arr[y0:y0 + crop, x0:x0 + crop]
+
     def _split_channel_array(self, arr):
         if arr.ndim != 3:
             return None
@@ -194,6 +217,7 @@ class AxiconFieldDataset(Dataset):
         arr = np.squeeze(arr)
         if arr.ndim != 2:
             raise ValueError(f"{path} must be 2D camera data; got {arr.shape}")
+        arr = self._center_crop_2d(arr, source_name=f"camera {path.name}")
         return np.nan_to_num(arr.astype(np.float32))
 
     def _camera_to_training_scale(self, arr, eps=1e-8):
@@ -245,6 +269,7 @@ class AxiconFieldDataset(Dataset):
         for s in self.samples:
             arr = np.load(s['field'])
             amp = self._extract_field_amplitude(arr)
+            amp = self._center_crop_2d(amp, source_name=f"field amplitude {s['field'].name}")
             finite = amp[np.isfinite(amp)]
             if finite.size:
                 values.append(finite.reshape(-1))
@@ -295,6 +320,9 @@ class AxiconFieldDataset(Dataset):
                 cos_p = chw[1].astype(np.float32)
                 sin_p = chw[2].astype(np.float32)
 
+        amp = self._center_crop_2d(amp, source_name='field amplitude')
+        cos_p = self._center_crop_2d(cos_p, source_name='field phase cosine')
+        sin_p = self._center_crop_2d(sin_p, source_name='field phase sine')
         amp = self._scale_field_amplitude(amp, eps=eps)
         field = torch.from_numpy(np.stack([amp, cos_p, sin_p], axis=0))
         field = self._resize_chw(field, self.sim_size, mode='bilinear')
@@ -1410,8 +1438,11 @@ if __name__ == '__main__':
     WORKFLOW_FIELD_DIR = '1.Forward_Sim'
     WORKFLOW_CAMERA_DIR = '3.Aligned_Camera'
     WORKFLOW_PHASE_DIR = '0.Phase_Mask'
-    SIM_SIZE = 1024
-    MODEL_SIZE = 1024  # lower to 512 if FFT memory is too high
+    # Set to None for full-frame training. 608 is a native ~60% crop of 1024
+    # and avoids resizing the valid FOV back to the original resolution.
+    FOV_CROP_SIZE = 608
+    SIM_SIZE = FOV_CROP_SIZE if FOV_CROP_SIZE is not None else 1024
+    MODEL_SIZE = SIM_SIZE
     PHASE_FLIP = True
     FIELD_SCALE_MODE = 'global_percentile'   # 'raw', 'global_percentile', or 'sample_norm'
     CAMERA_SCALE_MODE = 'global_percentile'  # 'raw', 'global_percentile', or 'sample_norm'
@@ -1471,7 +1502,9 @@ if __name__ == '__main__':
     PEAK_TOP_FRACTION = 0.002
     DARK_MARGIN = 0.10
     DARK_TOP_FRACTION = 0.002
-    LOSS_ROI_FRACTION = 0.80  # center crop for loss/metrics; set to 1.0 to use the full image
+    # A native FOV crop is already the supervised domain. When it is disabled,
+    # retain the previous full-frame behavior with an 80% center loss ROI.
+    LOSS_ROI_FRACTION = 1.0 if FOV_CROP_SIZE is not None else 0.80
 
     # Visualization
     N_VIS_TRAIN = 30
@@ -1495,6 +1528,7 @@ if __name__ == '__main__':
         'workflow_field_dir': WORKFLOW_FIELD_DIR,
         'workflow_camera_dir': WORKFLOW_CAMERA_DIR,
         'workflow_phase_dir': WORKFLOW_PHASE_DIR,
+        'fov_crop_size': FOV_CROP_SIZE,
         'sim_size': SIM_SIZE,
         'model_size': MODEL_SIZE,
         'phase_flip': PHASE_FLIP,
@@ -1566,6 +1600,7 @@ if __name__ == '__main__':
         camera_percentile=CAMERA_PERCENTILE,
         camera_scale=CAMERA_SCALE,
         camera_black_level=CAMERA_BLACK_LEVEL,
+        fov_crop_size=FOV_CROP_SIZE,
     )
     cfg['field_amp_scale_actual'] = dataset.field_amp_scale
     cfg['camera_scale_actual'] = dataset.camera_scale
