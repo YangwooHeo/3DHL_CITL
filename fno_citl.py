@@ -103,12 +103,15 @@ SCRIPT_CONFIG = {
     "transpose_phase": True,
     "flip_phase_first_axis": True,
     "transpose_output_field": True,
-    # "auto": direct for .npy / already-grid-sized targets, phase_optimization for raw PNG targets.
+    # "auto": direct for .npy / already-grid-sized targets, and
+    # phase_optimization_camera for raw PNG targets drawn for optimizer_phase_axicon_3d.py.
     "target_preprocess_mode": "auto",
     "target_original_pixel_size": 2e-6,
     "phase_optimization_roi_size": 1600,
     "phase_optimization_crop_to_current_roi": True,
     "phase_optimization_internal_transpose": False,
+    "target_camera_full_size": 1024,
+    "target_fov_crop_size": None,
     "transpose_target": False,
     "flip_target_ud": False,
     "flip_target_lr": False,
@@ -247,6 +250,57 @@ def phase_optimization_target_array(
     return final_image.astype(np.float32, copy=False)
 
 
+def phase_optimization_camera_target_tensor(
+    arr: np.ndarray,
+    beam_config: HoloBeamConfig,
+    device: torch.device,
+    dtype: torch.dtype,
+    original_pixel_size: float = 2e-6,
+    phase_optimization_roi_size: int = 1600,
+    target_camera_full_size: int | None = 1024,
+    target_fov_crop_size: int | None = None,
+    internal_transpose: bool = False,
+) -> torch.Tensor:
+    """
+    Reproduce the raw-PNG target coordinate chain used by the phase optimizer,
+    then place it into the same camera/FNO domain used for proxy training.
+
+    optimizer_phase_axicon_3d.py:
+        raw PNG -> physical rescale by abbe resolution -> optimizer ROI
+
+    FNO training:
+        optimizer result -> 1024 camera/simulation full frame -> optional
+        native center FOV crop, e.g. 608 -> model_size
+    """
+    optimizer_canvas = phase_optimization_target_array(
+        arr,
+        beam_config,
+        original_pixel_size=float(original_pixel_size),
+        internal_transpose=bool(internal_transpose),
+    )
+    target = torch.from_numpy(optimizer_canvas).unsqueeze(0).unsqueeze(0).to(
+        device=device,
+        dtype=dtype,
+    )
+    target = resize_batch(target, int(phase_optimization_roi_size), mode="bilinear")
+
+    if target_camera_full_size is not None:
+        target = center_crop_or_pad_tensor(
+            target,
+            int(target_camera_full_size),
+            int(target_camera_full_size),
+        )
+
+    if target_fov_crop_size is not None:
+        target = center_crop_or_pad_tensor(
+            target,
+            int(target_fov_crop_size),
+            int(target_fov_crop_size),
+        )
+
+    return target
+
+
 def target_preprocess_report(
     source_shape: tuple[int, int],
     beam_config: HoloBeamConfig,
@@ -296,11 +350,12 @@ def resolve_target_preprocess_mode(
     target_size: int,
     current_roi_size: int | None,
 ) -> str:
-    if requested_mode in {"direct", "phase_optimization"}:
+    if requested_mode in {"direct", "phase_optimization", "phase_optimization_camera"}:
         return requested_mode
     if requested_mode != "auto":
         raise ValueError(
-            "target_preprocess_mode must be 'auto', 'direct', or 'phase_optimization'; "
+            "target_preprocess_mode must be 'auto', 'direct', "
+            "'phase_optimization', or 'phase_optimization_camera'; "
             f"got {requested_mode!r}"
         )
 
@@ -315,7 +370,7 @@ def resolve_target_preprocess_mode(
         return "direct"
     if source_h in grid_sizes and source_w in grid_sizes:
         return "direct"
-    return "phase_optimization"
+    return "phase_optimization_camera"
 
 
 def load_target_image(
@@ -330,6 +385,8 @@ def load_target_image(
     current_roi_size: int | None = None,
     crop_phase_optimization_to_current_roi: bool = True,
     phase_optimization_internal_transpose: bool = False,
+    target_camera_full_size: int | None = 1024,
+    target_fov_crop_size: int | None = None,
     transpose: bool = False,
     flip_ud: bool = False,
     flip_lr: bool = False,
@@ -382,6 +439,44 @@ def load_target_image(
             "direct_vertical_scale_px_per_source_px": float(target_size) / float(source_shape[0]),
             "auto_reason": "npy_or_already_grid_sized_target",
         }
+        return target, report
+
+    if preprocess_mode == "phase_optimization_camera":
+        if beam_config is None:
+            raise ValueError("beam_config is required when target_preprocess_mode='phase_optimization_camera'.")
+        target = phase_optimization_camera_target_tensor(
+            arr,
+            beam_config=beam_config,
+            device=device,
+            dtype=dtype,
+            original_pixel_size=float(original_pixel_size),
+            phase_optimization_roi_size=int(phase_optimization_roi_size),
+            target_camera_full_size=target_camera_full_size,
+            target_fov_crop_size=target_fov_crop_size,
+            internal_transpose=bool(phase_optimization_internal_transpose),
+        )
+        target_domain_size = int(target.shape[-1])
+        target = resize_batch(target, int(target_size), mode="bilinear").clamp(0.0, 1.0)
+        target = target / target.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+        report = target_preprocess_report(
+            source_shape=source_shape,
+            beam_config=beam_config,
+            original_pixel_size=float(original_pixel_size),
+            phase_optimization_roi_size=int(phase_optimization_roi_size),
+            current_roi_size=target_domain_size,
+            target_size=int(target_size),
+        )
+        report.update({
+            "requested_mode": requested_mode,
+            "mode": "phase_optimization_camera",
+            "source_shape": list(source_shape),
+            "phase_optimization_roi_size": int(phase_optimization_roi_size),
+            "target_camera_full_size": None if target_camera_full_size is None else int(target_camera_full_size),
+            "target_fov_crop_size": None if target_fov_crop_size is None else int(target_fov_crop_size),
+            "target_domain_size_before_model_resize": target_domain_size,
+            "target_size": int(target_size),
+            "phase_optimization_internal_transpose": bool(phase_optimization_internal_transpose),
+        })
         return target, report
 
     if preprocess_mode != "phase_optimization":
@@ -1201,7 +1296,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target-preprocess-mode",
-        choices=("auto", "direct", "phase_optimization"),
+        choices=("auto", "direct", "phase_optimization", "phase_optimization_camera"),
         default=SCRIPT_CONFIG["target_preprocess_mode"],
     )
     parser.add_argument(
@@ -1226,6 +1321,21 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=SCRIPT_CONFIG["phase_optimization_internal_transpose"],
         help="Use the GS optimizer's internal x/y target orientation. Leave false for FNO camera/display loss.",
+    )
+    parser.add_argument(
+        "--target-camera-full-size",
+        type=int,
+        default=SCRIPT_CONFIG["target_camera_full_size"],
+        help="Full homography-aligned camera/simulation canvas before native FOV crop, typically 1024.",
+    )
+    parser.add_argument(
+        "--target-fov-crop-size",
+        type=int,
+        default=SCRIPT_CONFIG["target_fov_crop_size"],
+        help=(
+            "Native center crop applied during FNO training, e.g. 608. "
+            "Leave unset to infer from the FNO checkpoint fov_crop_size."
+        ),
     )
     parser.add_argument("--transpose-target", action=argparse.BooleanOptionalAction, default=SCRIPT_CONFIG["transpose_target"])
     parser.add_argument("--flip-target-ud", action=argparse.BooleanOptionalAction, default=SCRIPT_CONFIG["flip_target_ud"])
@@ -1267,6 +1377,14 @@ def main():
     fno_model, fno_cfg = load_fno_proxy(args.fno, device)
     if args.loss_roi_fraction is not None:
         fno_cfg["loss_roi_fraction"] = float(args.loss_roi_fraction)
+    target_fov_crop_size = args.target_fov_crop_size
+    if target_fov_crop_size is None:
+        checkpoint_crop = fno_cfg.get("fov_crop_size")
+        if checkpoint_crop is not None:
+            target_fov_crop_size = int(checkpoint_crop)
+        elif args.target_camera_full_size is not None and int(args.roi_size) < int(args.target_camera_full_size):
+            target_fov_crop_size = int(args.roi_size)
+    args.resolved_target_fov_crop_size = target_fov_crop_size
     loss_weights = {
         "w_log_display_mse": float(args.w_log_display_mse),
         "w_log_display_ssim": float(args.w_log_display_ssim),
@@ -1306,6 +1424,8 @@ def main():
         current_roi_size=int(args.roi_size),
         crop_phase_optimization_to_current_roi=bool(args.phase_optimization_crop_to_current_roi),
         phase_optimization_internal_transpose=bool(args.phase_optimization_internal_transpose),
+        target_camera_full_size=args.target_camera_full_size,
+        target_fov_crop_size=target_fov_crop_size,
         transpose=args.transpose_target,
         flip_ud=args.flip_target_ud,
         flip_lr=args.flip_target_lr,
@@ -1313,7 +1433,7 @@ def main():
     args.target_preprocess_report = preprocess_report
     if preprocess_report.get("requested_mode") == "auto":
         print(f"[Target] auto preprocessing selected: {preprocess_report.get('mode')}")
-    if preprocess_report.get("mode") == "phase_optimization":
+    if preprocess_report.get("mode") in {"phase_optimization", "phase_optimization_camera"}:
         print(
             "[Target] phase-optimization scale correction: "
             f"abbe=({preprocess_report['abbe_res_x_um']:.6f}, "
@@ -1322,6 +1442,15 @@ def main():
             f"({preprocess_report['relative_horizontal_magnification_vs_direct_resize']:.6f}x, "
             f"{preprocess_report['relative_vertical_magnification_vs_direct_resize']:.6f}x)"
         )
+        if preprocess_report.get("mode") == "phase_optimization_camera":
+            print(
+                "[Target] camera/FNO target chain: "
+                f"raw {tuple(preprocess_report['source_shape'])} -> "
+                f"optimizer ROI {preprocess_report['phase_optimization_roi_size']} -> "
+                f"camera full {preprocess_report['target_camera_full_size']} -> "
+                f"FOV crop {preprocess_report['target_fov_crop_size']} -> "
+                f"model {preprocess_report['target_size']}"
+            )
     else:
         print("[Target] using direct target resize; phase-optimization scale correction disabled.")
 
