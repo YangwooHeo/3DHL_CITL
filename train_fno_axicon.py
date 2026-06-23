@@ -967,10 +967,21 @@ def sample_group_from_id(sample_id):
     return 'other'
 
 
-def split_dataset(dataset, train_ratio=0.8, seed=42):
+def split_dataset(dataset, real_train_ratio=0.8, sys_train_ratio=1.0,
+                  seed=42, train_ratio=None):
+    # train_ratio is retained as a compatibility alias for older callers.
+    if train_ratio is not None:
+        real_train_ratio = train_ratio
+    real_train_ratio = float(real_train_ratio)
+    sys_train_ratio = float(sys_train_ratio)
+    for name, ratio in [('real_train_ratio', real_train_ratio),
+                        ('sys_train_ratio', sys_train_ratio)]:
+        if not 0.0 <= ratio <= 1.0:
+            raise ValueError(f"{name} must be between 0 and 1; got {ratio}")
+
     rng = random.Random(seed)
 
-    sys_idx = []
+    sys_idx_by_group = {}
     real_idx_by_id = {}
     pert_idx_by_parent = {}
     other_idx = []
@@ -980,7 +991,8 @@ def split_dataset(dataset, train_ratio=0.8, seed=42):
         sample_type = sample_type_from_id(sample['id'])
         typed_samples.append((idx, sample['id'], sample_type))
         if sample_type == 'systematic':
-            sys_idx.append(idx)
+            group = sample_group_from_id(sample['id'])
+            sys_idx_by_group.setdefault(group, []).append(idx)
         elif sample_type == 'real':
             real_idx_by_id[sample['id']] = idx
 
@@ -996,13 +1008,25 @@ def split_dataset(dataset, train_ratio=0.8, seed=42):
         indices.sort()
 
     real_parent_ids = sorted(set(real_idx_by_id) | set(pert_idx_by_parent))
+    sys_train_idx = []
+    sys_val_idx = []
+    for group in sorted(sys_idx_by_group):
+        indices = sorted(sys_idx_by_group[group])
+        rng.shuffle(indices)
+        n_train = int(round(len(indices) * sys_train_ratio))
+        if 0.0 < sys_train_ratio < 1.0 and len(indices) >= 2:
+            n_train = min(max(n_train, 1), len(indices) - 1)
+        sys_train_idx.extend(indices[:n_train])
+        sys_val_idx.extend(indices[n_train:])
 
-    if sys_idx or real_parent_ids:
+    if sys_idx_by_group or real_parent_ids:
         rng.shuffle(real_parent_ids)
         rng.shuffle(other_idx)
 
-        n_parent_train = int(round(len(real_parent_ids) * train_ratio))
-        n_other_train = int(round(len(other_idx) * train_ratio))
+        n_parent_train = int(round(len(real_parent_ids) * real_train_ratio))
+        if 0.0 < real_train_ratio < 1.0 and len(real_parent_ids) >= 2:
+            n_parent_train = min(max(n_parent_train, 1), len(real_parent_ids) - 1)
+        n_other_train = int(round(len(other_idx) * real_train_ratio))
         train_parent_ids = set(real_parent_ids[:n_parent_train])
         val_parent_ids = set(real_parent_ids[n_parent_train:])
 
@@ -1017,8 +1041,8 @@ def split_dataset(dataset, train_ratio=0.8, seed=42):
         grouped_train_idx = grouped_indices(train_parent_ids)
         grouped_val_idx = grouped_indices(val_parent_ids)
 
-        train_idx = sys_idx + grouped_train_idx + other_idx[:n_other_train]
-        val_idx = grouped_val_idx + other_idx[n_other_train:]
+        train_idx = sys_train_idx + grouped_train_idx + other_idx[:n_other_train]
+        val_idx = sys_val_idx + grouped_val_idx + other_idx[n_other_train:]
 
         train_real_count = sum(1 for i in grouped_train_idx
                                if sample_type_from_id(dataset.samples[i]['id']) == 'real')
@@ -1031,12 +1055,12 @@ def split_dataset(dataset, train_ratio=0.8, seed=42):
 
         print(
             f"Prefix/group split: {len(train_idx)} train / {len(val_idx)} val "
-            f"(sys train-fixed={len(sys_idx)}, "
+            f"(sys train/val={len(sys_train_idx)}/{len(sys_val_idx)}, "
             f"real-parent train/val={len(train_parent_ids)}/{len(val_parent_ids)}, "
             f"real samples train/val={train_real_count}/{val_real_count}, "
             f"pert samples train/val={train_pert_count}/{val_pert_count}, "
             f"other train/val={n_other_train}/{len(other_idx) - n_other_train}, "
-            f"ratio={train_ratio})"
+            f"sys ratio={sys_train_ratio}, real ratio={real_train_ratio})"
         )
         orphan_parents = sorted(pid for pid in pert_idx_by_parent if pid not in real_idx_by_id)
         if orphan_parents:
@@ -1047,12 +1071,15 @@ def split_dataset(dataset, train_ratio=0.8, seed=42):
             )
     else:
         n = len(dataset)
-        n_train = int(round(n * train_ratio))
+        n_train = int(round(n * real_train_ratio))
         indices = list(range(n))
         rng.shuffle(indices)
         train_idx = indices[:n_train]
         val_idx = indices[n_train:]
-        print(f"Split: {len(train_idx)} train / {len(val_idx)} val (ratio={train_ratio})")
+        print(
+            f"Split: {len(train_idx)} train / {len(val_idx)} val "
+            f"(real ratio={real_train_ratio})"
+        )
 
     return Subset(dataset, train_idx), Subset(dataset, val_idx), train_idx, val_idx
 
@@ -1128,6 +1155,7 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
         'train': [], 'val': [],
         'train_unweighted': [],
         'train_systematic': [], 'train_real_family': [], 'train_other': [],
+        'val_systematic': [], 'val_real_family': [], 'val_other': [],
         'train_log_display_smooth_l1': [], 'val_log_display_smooth_l1': [],
         'train_ssim': [], 'val_ssim': [],
         'train_grad': [], 'val_grad': [],
@@ -1208,13 +1236,15 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
         model.eval()
         sums = {k: 0.0 for k in ['loss', 'log_display_smooth_l1', 'ssim', 'grad', 'fft',
                                   'mean_norm_l1', 'peak', 'dark', 'raw_mse']}
+        val_group_loss_sums = {'systematic': 0.0, 'real_family': 0.0, 'other': 0.0}
+        val_group_counts = {'systematic': 0, 'real_family': 0, 'other': 0}
         n_seen = 0
         with torch.no_grad():
             for batch in val_loader:
                 field, _, phase, camera = prepare_batch(batch, device, cfg['model_size'])
                 pred, _ = predict_camera(model, field, phase, cfg, train_noise=False)
                 pred_loss, camera_loss = apply_loss_roi(pred, camera, loss_roi_fraction)
-                loss, comps = visual_loss(
+                per_sample_loss, per_sample_comps = visual_loss_per_sample(
                     pred_loss, camera_loss,
                     w_log_display_smooth_l1=cfg['w_log_display_smooth_l1'],
                     w_ssim=cfg['w_ssim'],
@@ -1228,13 +1258,30 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
                     dark_margin=cfg['dark_margin'],
                     dark_top_fraction=cfg['dark_top_fraction'],
                 )
+                loss = per_sample_loss.mean()
                 b = field.shape[0]
                 sums['loss'] += loss.item() * b
-                for k in comps:
-                    sums[k] += comps[k] * b
+                for key, values in per_sample_comps.items():
+                    sums[key] += values.sum().item()
+                sample_types = [sample_type_from_id(sample_id) for sample_id in batch['id']]
+                for sample_type, sample_loss in zip(
+                        sample_types, per_sample_loss.cpu().tolist()):
+                    if sample_type == 'systematic':
+                        family = 'systematic'
+                    elif sample_type in {'real', 'pert'}:
+                        family = 'real_family'
+                    else:
+                        family = 'other'
+                    val_group_loss_sums[family] += float(sample_loss)
+                    val_group_counts[family] += 1
                 n_seen += b
 
         val_stats = {k: v / max(n_seen, 1) for k, v in sums.items()}
+        val_group_stats = {
+            name: (val_group_loss_sums[name] / val_group_counts[name]
+                   if val_group_counts[name] else float('nan'))
+            for name in val_group_loss_sums
+        }
 
         history['train'].append(train_stats['loss'])
         history['val'].append(val_stats['loss'])
@@ -1242,6 +1289,9 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
         history['train_systematic'].append(train_group_stats['systematic'])
         history['train_real_family'].append(train_group_stats['real_family'])
         history['train_other'].append(train_group_stats['other'])
+        history['val_systematic'].append(val_group_stats['systematic'])
+        history['val_real_family'].append(val_group_stats['real_family'])
+        history['val_other'].append(val_group_stats['other'])
         for k in ['log_display_smooth_l1', 'ssim', 'grad', 'fft', 'mean_norm_l1',
                   'peak', 'dark', 'raw_mse']:
             history[f'train_{k}'].append(train_stats[k])
@@ -1254,6 +1304,8 @@ def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_d
             f"train_sys={train_group_stats['systematic']:.5f} "
             f"train_real_family={train_group_stats['real_family']:.5f} "
             f"val_loss={val_stats['loss']:.5f} "
+            f"val_sys={val_group_stats['systematic']:.5f} "
+            f"val_real_family={val_group_stats['real_family']:.5f} "
             f"val_mean_norm_l1={val_stats['mean_norm_l1']:.5f} "
             f"val_ssim={val_stats['ssim']:.5f} "
             f"val_grad={val_stats['grad']:.5f} "
@@ -1382,16 +1434,19 @@ def plot_loss_curve(history, run_dir):
     plt.close()
 
     group_series = [
-        ('train_systematic', 'systematic', 'tab:blue'),
-        ('train_real_family', 'real + pert', 'tab:green'),
-        ('train_other', 'other', 'tab:gray'),
+        ('train_systematic', 'train systematic', 'tab:blue', '-'),
+        ('val_systematic', 'val systematic', 'tab:blue', '--'),
+        ('train_real_family', 'train real + pert', 'tab:green', '-'),
+        ('val_real_family', 'val real + pert', 'tab:green', '--'),
+        ('train_other', 'train other', 'tab:gray', '-'),
+        ('val_other', 'val other', 'tab:gray', '--'),
     ]
     plt.figure(figsize=(8, 5))
     plotted = False
-    for key, label, color in group_series:
+    for key, label, color, linestyle in group_series:
         values = np.asarray(history.get(key, []), dtype=np.float64)
         if values.size and np.isfinite(values).any():
-            plt.plot(values, label=label, color=color)
+            plt.plot(values, label=label, color=color, linestyle=linestyle)
             plotted = True
     if plotted:
         plt.xlabel('Epoch')
@@ -1615,7 +1670,8 @@ if __name__ == '__main__':
 
     # Training
     REQUIRE_CUDA = False
-    TRAIN_RATIO = 0.6
+    SYS_TRAIN_RATIO = 0.90   # 10% of each systematic pattern family goes to validation
+    REAL_TRAIN_RATIO = 0.60  # real parents and all matching pert samples stay together
     BATCH_SIZE = 3
     EPOCHS = 100
     LR = 1e-3
@@ -1698,7 +1754,8 @@ if __name__ == '__main__':
         'field_out_scale_mode': FIELD_OUT_SCALE_MODE,
         'direct_field_activation': DIRECT_FIELD_ACTIVATION,
         'direct_field_noise_std': DIRECT_FIELD_NOISE_STD,
-        'train_ratio': TRAIN_RATIO,
+        'sys_train_ratio': SYS_TRAIN_RATIO,
+        'real_train_ratio': REAL_TRAIN_RATIO,
         'batch_size': BATCH_SIZE,
         'epochs': EPOCHS,
         'lr': LR,
@@ -1762,15 +1819,21 @@ if __name__ == '__main__':
         val_set = Subset(dataset, val_idx)
     else:
         train_set, val_set, train_idx, val_idx = split_dataset(
-            dataset, train_ratio=TRAIN_RATIO, seed=SEED)
+            dataset,
+            sys_train_ratio=SYS_TRAIN_RATIO,
+            real_train_ratio=REAL_TRAIN_RATIO,
+            seed=SEED,
+        )
         if not eval_only:
             with open(split_path, 'w', encoding='utf-8') as f:
                 json.dump({
                     'split_rule': (
-                        'sys_* -> train fixed; real_* parent groups -> random train/val; '
+                        'sys_* -> family-stratified random train/val; '
+                        'real_* parent groups -> random train/val; '
                         'pert_* -> same split as matching real_* parent; others -> random train/val'
                     ),
-                    'train_ratio_for_real_and_other': TRAIN_RATIO,
+                    'sys_train_ratio': SYS_TRAIN_RATIO,
+                    'real_train_ratio_for_parents_and_other': REAL_TRAIN_RATIO,
                     'train': [dataset.samples[i]['id'] for i in train_idx],
                     'val': [dataset.samples[i]['id'] for i in val_idx],
                 }, f, indent=2)
