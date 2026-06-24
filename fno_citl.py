@@ -524,6 +524,7 @@ def load_camera_image(
     target_size: int,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
+    fov_crop_size: int | None = None,
     transpose: bool = False,
     flip_ud: bool = False,
     flip_lr: bool = False,
@@ -539,6 +540,8 @@ def load_camera_image(
     arr = arr - float(arr.min())
     arr = arr / (float(arr.max()) + 1e-8)
     image = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0).to(device=device, dtype=dtype)
+    if fov_crop_size is not None:
+        image = center_crop_or_pad_tensor(image, int(fov_crop_size), int(fov_crop_size))
     return resize_batch(image, int(target_size), mode="bilinear").clamp(0.0, 1.0)
 
 
@@ -1462,6 +1465,7 @@ def main():
             target_size=int(fno_cfg["model_size"]),
             device=device,
             dtype=torch.float32,
+            fov_crop_size=target_fov_crop_size,
             transpose=args.transpose_target,
             flip_ud=args.flip_target_ud,
             flip_lr=args.flip_target_lr,
@@ -1476,6 +1480,10 @@ def main():
         print(
             "[CITL] camera-gradient mode: loss uses captured camera image for dL/df; "
             "FNO proxy supplies df/dphase."
+        )
+        print(
+            "[CITL] captured camera chain: "
+            f"FOV crop {target_fov_crop_size} -> model {int(fno_cfg['model_size'])}"
         )
         print(
             "[CITL] captured camera metrics: "
