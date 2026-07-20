@@ -466,6 +466,72 @@ def make_grid(batch, height, width, device, dtype, radial=True):
     return grid.repeat(batch, 1, 1, 1)
 
 
+def _physical_axis(n_source_pixels, n_out, pixel_size, device, dtype):
+    return torch.linspace(
+        -(float(n_source_pixels) - 1.0) / 2.0,
+        (float(n_source_pixels) - 1.0) / 2.0,
+        int(n_out),
+        device=device,
+        dtype=dtype,
+    ) * float(pixel_size)
+
+
+def make_axicon_coordinate_grid(size, cfg, device, dtype):
+    scope = str(cfg.get("axicon_map_scope", "roi")).lower()
+    slm_pixel = float(cfg.get("slm_pixel_size_m", 6.4e-6))
+    upsample = int(cfg.get("axicon_upsample_factor", 20))
+    upsample = max(1, upsample)
+    upsampled_pixel = slm_pixel / upsample
+
+    if scope == "slm":
+        nx = int(cfg.get("slm_nx", 1600)) * upsample
+        ny = int(cfg.get("slm_ny", 1200)) * upsample
+        x = _physical_axis(nx, size, upsampled_pixel, device, dtype)
+        y = _physical_axis(ny, size, upsampled_pixel, device, dtype)
+    elif scope == "roi":
+        crop = cfg.get("fov_crop_size", None)
+        crop = int(crop) if crop is not None else int(cfg.get("axicon_roi_size", 1024))
+        x = _physical_axis(crop, size, upsampled_pixel, device, dtype)
+        y = _physical_axis(crop, size, upsampled_pixel, device, dtype)
+    else:
+        raise ValueError(f"Unknown axicon_map_scope={scope!r}; expected 'roi' or 'slm'")
+
+    yy, xx = torch.meshgrid(y, x, indexing="ij")
+    return xx, yy
+
+
+def make_axicon_physics_maps(batch, size, cfg, device, dtype):
+    xx, yy = make_axicon_coordinate_grid(size, cfg, device, dtype)
+    radius = torch.sqrt(xx.pow(2) + yy.pow(2))
+
+    grating_pitch = float(cfg.get("axicon_grating_pitch_m", 1.396e-6))
+    transverse_frequency = float(cfg.get(
+        "axicon_transverse_frequency_actual",
+        cfg.get("axicon_transverse_frequency", 0.0),
+    ))
+    if transverse_frequency <= 0:
+        transverse_frequency = 1.0 / grating_pitch
+    phase_sign = float(cfg.get("axicon_phase_sign", -1.0))
+    axicon_phase = phase_sign * 2.0 * math.pi * transverse_frequency * radius
+    axicon_cos = torch.cos(axicon_phase).unsqueeze(0).unsqueeze(0)
+    axicon_sin = torch.sin(axicon_phase).unsqueeze(0).unsqueeze(0)
+
+    radius_scale = radius.amax().clamp_min(torch.as_tensor(1e-12, device=device, dtype=dtype))
+    radius_norm = (radius / radius_scale).unsqueeze(0).unsqueeze(0)
+
+    waist = float(cfg.get("axicon_gaussian_waist_m", 0.00638708 * 0.8))
+    aperture = torch.exp(-radius.pow(2) / max(waist, 1e-12) ** 2)
+    aperture = aperture / aperture.mean().clamp_min(torch.as_tensor(1e-12, device=device, dtype=dtype))
+    aperture = aperture.unsqueeze(0).unsqueeze(0)
+
+    return {
+        "axicon_cos": axicon_cos.repeat(batch, 1, 1, 1),
+        "axicon_sin": axicon_sin.repeat(batch, 1, 1, 1),
+        "axicon_radius": radius_norm.repeat(batch, 1, 1, 1),
+        "axicon_aperture": aperture.repeat(batch, 1, 1, 1),
+    }
+
+
 def build_phase_fno_input(phase, z_mm, cfg):
     size = int(cfg["model_size"])
     phase_cos = torch.cos(phase)
@@ -480,7 +546,36 @@ def build_phase_fno_input(phase, z_mm, cfg):
     phase_cos = resize_batch(phase_cos, size, mode="bilinear")
     phase_sin = resize_batch(phase_sin, size, mode="bilinear")
     phase_norm = torch.sqrt(phase_cos.pow(2) + phase_sin.pow(2)).clamp_min(1e-6)
-    pieces = [phase_cos / phase_norm, phase_sin / phase_norm]
+    slm_cos = phase_cos / phase_norm
+    slm_sin = phase_sin / phase_norm
+    pieces = [slm_cos, slm_sin]
+
+    axicon_maps = None
+    if (
+        cfg.get("use_axicon_phase", True)
+        or cfg.get("use_slm_axicon_product", True)
+        or cfg.get("use_axicon_radius", True)
+        or cfg.get("use_axicon_aperture", False)
+    ):
+        axicon_maps = make_axicon_physics_maps(
+            phase.shape[0], size, cfg, phase.device, phase.dtype
+        )
+
+    if cfg.get("use_axicon_phase", True):
+        pieces.extend([axicon_maps["axicon_cos"], axicon_maps["axicon_sin"]])
+
+    if cfg.get("use_slm_axicon_product", True):
+        ax_cos = axicon_maps["axicon_cos"]
+        ax_sin = axicon_maps["axicon_sin"]
+        product_cos = slm_cos * ax_cos - slm_sin * ax_sin
+        product_sin = slm_sin * ax_cos + slm_cos * ax_sin
+        pieces.extend([product_cos, product_sin])
+
+    if cfg.get("use_axicon_radius", True):
+        pieces.append(axicon_maps["axicon_radius"])
+
+    if cfg.get("use_axicon_aperture", False):
+        pieces.append(axicon_maps["axicon_aperture"])
 
     if cfg.get("use_grid", True):
         pieces.append(make_grid(
@@ -502,11 +597,38 @@ def build_phase_fno_input(phase, z_mm, cfg):
 
 def infer_phase_input_channels(cfg):
     channels = 2
+    if cfg.get("use_axicon_phase", True):
+        channels += 2
+    if cfg.get("use_slm_axicon_product", True):
+        channels += 2
+    if cfg.get("use_axicon_radius", True):
+        channels += 1
+    if cfg.get("use_axicon_aperture", False):
+        channels += 1
     if cfg.get("use_grid", True):
         channels += 3 if cfg.get("use_radial_coord", True) else 2
     if cfg.get("use_z_channel", True):
         channels += 1
     return channels
+
+
+def phase_input_channel_names(cfg):
+    names = ["slm_cos", "slm_sin"]
+    if cfg.get("use_axicon_phase", True):
+        names.extend(["axicon_cos", "axicon_sin"])
+    if cfg.get("use_slm_axicon_product", True):
+        names.extend(["slm_times_axicon_cos", "slm_times_axicon_sin"])
+    if cfg.get("use_axicon_radius", True):
+        names.append("axicon_radius_norm")
+    if cfg.get("use_axicon_aperture", False):
+        names.append("axicon_gaussian_aperture")
+    if cfg.get("use_grid", True):
+        names.extend(["x_norm", "y_norm"])
+        if cfg.get("use_radial_coord", True):
+            names.append("r_norm")
+    if cfg.get("use_z_channel", True):
+        names.append("z_mm_over_ref")
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -1112,6 +1234,22 @@ def build_parser():
     parser.add_argument("--no-z-channel", action="store_true")
     parser.add_argument("--no-grid", action="store_true")
     parser.add_argument("--no-radial-coord", action="store_true")
+    parser.add_argument("--no-axicon-phase", action="store_true")
+    parser.add_argument("--no-slm-axicon-product", action="store_true")
+    parser.add_argument("--no-axicon-radius", action="store_true")
+    parser.add_argument("--use-axicon-aperture", action="store_true")
+    parser.add_argument("--axicon-map-scope", choices=["roi", "slm"], default="roi")
+    parser.add_argument("--axicon-roi-size", type=int, default=1024)
+    parser.add_argument("--slm-nx", type=int, default=1600)
+    parser.add_argument("--slm-ny", type=int, default=1200)
+    parser.add_argument("--slm-pixel-size-m", type=float, default=6.4e-6)
+    parser.add_argument("--axicon-upsample-factor", type=int, default=20)
+    parser.add_argument("--axicon-grating-pitch-m", type=float, default=1.396e-6)
+    parser.add_argument("--axicon-transverse-frequency", type=float, default=0.0)
+    parser.add_argument("--axicon-wavelength-m", type=float, default=0.473e-6)
+    parser.add_argument("--axicon-medium-index", type=float, default=1.471)
+    parser.add_argument("--axicon-phase-sign", type=float, default=-1.0)
+    parser.add_argument("--axicon-gaussian-waist-m", type=float, default=0.00638708 * 0.8)
 
     parser.add_argument("--field-scale-mode", choices=["raw", "sample_norm", "global_percentile"], default="global_percentile")
     parser.add_argument("--field-amp-percentile", type=float, default=99.9)
@@ -1180,6 +1318,11 @@ def build_parser():
 
 
 def config_from_args(args):
+    axicon_frequency = (
+        float(args.axicon_transverse_frequency)
+        if float(args.axicon_transverse_frequency) > 0
+        else 1.0 / float(args.axicon_grating_pitch_m)
+    )
     return {
         "root_dir": [str(p) for p in args.root_dir],
         "phase_dir": args.phase_dir,
@@ -1196,6 +1339,24 @@ def config_from_args(args):
         "use_z_channel": not args.no_z_channel,
         "use_grid": not args.no_grid,
         "use_radial_coord": not args.no_radial_coord,
+        "use_axicon_phase": not args.no_axicon_phase,
+        "use_slm_axicon_product": not args.no_slm_axicon_product,
+        "use_axicon_radius": not args.no_axicon_radius,
+        "use_axicon_aperture": args.use_axicon_aperture,
+        "axicon_map_scope": args.axicon_map_scope,
+        "axicon_roi_size": args.axicon_roi_size,
+        "slm_nx": args.slm_nx,
+        "slm_ny": args.slm_ny,
+        "slm_pixel_size_m": args.slm_pixel_size_m,
+        "axicon_upsample_factor": args.axicon_upsample_factor,
+        "axicon_grating_pitch_m": args.axicon_grating_pitch_m,
+        "axicon_transverse_frequency": args.axicon_transverse_frequency,
+        "axicon_transverse_frequency_actual": axicon_frequency,
+        "axicon_wavelength_m": args.axicon_wavelength_m,
+        "axicon_medium_index": args.axicon_medium_index,
+        "axicon_na_air_equiv": float(args.axicon_wavelength_m) * axicon_frequency,
+        "axicon_phase_sign": args.axicon_phase_sign,
+        "axicon_gaussian_waist_m": args.axicon_gaussian_waist_m,
         "field_scale_mode": args.field_scale_mode,
         "field_amp_percentile": args.field_amp_percentile,
         "field_amp_scale": args.field_amp_scale,
@@ -1366,6 +1527,14 @@ def main():
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Input channels: {in_ch}")
+    print(f"Input channel names: {', '.join(phase_input_channel_names(cfg))}")
+    print(
+        "Axicon conditioning: "
+        f"scope={cfg['axicon_map_scope']}, "
+        f"pitch={cfg['axicon_grating_pitch_m']:.4g} m, "
+        f"f_r={cfg['axicon_transverse_frequency_actual']:.4g} 1/m, "
+        f"NA_air={cfg['axicon_na_air_equiv']:.4f}"
+    )
     print(f"Model parameters: {n_params / 1e6:.3f} M")
     print(f"Run dir: {run_dir}")
 
@@ -1378,6 +1547,7 @@ def main():
             y = model(x)
         print(f"Dry run batch phase: {tuple(b['phase'].shape)}")
         print(f"Dry run FNO input:   {tuple(x.shape)}")
+        print(f"Dry run channels:    {', '.join(phase_input_channel_names(cfg))}")
         print(f"Dry run output:      {tuple(y.shape)}")
         print(f"Dry run field target:{tuple(b['field'].shape)}")
         if "camera" in b:
