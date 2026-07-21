@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
 import numpy as np
 from tqdm import tqdm
 
@@ -117,6 +118,43 @@ def quantile_display(arr, q_min=0.001, q_max=0.999, eps=1e-8):
 
 def angle_display(real, imag):
     return np.angle(real + 1j * imag).astype(np.float32)
+
+
+def plain_decimal_tick(value, _pos=None):
+    if not np.isfinite(value):
+        return ""
+    value = float(value)
+    abs_value = abs(value)
+    if abs_value < 1e-12:
+        return "0"
+    if abs_value >= 100:
+        text = f"{value:.0f}"
+    elif abs_value >= 10:
+        text = f"{value:.1f}"
+    elif abs_value >= 1:
+        text = f"{value:.3f}"
+    elif abs_value >= 0.01:
+        text = f"{value:.4f}"
+    elif abs_value >= 0.001:
+        text = f"{value:.5f}"
+    else:
+        text = f"{value:.6f}"
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def apply_plain_decimal_yaxis(ax):
+    formatter = FuncFormatter(plain_decimal_tick)
+    ax.yaxis.set_major_formatter(formatter)
+    ax.yaxis.set_minor_formatter(formatter)
+    ax.yaxis.offsetText.set_visible(False)
+
+
+def resize_wrapped_phase_for_display(phase, size):
+    phase_sin = resize_batch(torch.sin(phase), size, mode="bilinear")
+    phase_cos = resize_batch(torch.cos(phase), size, mode="bilinear")
+    return torch.atan2(phase_sin, phase_cos)
 
 
 def field_intensity(field):
@@ -1059,6 +1097,7 @@ def plot_history(history, path, stage):
     ax.set_ylabel("loss")
     ax.set_title(f"{stage} loss")
     ax.grid(True, alpha=0.25)
+    apply_plain_decimal_yaxis(ax)
     ax.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=150)
@@ -1080,6 +1119,7 @@ def plot_history(history, path, stage):
             finite_vals = finite_vals[np.isfinite(finite_vals)]
             if finite_vals.size and np.all(finite_vals > 0):
                 ax.set_yscale("log")
+            apply_plain_decimal_yaxis(ax)
             ax.grid(True, alpha=0.25)
         for ax in axes[len(keys):]:
             ax.axis("off")
@@ -1130,6 +1170,7 @@ def plot_metric_summary(rows, path, stage):
             and np.all(finite_vals > 0)
         ):
             ax.set_yscale("log")
+        apply_plain_decimal_yaxis(ax)
     for ax in axes[len(keys):]:
         ax.axis("off")
     axes[0].legend(fontsize=8)
@@ -1150,7 +1191,8 @@ def save_previews(model, dataset, indices, device, cfg, stage, out_dir):
             target = sample["field"].unsqueeze(0).to(device)
             pred = model(build_phase_fno_input(phase, z_mm, cfg))
 
-        phase_np = resize_batch(phase, cfg["model_size"], mode="bilinear")[0, 0].detach().cpu().numpy()
+        phase_np = resize_wrapped_phase_for_display(phase, cfg["model_size"])[0, 0].detach().cpu().numpy()
+        phase_np = np.mod(phase_np, 2.0 * np.pi)
         target_np = target[0].detach().cpu().numpy()
         pred_np = pred[0].detach().cpu().numpy()
         target_int = (target_np[0] ** 2 + target_np[1] ** 2)
@@ -1165,40 +1207,48 @@ def save_previews(model, dataset, indices, device, cfg, stage, out_dir):
             camera_np = sample["camera"][0].numpy()
             fig, axes = plt.subplots(2, 5, figsize=(18, 7))
             panels = [
-                (phase_np, "SLM phase", "twilight"),
-                (target_int, "Synthetic |E|^2", "magma"),
-                (camera_np, "Camera", "magma"),
-                (pred_int, "Pred |E|^2", "magma"),
-                (np.abs(pred_int - camera_np), "|Pred-camera|", "inferno"),
-                (target_amp, "Synthetic amp", "viridis"),
-                (pred_amp, "Pred amp", "viridis"),
-                (target_phase, "Synthetic phase", "twilight"),
-                (pred_phase, "Pred phase", "twilight"),
-                (phase_err, "Phase error", "coolwarm"),
+                (phase_np, "SLM phase", "twilight", "slm_phase"),
+                (target_amp, "Synthetic amp", "viridis", "scalar"),
+                (target_phase, "Synthetic phase", "twilight_shifted", "field_phase"),
+                (target_int, "Synthetic |E|^2", "magma", "scalar"),
+                (camera_np, "Camera", "magma", "scalar"),
+                (phase_err, "Phase error", "coolwarm", "phase_error"),
+                (pred_amp, "Pred amp", "viridis", "scalar"),
+                (pred_phase, "Pred phase", "twilight_shifted", "field_phase"),
+                (pred_int, "Pred |E|^2", "magma", "scalar"),
+                (np.abs(pred_int - camera_np), "|Pred-camera|", "inferno", "scalar"),
             ]
         else:
             fig, axes = plt.subplots(2, 5, figsize=(18, 7))
             panels = [
-                (phase_np, "SLM phase", "twilight"),
-                (target_amp, "Target amp", "viridis"),
-                (pred_amp, "Pred amp", "viridis"),
-                (np.abs(pred_amp - target_amp), "Amp error", "inferno"),
-                (np.abs(pred_np[0] - target_np[0]) + np.abs(pred_np[1] - target_np[1]), "Field L1 error", "inferno"),
-                (target_int, "Target |E|^2", "magma"),
-                (pred_int, "Pred |E|^2", "magma"),
-                (target_phase, "Target phase", "twilight"),
-                (pred_phase, "Pred phase", "twilight"),
-                (phase_err, "Phase error", "coolwarm"),
+                (phase_np, "SLM phase", "twilight", "slm_phase"),
+                (target_amp, "Target amp", "viridis", "scalar"),
+                (target_phase, "Target phase", "twilight_shifted", "field_phase"),
+                (target_int, "Target |E|^2", "magma", "scalar"),
+                (np.abs(pred_amp - target_amp), "Amp error", "inferno", "scalar"),
+                (np.abs(pred_np[0] - target_np[0]) + np.abs(pred_np[1] - target_np[1]), "Field L1 error", "inferno", "scalar"),
+                (pred_amp, "Pred amp", "viridis", "scalar"),
+                (pred_phase, "Pred phase", "twilight_shifted", "field_phase"),
+                (pred_int, "Pred |E|^2", "magma", "scalar"),
+                (phase_err, "Phase error", "coolwarm", "phase_error"),
             ]
 
-        for ax, (arr, title, cmap) in zip(axes.reshape(-1), panels):
-            if "phase" in title.lower() or "SLM" in title:
-                im = ax.imshow(arr, cmap=cmap, vmin=-np.pi if "SLM" not in title else None, vmax=np.pi if "SLM" not in title else None)
+        for ax, (arr, title, cmap, kind) in zip(axes.reshape(-1), panels):
+            if kind == "slm_phase":
+                im = ax.imshow(np.mod(arr, 2.0 * np.pi), cmap=cmap, vmin=0.0, vmax=2.0 * np.pi)
+            elif kind in {"field_phase", "phase_error"}:
+                im = ax.imshow(arr, cmap=cmap, vmin=-np.pi, vmax=np.pi)
             else:
                 im = ax.imshow(quantile_display(arr), cmap=cmap, vmin=0, vmax=1)
             ax.set_title(title, fontsize=10)
             ax.axis("off")
-            fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
+            cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
+            if kind == "slm_phase":
+                cbar.set_ticks([0.0, np.pi, 2.0 * np.pi])
+                cbar.set_ticklabels(["0", "3.14", "6.28"])
+            elif kind in {"field_phase", "phase_error"}:
+                cbar.set_ticks([-np.pi, 0.0, np.pi])
+                cbar.set_ticklabels(["-3.14", "0", "3.14"])
         fig.suptitle(f"{sample['id']}  z={float(sample['z_mm']):.3g} mm", fontsize=12)
         fig.tight_layout()
         fig.savefig(out_dir / f"{sample['id']}.png", dpi=140)
