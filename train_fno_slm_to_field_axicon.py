@@ -32,6 +32,7 @@ import numpy as np
 from tqdm import tqdm
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
@@ -670,6 +671,238 @@ def phase_input_channel_names(cfg):
 
 
 # ---------------------------------------------------------------------------
+# Operator models
+# ---------------------------------------------------------------------------
+
+def channel_index_map(names):
+    return {name: idx for idx, name in enumerate(names)}
+
+
+class PointwiseMLP2d(nn.Module):
+    def __init__(self, in_ch, out_ch, width, depth, zero_init=True):
+        super().__init__()
+        depth = max(0, int(depth))
+        width = max(1, int(width))
+        if depth <= 0:
+            self.net = nn.Conv2d(in_ch, out_ch, kernel_size=1)
+        else:
+            layers = [nn.Conv2d(in_ch, width, kernel_size=1), nn.GELU()]
+            for _ in range(depth - 1):
+                layers.extend([nn.Conv2d(width, width, kernel_size=1), nn.GELU()])
+            layers.append(nn.Conv2d(width, out_ch, kernel_size=1))
+            self.net = nn.Sequential(*layers)
+        if zero_init:
+            last = self.net[-1] if isinstance(self.net, nn.Sequential) else self.net
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class PhysicsConstrainedSpectralPropagator2d(nn.Module):
+    """Compact ASM-like surrogate with a learnable radial Fourier multiplier."""
+
+    def __init__(
+        self,
+        in_ch,
+        channel_names,
+        model_size,
+        width=16,
+        depth=2,
+        radial_bins=256,
+        transfer_amp_scale=2.0,
+        pupil_phase_scale=0.25,
+        pupil_amp_scale=0.10,
+        residual_scale=0.10,
+        support_radius=1.0,
+        support_softness=0.05,
+    ):
+        super().__init__()
+        self.in_ch = int(in_ch)
+        self.channel_names = list(channel_names)
+        self.channel_idx = channel_index_map(self.channel_names)
+        self.model_size = int(model_size)
+        self.radial_bins = max(8, int(radial_bins))
+        self.transfer_amp_scale = float(transfer_amp_scale)
+        self.pupil_phase_scale = float(pupil_phase_scale)
+        self.pupil_amp_scale = float(pupil_amp_scale)
+        self.residual_scale = float(residual_scale)
+        self.support_radius = float(support_radius)
+        self.support_softness = max(float(support_softness), 1e-6)
+
+        self.radial_log_amp = nn.Parameter(torch.zeros(self.radial_bins))
+        self.radial_phase = nn.Parameter(torch.zeros(self.radial_bins))
+        self.output_log_gain = nn.Parameter(torch.zeros(()))
+
+        self.pupil_calibration = PointwiseMLP2d(
+            in_ch=self.in_ch,
+            out_ch=2,
+            width=width,
+            depth=depth,
+            zero_init=True,
+        )
+        self.post_residual = PointwiseMLP2d(
+            in_ch=self.in_ch + 2,
+            out_ch=2,
+            width=width,
+            depth=depth,
+            zero_init=True,
+        )
+
+        fy = torch.fft.fftfreq(self.model_size)
+        fx = torch.fft.fftfreq(self.model_size)
+        fyy, fxx = torch.meshgrid(fy, fx, indexing="ij")
+        rho = torch.sqrt(fxx.pow(2) + fyy.pow(2))
+        rho = rho / rho.max().clamp_min(1e-8)
+        bin_pos = rho * (self.radial_bins - 1)
+        bin_lo = torch.floor(bin_pos).long().clamp(0, self.radial_bins - 1)
+        bin_hi = (bin_lo + 1).clamp(0, self.radial_bins - 1)
+        bin_frac = (bin_pos - bin_lo.to(bin_pos.dtype)).clamp(0.0, 1.0)
+        if self.support_radius >= 0.999:
+            support = torch.ones_like(rho)
+        else:
+            support = torch.sigmoid((self.support_radius - rho) / self.support_softness)
+        self.register_buffer("rho_norm", rho)
+        self.register_buffer("bin_lo", bin_lo)
+        self.register_buffer("bin_hi", bin_hi)
+        self.register_buffer("bin_frac", bin_frac)
+        self.register_buffer("support_taper", support)
+
+    def _channel(self, x, name):
+        idx = self.channel_idx.get(name)
+        if idx is None:
+            return None
+        return x[:, idx:idx + 1]
+
+    def _complex_pupil(self, x):
+        product_cos = self._channel(x, "slm_times_axicon_cos")
+        product_sin = self._channel(x, "slm_times_axicon_sin")
+        if product_cos is not None and product_sin is not None:
+            real, imag = product_cos, product_sin
+        else:
+            slm_cos = self._channel(x, "slm_cos")
+            slm_sin = self._channel(x, "slm_sin")
+            if slm_cos is None or slm_sin is None:
+                raise RuntimeError("spectral operator requires slm_cos/slm_sin input channels.")
+            ax_cos = self._channel(x, "axicon_cos")
+            ax_sin = self._channel(x, "axicon_sin")
+            if ax_cos is None or ax_sin is None:
+                real, imag = slm_cos, slm_sin
+            else:
+                real = slm_cos * ax_cos - slm_sin * ax_sin
+                imag = slm_sin * ax_cos + slm_cos * ax_sin
+
+        aperture = self._channel(x, "axicon_gaussian_aperture")
+        if aperture is not None:
+            real = real * aperture
+            imag = imag * aperture
+
+        calib = self.pupil_calibration(x)
+        amp_corr = torch.exp(self.pupil_amp_scale * torch.tanh(calib[:, 0:1]))
+        phase_corr = self.pupil_phase_scale * torch.tanh(calib[:, 1:2])
+        phase_cos = torch.cos(phase_corr)
+        phase_sin = torch.sin(phase_corr)
+        real_cal = real * phase_cos - imag * phase_sin
+        imag_cal = imag * phase_cos + real * phase_sin
+        return torch.complex(real_cal[:, 0] * amp_corr[:, 0], imag_cal[:, 0] * amp_corr[:, 0])
+
+    def _radial_lookup(self, values):
+        lo = values[self.bin_lo]
+        hi = values[self.bin_hi]
+        return lo * (1.0 - self.bin_frac) + hi * self.bin_frac
+
+    def transfer_function(self):
+        log_amp = self.transfer_amp_scale * torch.tanh(self._radial_lookup(self.radial_log_amp))
+        phase = self._radial_lookup(self.radial_phase)
+        amp = torch.exp(log_amp) * self.support_taper
+        return torch.polar(amp, phase)
+
+    def forward(self, x):
+        pupil = self._complex_pupil(x)
+        spectrum = torch.fft.fft2(pupil, norm="ortho")
+        propagated = torch.fft.ifft2(spectrum * self.transfer_function().unsqueeze(0), norm="ortho")
+        out = torch.stack([propagated.real, propagated.imag], dim=1)
+        out = torch.exp(self.output_log_gain) * out
+        if self.residual_scale > 0:
+            residual = self.post_residual(torch.cat([x, out], dim=1))
+            out = out + self.residual_scale * residual
+        return out
+
+    def regularization_terms(self):
+        amp_diff = self.radial_log_amp[1:] - self.radial_log_amp[:-1]
+        phase_diff = self.radial_phase[1:] - self.radial_phase[:-1]
+        return {
+            "spectral_amp_smooth": amp_diff.pow(2).mean(),
+            "spectral_phase_smooth": phase_diff.pow(2).mean(),
+            "spectral_amp_l2": self.radial_log_amp.pow(2).mean(),
+            "spectral_gain_l2": self.output_log_gain.pow(2),
+        }
+
+    def diagnostic_arrays(self):
+        with torch.no_grad():
+            h = self.transfer_function().detach().cpu()
+            return {
+                "transfer_amp": h.abs().numpy(),
+                "transfer_phase": torch.angle(h).numpy(),
+                "radial_log_amp": self.radial_log_amp.detach().cpu().numpy(),
+                "radial_phase": self.radial_phase.detach().cpu().numpy(),
+            }
+
+
+def build_operator_model(cfg, in_ch):
+    mode = cfg.get("operator_mode", "fno")
+    channel_names = phase_input_channel_names(cfg)
+    if mode == "fno":
+        return AxiconFNO2d(
+            in_ch=in_ch,
+            out_ch=2,
+            width=cfg["width"],
+            modes_y=cfg["modes_y"],
+            modes_x=cfg["modes_x"],
+            depth=cfg["depth"],
+            mlp_width=cfg["mlp_width"],
+        )
+    if mode == "spectral":
+        return PhysicsConstrainedSpectralPropagator2d(
+            in_ch=in_ch,
+            channel_names=channel_names,
+            model_size=cfg["model_size"],
+            width=cfg["spectral_width"],
+            depth=cfg["spectral_depth"],
+            radial_bins=cfg["spectral_radial_bins"],
+            transfer_amp_scale=cfg["spectral_transfer_amp_scale"],
+            pupil_phase_scale=cfg["spectral_pupil_phase_scale"],
+            pupil_amp_scale=cfg["spectral_pupil_amp_scale"],
+            residual_scale=cfg["spectral_residual_scale"],
+            support_radius=cfg["spectral_support_radius"],
+            support_softness=cfg["spectral_support_softness"],
+        )
+    raise ValueError(f"Unknown operator_mode={mode!r}")
+
+
+def model_regularization_loss(model, cfg, device):
+    if not hasattr(model, "regularization_terms"):
+        return torch.zeros((), device=device), {}
+    terms = model.regularization_terms()
+    weights = {
+        "spectral_amp_smooth": cfg.get("w_spectral_amp_smooth", 0.0),
+        "spectral_phase_smooth": cfg.get("w_spectral_phase_smooth", 0.0),
+        "spectral_amp_l2": cfg.get("w_spectral_amp_l2", 0.0),
+        "spectral_gain_l2": cfg.get("w_spectral_gain_l2", 0.0),
+    }
+    total = torch.zeros((), device=device)
+    weighted_terms = {}
+    for key, value in terms.items():
+        value = value.to(device)
+        weight = float(weights.get(key, 0.0))
+        weighted_terms[key] = value
+        if weight:
+            total = total + weight * value
+    return total, weighted_terms
+
+
+# ---------------------------------------------------------------------------
 # Losses
 # ---------------------------------------------------------------------------
 
@@ -940,6 +1173,13 @@ def run_one_epoch(model, loader, optimizer, device, cfg, stage, train):
                         for sid in batch["id"]
                     ])
                 loss = (weights * per_sample_loss).mean()
+                reg_loss, reg_terms = model_regularization_loss(model, cfg, pred_field.device)
+                loss = loss + reg_loss
+                if reg_terms:
+                    comps = dict(comps)
+                    comps["model_regularization"] = reg_loss.expand(pred_field.shape[0])
+                    for key, value in reg_terms.items():
+                        comps[key] = value.expand(pred_field.shape[0])
 
         if train:
             if amp_enabled:
@@ -994,6 +1234,7 @@ def train_stage(model, train_loader, val_loader, device, cfg, stage, stage_dir, 
 
     ckpt = torch.load(stage_dir / "best.pt", map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
+    save_model_diagnostics(model, stage_dir / "model_diagnostics.png")
     return history
 
 
@@ -1180,6 +1421,46 @@ def plot_metric_summary(rows, path, stage):
     plt.close(fig)
 
 
+def save_model_diagnostics(model, path):
+    if not hasattr(model, "diagnostic_arrays"):
+        return
+    arrays = model.diagnostic_arrays()
+    amp = arrays["transfer_amp"]
+    phase = arrays["transfer_phase"]
+    radial_log_amp = arrays["radial_log_amp"]
+    radial_phase = arrays["radial_phase"]
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
+    axes = axes.reshape(-1)
+    axes[0].plot(np.arange(radial_log_amp.size), radial_log_amp)
+    axes[0].set_title("H_eff radial log-amplitude parameter")
+    axes[0].set_xlabel("radial bin")
+    axes[0].grid(True, alpha=0.25)
+    apply_plain_decimal_yaxis(axes[0])
+
+    axes[1].plot(np.arange(radial_phase.size), radial_phase)
+    axes[1].set_title("H_eff radial phase parameter")
+    axes[1].set_xlabel("radial bin")
+    axes[1].grid(True, alpha=0.25)
+    apply_plain_decimal_yaxis(axes[1])
+
+    im_amp = axes[2].imshow(quantile_display(amp), cmap="viridis", vmin=0, vmax=1)
+    axes[2].set_title("|H_eff(fx, fy)|")
+    axes[2].axis("off")
+    fig.colorbar(im_amp, ax=axes[2], fraction=0.035, pad=0.02)
+
+    im_phase = axes[3].imshow(phase, cmap="twilight_shifted", vmin=-np.pi, vmax=np.pi)
+    axes[3].set_title("angle H_eff(fx, fy)")
+    axes[3].axis("off")
+    cbar = fig.colorbar(im_phase, ax=axes[3], fraction=0.035, pad=0.02)
+    cbar.set_ticks([-np.pi, 0.0, np.pi])
+    cbar.set_ticklabels(["-3.14", "0", "3.14"])
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 def save_previews(model, dataset, indices, device, cfg, stage, out_dir):
     out_dir = ensure_dir(out_dir)
     model.eval()
@@ -1316,6 +1597,16 @@ def build_parser():
     parser.add_argument("--modes-y", type=int, default=96)
     parser.add_argument("--modes-x", type=int, default=96)
     parser.add_argument("--mlp-width", type=int, default=128)
+    parser.add_argument("--operator-mode", choices=["fno", "spectral"], default="fno")
+    parser.add_argument("--spectral-width", type=int, default=16)
+    parser.add_argument("--spectral-depth", type=int, default=2)
+    parser.add_argument("--spectral-radial-bins", type=int, default=256)
+    parser.add_argument("--spectral-transfer-amp-scale", type=float, default=2.0)
+    parser.add_argument("--spectral-pupil-phase-scale", type=float, default=0.25)
+    parser.add_argument("--spectral-pupil-amp-scale", type=float, default=0.10)
+    parser.add_argument("--spectral-residual-scale", type=float, default=0.10)
+    parser.add_argument("--spectral-support-radius", type=float, default=1.0)
+    parser.add_argument("--spectral-support-softness", type=float, default=0.05)
 
     parser.add_argument("--stage1-epochs", type=int, default=120)
     parser.add_argument("--stage2-epochs", type=int, default=60)
@@ -1345,6 +1636,10 @@ def build_parser():
     parser.add_argument("--w-phase-circular", type=float, default=0.30)
     parser.add_argument("--w-field-grad", type=float, default=0.05)
     parser.add_argument("--w-spectrum", type=float, default=0.05)
+    parser.add_argument("--w-spectral-amp-smooth", type=float, default=1e-4)
+    parser.add_argument("--w-spectral-phase-smooth", type=float, default=1e-4)
+    parser.add_argument("--w-spectral-amp-l2", type=float, default=1e-5)
+    parser.add_argument("--w-spectral-gain-l2", type=float, default=1e-5)
     parser.add_argument("--phase-loss-amp-floor", type=float, default=0.02)
     parser.add_argument("--phase-loss-weight-power", type=float, default=1.0)
 
@@ -1421,6 +1716,16 @@ def config_from_args(args):
         "modes_y": args.modes_y,
         "modes_x": args.modes_x,
         "mlp_width": args.mlp_width,
+        "operator_mode": args.operator_mode,
+        "spectral_width": args.spectral_width,
+        "spectral_depth": args.spectral_depth,
+        "spectral_radial_bins": args.spectral_radial_bins,
+        "spectral_transfer_amp_scale": args.spectral_transfer_amp_scale,
+        "spectral_pupil_phase_scale": args.spectral_pupil_phase_scale,
+        "spectral_pupil_amp_scale": args.spectral_pupil_amp_scale,
+        "spectral_residual_scale": args.spectral_residual_scale,
+        "spectral_support_radius": args.spectral_support_radius,
+        "spectral_support_softness": args.spectral_support_softness,
         "stage1_epochs": args.stage1_epochs,
         "stage2_epochs": args.stage2_epochs,
         "stage1_lr": args.stage1_lr,
@@ -1447,6 +1752,10 @@ def config_from_args(args):
         "w_phase_circular": args.w_phase_circular,
         "w_field_grad": args.w_field_grad,
         "w_spectrum": args.w_spectrum,
+        "w_spectral_amp_smooth": args.w_spectral_amp_smooth,
+        "w_spectral_phase_smooth": args.w_spectral_phase_smooth,
+        "w_spectral_amp_l2": args.w_spectral_amp_l2,
+        "w_spectral_gain_l2": args.w_spectral_gain_l2,
         "phase_loss_amp_floor": args.phase_loss_amp_floor,
         "phase_loss_weight_power": args.phase_loss_weight_power,
         "stage2_field_anchor_weight": args.stage2_field_anchor_weight,
@@ -1566,18 +1875,18 @@ def main():
     save_split(run_dir / "split.json", dataset, train_idx, val_idx, cfg)
 
     in_ch = infer_phase_input_channels(cfg)
-    model = AxiconFNO2d(
-        in_ch=in_ch,
-        out_ch=2,
-        width=args.width,
-        modes_y=args.modes_y,
-        modes_x=args.modes_x,
-        depth=args.depth,
-        mlp_width=args.mlp_width,
-    ).to(device)
+    model = build_operator_model(cfg, in_ch).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Input channels: {in_ch}")
     print(f"Input channel names: {', '.join(phase_input_channel_names(cfg))}")
+    print(f"Operator mode: {cfg['operator_mode']}")
+    if cfg["operator_mode"] == "spectral":
+        print(
+            "Spectral operator: "
+            f"width={cfg['spectral_width']}, depth={cfg['spectral_depth']}, "
+            f"radial_bins={cfg['spectral_radial_bins']}, "
+            f"residual_scale={cfg['spectral_residual_scale']:.4g}"
+        )
     print(
         "Axicon conditioning: "
         f"scope={cfg['axicon_map_scope']}, "
@@ -1596,7 +1905,7 @@ def main():
             x = build_phase_fno_input(b["phase"], b["z_mm"], cfg)
             y = model(x)
         print(f"Dry run batch phase: {tuple(b['phase'].shape)}")
-        print(f"Dry run FNO input:   {tuple(x.shape)}")
+        print(f"Dry run model input: {tuple(x.shape)}")
         print(f"Dry run channels:    {', '.join(phase_input_channel_names(cfg))}")
         print(f"Dry run output:      {tuple(y.shape)}")
         print(f"Dry run field target:{tuple(b['field'].shape)}")
