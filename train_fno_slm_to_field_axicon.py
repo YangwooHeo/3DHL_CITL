@@ -1486,35 +1486,36 @@ def save_previews(model, dataset, indices, device, cfg, stage, out_dir):
 
         if stage == "stage2" and "camera" in sample:
             camera_np = sample["camera"][0].numpy()
-            fig, axes = plt.subplots(2, 5, figsize=(18, 7))
+            fig, axes = plt.subplots(2, 4, figsize=(15, 7))
             panels = [
                 (phase_np, "SLM phase", "twilight", "slm_phase"),
-                (target_amp, "Synthetic amp", "viridis", "scalar"),
-                (target_phase, "Synthetic phase", "twilight_shifted", "field_phase"),
-                (target_int, "Synthetic |E|^2", "magma", "scalar"),
                 (camera_np, "Camera", "magma", "scalar"),
-                (phase_err, "Phase error", "coolwarm", "phase_error"),
-                (pred_amp, "Pred amp", "viridis", "scalar"),
-                (pred_phase, "Pred phase", "twilight_shifted", "field_phase"),
                 (pred_int, "Pred |E|^2", "magma", "scalar"),
                 (np.abs(pred_int - camera_np), "|Pred-camera|", "inferno", "scalar"),
+                (target_amp, "Synthetic amp", "viridis", "scalar"),
+                (pred_amp, "Pred amp", "viridis", "scalar"),
+                (target_phase, "Synthetic phase", "twilight_shifted", "field_phase"),
+                (pred_phase, "Pred phase", "twilight_shifted", "field_phase"),
             ]
         else:
-            fig, axes = plt.subplots(2, 5, figsize=(18, 7))
+            fig, axes = plt.subplots(3, 3, figsize=(12, 10))
             panels = [
                 (phase_np, "SLM phase", "twilight", "slm_phase"),
                 (target_amp, "Target amp", "viridis", "scalar"),
                 (target_phase, "Target phase", "twilight_shifted", "field_phase"),
-                (target_int, "Target |E|^2", "magma", "scalar"),
-                (np.abs(pred_amp - target_amp), "Amp error", "inferno", "scalar"),
                 (np.abs(pred_np[0] - target_np[0]) + np.abs(pred_np[1] - target_np[1]), "Field L1 error", "inferno", "scalar"),
                 (pred_amp, "Pred amp", "viridis", "scalar"),
                 (pred_phase, "Pred phase", "twilight_shifted", "field_phase"),
-                (pred_int, "Pred |E|^2", "magma", "scalar"),
+                None,
+                (np.abs(pred_amp - target_amp), "Amp error", "inferno", "scalar"),
                 (phase_err, "Phase error", "coolwarm", "phase_error"),
             ]
 
-        for ax, (arr, title, cmap, kind) in zip(axes.reshape(-1), panels):
+        for ax, panel in zip(axes.reshape(-1), panels):
+            if panel is None:
+                ax.axis("off")
+                continue
+            arr, title, cmap, kind = panel
             if kind == "slm_phase":
                 im = ax.imshow(np.mod(arr, 2.0 * np.pi), cmap=cmap, vmin=0.0, vmax=2.0 * np.pi)
             elif kind in {"field_phase", "phase_error"}:
@@ -1530,6 +1531,8 @@ def save_previews(model, dataset, indices, device, cfg, stage, out_dir):
             elif kind in {"field_phase", "phase_error"}:
                 cbar.set_ticks([-np.pi, 0.0, np.pi])
                 cbar.set_ticklabels(["-3.14", "0", "3.14"])
+        for ax in axes.reshape(-1)[len(panels):]:
+            ax.axis("off")
         fig.suptitle(f"{sample['id']}  z={float(sample['z_mm']):.3g} mm", fontsize=12)
         fig.tight_layout()
         fig.savefig(out_dir / f"{sample['id']}.png", dpi=140)
