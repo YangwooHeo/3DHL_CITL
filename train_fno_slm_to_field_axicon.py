@@ -67,6 +67,26 @@ def optional_int(text):
     return int(text)
 
 
+def parse_int_list(text):
+    if text is None:
+        return []
+    if isinstance(text, (list, tuple)):
+        raw_parts = text
+    else:
+        text = str(text).strip()
+        if not text:
+            return []
+        raw_parts = re.split(r"[,;\s]+", text)
+    values = []
+    for part in raw_parts:
+        if str(part).strip():
+            value = int(part)
+            if value <= 0:
+                raise ValueError("Angular orders must be positive integers.")
+            values.append(value)
+    return sorted(set(values))
+
+
 def normalized_stem(path):
     stem = Path(path).stem
     if stem.startswith("sine") and len(stem) > 4 and stem[4].isdigit():
@@ -712,6 +732,9 @@ class PhysicsConstrainedSpectralPropagator2d(nn.Module):
         depth=2,
         radial_bins=256,
         transfer_amp_scale=2.0,
+        angular_orders=None,
+        angular_amp_scale=0.25,
+        angular_phase_scale=0.50,
         pupil_phase_scale=0.25,
         pupil_amp_scale=0.10,
         residual_scale=0.10,
@@ -725,6 +748,10 @@ class PhysicsConstrainedSpectralPropagator2d(nn.Module):
         self.model_size = int(model_size)
         self.radial_bins = max(8, int(radial_bins))
         self.transfer_amp_scale = float(transfer_amp_scale)
+        self.angular_orders = parse_int_list(angular_orders)
+        self.n_angular = len(self.angular_orders)
+        self.angular_amp_scale = float(angular_amp_scale)
+        self.angular_phase_scale = float(angular_phase_scale)
         self.pupil_phase_scale = float(pupil_phase_scale)
         self.pupil_amp_scale = float(pupil_amp_scale)
         self.residual_scale = float(residual_scale)
@@ -734,6 +761,16 @@ class PhysicsConstrainedSpectralPropagator2d(nn.Module):
         self.radial_log_amp = nn.Parameter(torch.zeros(self.radial_bins))
         self.radial_phase = nn.Parameter(torch.zeros(self.radial_bins))
         self.output_log_gain = nn.Parameter(torch.zeros(()))
+        if self.n_angular:
+            self.angular_log_amp_cos = nn.Parameter(torch.zeros(self.n_angular, self.radial_bins))
+            self.angular_log_amp_sin = nn.Parameter(torch.zeros(self.n_angular, self.radial_bins))
+            self.angular_phase_cos = nn.Parameter(torch.zeros(self.n_angular, self.radial_bins))
+            self.angular_phase_sin = nn.Parameter(torch.zeros(self.n_angular, self.radial_bins))
+        else:
+            self.angular_log_amp_cos = None
+            self.angular_log_amp_sin = None
+            self.angular_phase_cos = None
+            self.angular_phase_sin = None
 
         self.pupil_calibration = PointwiseMLP2d(
             in_ch=self.in_ch,
@@ -754,6 +791,7 @@ class PhysicsConstrainedSpectralPropagator2d(nn.Module):
         fx = torch.fft.fftfreq(self.model_size)
         fyy, fxx = torch.meshgrid(fy, fx, indexing="ij")
         rho = torch.sqrt(fxx.pow(2) + fyy.pow(2))
+        theta = torch.atan2(fyy, fxx)
         rho = rho / rho.max().clamp_min(1e-8)
         bin_pos = rho * (self.radial_bins - 1)
         bin_lo = torch.floor(bin_pos).long().clamp(0, self.radial_bins - 1)
@@ -768,6 +806,13 @@ class PhysicsConstrainedSpectralPropagator2d(nn.Module):
         self.register_buffer("bin_hi", bin_hi)
         self.register_buffer("bin_frac", bin_frac)
         self.register_buffer("support_taper", support)
+        if self.n_angular:
+            order_tensor = torch.as_tensor(self.angular_orders, dtype=theta.dtype).view(-1, 1, 1)
+            self.register_buffer("angular_cos_basis", torch.cos(order_tensor * theta.unsqueeze(0)))
+            self.register_buffer("angular_sin_basis", torch.sin(order_tensor * theta.unsqueeze(0)))
+        else:
+            self.register_buffer("angular_cos_basis", torch.empty(0, self.model_size, self.model_size))
+            self.register_buffer("angular_sin_basis", torch.empty(0, self.model_size, self.model_size))
 
     def _channel(self, x, name):
         idx = self.channel_idx.get(name)
@@ -808,13 +853,37 @@ class PhysicsConstrainedSpectralPropagator2d(nn.Module):
         return torch.complex(real_cal[:, 0] * amp_corr[:, 0], imag_cal[:, 0] * amp_corr[:, 0])
 
     def _radial_lookup(self, values):
-        lo = values[self.bin_lo]
-        hi = values[self.bin_hi]
+        if values.ndim == 1:
+            lo = values[self.bin_lo]
+            hi = values[self.bin_hi]
+        else:
+            leading_shape = tuple(values.shape[:-1])
+            flat_lo = self.bin_lo.reshape(-1)
+            flat_hi = self.bin_hi.reshape(-1)
+            lo = torch.index_select(values, values.ndim - 1, flat_lo)
+            hi = torch.index_select(values, values.ndim - 1, flat_hi)
+            lo = lo.reshape(*leading_shape, *self.bin_lo.shape)
+            hi = hi.reshape(*leading_shape, *self.bin_hi.shape)
         return lo * (1.0 - self.bin_frac) + hi * self.bin_frac
 
     def transfer_function(self):
         log_amp = self.transfer_amp_scale * torch.tanh(self._radial_lookup(self.radial_log_amp))
         phase = self._radial_lookup(self.radial_phase)
+        if self.n_angular:
+            amp_cos = self._radial_lookup(self.angular_log_amp_cos)
+            amp_sin = self._radial_lookup(self.angular_log_amp_sin)
+            phase_cos = self._radial_lookup(self.angular_phase_cos)
+            phase_sin = self._radial_lookup(self.angular_phase_sin)
+            angular_log_amp = (
+                amp_cos * self.angular_cos_basis
+                + amp_sin * self.angular_sin_basis
+            ).sum(dim=0)
+            angular_phase = (
+                phase_cos * self.angular_cos_basis
+                + phase_sin * self.angular_sin_basis
+            ).sum(dim=0)
+            log_amp = log_amp + self.angular_amp_scale * torch.tanh(angular_log_amp)
+            phase = phase + self.angular_phase_scale * torch.tanh(angular_phase)
         amp = torch.exp(log_amp) * self.support_taper
         return torch.polar(amp, phase)
 
@@ -832,12 +901,28 @@ class PhysicsConstrainedSpectralPropagator2d(nn.Module):
     def regularization_terms(self):
         amp_diff = self.radial_log_amp[1:] - self.radial_log_amp[:-1]
         phase_diff = self.radial_phase[1:] - self.radial_phase[:-1]
-        return {
+        terms = {
             "spectral_amp_smooth": amp_diff.pow(2).mean(),
             "spectral_phase_smooth": phase_diff.pow(2).mean(),
             "spectral_amp_l2": self.radial_log_amp.pow(2).mean(),
             "spectral_gain_l2": self.output_log_gain.pow(2),
         }
+        if self.n_angular:
+            angular_amp = torch.cat([
+                self.angular_log_amp_cos,
+                self.angular_log_amp_sin,
+            ], dim=0)
+            angular_phase = torch.cat([
+                self.angular_phase_cos,
+                self.angular_phase_sin,
+            ], dim=0)
+            terms.update({
+                "spectral_angular_amp_l2": angular_amp.pow(2).mean(),
+                "spectral_angular_phase_l2": angular_phase.pow(2).mean(),
+                "spectral_angular_amp_smooth": (angular_amp[:, 1:] - angular_amp[:, :-1]).pow(2).mean(),
+                "spectral_angular_phase_smooth": (angular_phase[:, 1:] - angular_phase[:, :-1]).pow(2).mean(),
+            })
+        return terms
 
     def diagnostic_arrays(self):
         with torch.no_grad():
@@ -847,6 +932,7 @@ class PhysicsConstrainedSpectralPropagator2d(nn.Module):
                 "transfer_phase": torch.angle(h).numpy(),
                 "radial_log_amp": self.radial_log_amp.detach().cpu().numpy(),
                 "radial_phase": self.radial_phase.detach().cpu().numpy(),
+                "angular_orders": np.array(self.angular_orders, dtype=np.int64),
             }
 
 
@@ -872,6 +958,9 @@ def build_operator_model(cfg, in_ch):
             depth=cfg["spectral_depth"],
             radial_bins=cfg["spectral_radial_bins"],
             transfer_amp_scale=cfg["spectral_transfer_amp_scale"],
+            angular_orders=cfg["spectral_angular_orders"],
+            angular_amp_scale=cfg["spectral_angular_amp_scale"],
+            angular_phase_scale=cfg["spectral_angular_phase_scale"],
             pupil_phase_scale=cfg["spectral_pupil_phase_scale"],
             pupil_amp_scale=cfg["spectral_pupil_amp_scale"],
             residual_scale=cfg["spectral_residual_scale"],
@@ -890,6 +979,10 @@ def model_regularization_loss(model, cfg, device):
         "spectral_phase_smooth": cfg.get("w_spectral_phase_smooth", 0.0),
         "spectral_amp_l2": cfg.get("w_spectral_amp_l2", 0.0),
         "spectral_gain_l2": cfg.get("w_spectral_gain_l2", 0.0),
+        "spectral_angular_amp_l2": cfg.get("w_spectral_angular_l2", 0.0),
+        "spectral_angular_phase_l2": cfg.get("w_spectral_angular_l2", 0.0),
+        "spectral_angular_amp_smooth": cfg.get("w_spectral_angular_smooth", 0.0),
+        "spectral_angular_phase_smooth": cfg.get("w_spectral_angular_smooth", 0.0),
     }
     total = torch.zeros((), device=device)
     weighted_terms = {}
@@ -1429,6 +1522,7 @@ def save_model_diagnostics(model, path):
     phase = arrays["transfer_phase"]
     radial_log_amp = arrays["radial_log_amp"]
     radial_phase = arrays["radial_phase"]
+    angular_orders = arrays.get("angular_orders", np.array([], dtype=np.int64))
 
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
     axes = axes.reshape(-1)
@@ -1456,6 +1550,8 @@ def save_model_diagnostics(model, path):
     cbar.set_ticks([-np.pi, 0.0, np.pi])
     cbar.set_ticklabels(["-3.14", "0", "3.14"])
 
+    if angular_orders.size:
+        fig.suptitle(f"H_eff angular orders: {', '.join(str(int(v)) for v in angular_orders)}", y=1.0)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -1605,6 +1701,9 @@ def build_parser():
     parser.add_argument("--spectral-depth", type=int, default=2)
     parser.add_argument("--spectral-radial-bins", type=int, default=256)
     parser.add_argument("--spectral-transfer-amp-scale", type=float, default=2.0)
+    parser.add_argument("--spectral-angular-orders", type=str, default="")
+    parser.add_argument("--spectral-angular-amp-scale", type=float, default=0.25)
+    parser.add_argument("--spectral-angular-phase-scale", type=float, default=0.50)
     parser.add_argument("--spectral-pupil-phase-scale", type=float, default=0.25)
     parser.add_argument("--spectral-pupil-amp-scale", type=float, default=0.10)
     parser.add_argument("--spectral-residual-scale", type=float, default=0.10)
@@ -1643,6 +1742,8 @@ def build_parser():
     parser.add_argument("--w-spectral-phase-smooth", type=float, default=1e-4)
     parser.add_argument("--w-spectral-amp-l2", type=float, default=1e-5)
     parser.add_argument("--w-spectral-gain-l2", type=float, default=1e-5)
+    parser.add_argument("--w-spectral-angular-smooth", type=float, default=1e-4)
+    parser.add_argument("--w-spectral-angular-l2", type=float, default=1e-4)
     parser.add_argument("--phase-loss-amp-floor", type=float, default=0.02)
     parser.add_argument("--phase-loss-weight-power", type=float, default=1.0)
 
@@ -1724,6 +1825,9 @@ def config_from_args(args):
         "spectral_depth": args.spectral_depth,
         "spectral_radial_bins": args.spectral_radial_bins,
         "spectral_transfer_amp_scale": args.spectral_transfer_amp_scale,
+        "spectral_angular_orders": parse_int_list(args.spectral_angular_orders),
+        "spectral_angular_amp_scale": args.spectral_angular_amp_scale,
+        "spectral_angular_phase_scale": args.spectral_angular_phase_scale,
         "spectral_pupil_phase_scale": args.spectral_pupil_phase_scale,
         "spectral_pupil_amp_scale": args.spectral_pupil_amp_scale,
         "spectral_residual_scale": args.spectral_residual_scale,
@@ -1759,6 +1863,8 @@ def config_from_args(args):
         "w_spectral_phase_smooth": args.w_spectral_phase_smooth,
         "w_spectral_amp_l2": args.w_spectral_amp_l2,
         "w_spectral_gain_l2": args.w_spectral_gain_l2,
+        "w_spectral_angular_smooth": args.w_spectral_angular_smooth,
+        "w_spectral_angular_l2": args.w_spectral_angular_l2,
         "phase_loss_amp_floor": args.phase_loss_amp_floor,
         "phase_loss_weight_power": args.phase_loss_weight_power,
         "stage2_field_anchor_weight": args.stage2_field_anchor_weight,
@@ -1888,6 +1994,7 @@ def main():
             "Spectral operator: "
             f"width={cfg['spectral_width']}, depth={cfg['spectral_depth']}, "
             f"radial_bins={cfg['spectral_radial_bins']}, "
+            f"angular_orders={cfg['spectral_angular_orders'] or 'none'}, "
             f"residual_scale={cfg['spectral_residual_scale']:.4g}"
         )
     print(
