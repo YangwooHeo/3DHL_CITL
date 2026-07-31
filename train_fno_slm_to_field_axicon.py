@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Two-stage FNO trainer for SLM-phase-to-axicon-field learning.
+Two-stage spectral-operator trainer for SLM-phase-to-axicon-field learning.
 
 Stage 1:
     input  = SLM phase (+ coordinate grid + z channel)
@@ -15,6 +15,10 @@ Stage 2:
 This deliberately avoids changing the head to intensity in stage 2.  The
 camera loss is intensity-to-intensity, but the model still carries a complex
 field representation learned from synthetic propagation.
+
+``annular_fno`` restricts each learned Fourier convolution to the physical
+support produced by convolving the axicon ring with the square GS bandwidth.
+The same support can also be used for stage-1 losses and diagnostics.
 """
 
 import argparse
@@ -559,6 +563,131 @@ def make_axicon_coordinate_grid(size, cfg, device, dtype):
     return xx, yy
 
 
+def model_field_pixel_size_m(cfg, height=None, width=None):
+    """Physical sampling of the cropped synthetic field represented by the model."""
+    height = int(height if height is not None else cfg["model_size"])
+    width = int(width if width is not None else cfg["model_size"])
+    crop = cfg.get("fov_crop_size", None)
+    crop = int(crop) if crop is not None else int(cfg.get("axicon_roi_size", 1024))
+    slm_pixel = float(cfg.get("slm_pixel_size_m", 6.4e-6))
+    upsample = max(1, int(cfg.get("axicon_upsample_factor", 20)))
+    source_pixel = slm_pixel / upsample
+
+    # _physical_axis spans crop source samples, including both end points.
+    dx = source_pixel * max(crop - 1, 1) / max(width - 1, 1)
+    dy = source_pixel * max(crop - 1, 1) / max(height - 1, 1)
+    return float(dy), float(dx)
+
+
+def effective_spectrum_geometry(cfg, height=None, width=None):
+    height = int(height if height is not None else cfg["model_size"])
+    width = int(width if width is not None else cfg["model_size"])
+    dy, dx = model_field_pixel_size_m(cfg, height=height, width=width)
+    gs_pixel = cfg.get("gs_effective_pixel_size_m", None)
+    gs_pixel = float(gs_pixel if gs_pixel is not None else cfg.get("slm_pixel_size_m", 6.4e-6))
+    if gs_pixel <= 0:
+        raise ValueError("GS effective pixel size must be positive.")
+
+    bandwidth_fraction = float(cfg.get("gs_bandwidth_nyquist_fraction", 1.0))
+    if bandwidth_fraction <= 0:
+        raise ValueError("GS bandwidth Nyquist fraction must be positive.")
+    f_nyquist = 1.0 / (2.0 * gs_pixel)
+    bandwidth_axis = bandwidth_fraction * f_nyquist
+    bandwidth_corner = math.sqrt(2.0) * bandwidth_axis
+    ring_frequency = float(cfg.get(
+        "axicon_transverse_frequency_actual",
+        1.0 / float(cfg.get("axicon_grating_pitch_m", 1.396e-6)),
+    ))
+    if ring_frequency <= 0:
+        raise ValueError("Axicon transverse frequency must be positive.")
+
+    return {
+        "height": height,
+        "width": width,
+        "field_dy_m": dy,
+        "field_dx_m": dx,
+        "df_y_cyc_per_m": 1.0 / (height * dy),
+        "df_x_cyc_per_m": 1.0 / (width * dx),
+        "model_nyquist_y_cyc_per_m": 1.0 / (2.0 * dy),
+        "model_nyquist_x_cyc_per_m": 1.0 / (2.0 * dx),
+        "gs_effective_pixel_size_m": gs_pixel,
+        "gs_nyquist_cyc_per_m": f_nyquist,
+        "gs_bandwidth_axis_cyc_per_m": bandwidth_axis,
+        "gs_bandwidth_corner_cyc_per_m": bandwidth_corner,
+        "axicon_ring_cyc_per_m": ring_frequency,
+        "ring_over_gs_nyquist": ring_frequency / f_nyquist,
+        "axis_halfwidth_over_ring": bandwidth_axis / ring_frequency,
+        "corner_halfwidth_over_ring": bandwidth_corner / ring_frequency,
+        "ring_bin_x": ring_frequency * width * dx,
+        "ring_bin_y": ring_frequency * height * dy,
+    }
+
+
+_EFFECTIVE_SPECTRUM_CACHE = {}
+
+
+def effective_axicon_spectrum_weight(height, width, cfg, device, dtype, rfft=False):
+    """Return the convolution support of an axicon ring and GS-mask bandwidth.
+
+    For ``square_minkowski`` this is the exact support of a radius-f_r ring
+    convolved with the square SLM Nyquist support [-B, B]^2.  A radial envelope
+    is available for direct comparison with the conservative +/-sqrt(2) B rule.
+    """
+    geometry = effective_spectrum_geometry(cfg, height=height, width=width)
+    shape = str(cfg.get("effective_spectrum_shape", "square_minkowski")).lower()
+    soft_fn = max(0.0, float(cfg.get("effective_spectrum_soft_edge_fn", 0.05)))
+    cache_key = (
+        int(height), int(width), bool(rfft), str(device), str(dtype), shape,
+        geometry["field_dy_m"], geometry["field_dx_m"],
+        geometry["axicon_ring_cyc_per_m"],
+        geometry["gs_bandwidth_axis_cyc_per_m"], soft_fn,
+    )
+    cached = _EFFECTIVE_SPECTRUM_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    fy = torch.fft.fftfreq(height, d=geometry["field_dy_m"], device=device, dtype=dtype)
+    if rfft:
+        fx = torch.fft.rfftfreq(width, d=geometry["field_dx_m"], device=device, dtype=dtype)
+    else:
+        fx = torch.fft.fftfreq(width, d=geometry["field_dx_m"], device=device, dtype=dtype)
+    fyy, fxx = torch.meshgrid(fy, fx, indexing="ij")
+    abs_x = fxx.abs()
+    abs_y = fyy.abs()
+    ring = geometry["axicon_ring_cyc_per_m"]
+    bandwidth = geometry["gs_bandwidth_axis_cyc_per_m"]
+    soft = soft_fn * geometry["gs_nyquist_cyc_per_m"]
+
+    if shape == "square_minkowski":
+        # A frequency k is in ring (+) square iff the circle radius lies between
+        # the minimum and maximum distances from k to the centered square.
+        distance_min = torch.sqrt(
+            F.relu(abs_x - bandwidth).pow(2) + F.relu(abs_y - bandwidth).pow(2)
+        )
+        distance_max = torch.sqrt((abs_x + bandwidth).pow(2) + (abs_y + bandwidth).pow(2))
+        if soft > 0:
+            weight = torch.sigmoid((ring - distance_min) / soft)
+            weight = weight * torch.sigmoid((distance_max - ring) / soft)
+        else:
+            weight = ((distance_min <= ring) & (ring <= distance_max)).to(dtype)
+    elif shape == "radial_envelope":
+        rho = torch.sqrt(fxx.pow(2) + fyy.pow(2))
+        halfwidth = geometry["gs_bandwidth_corner_cyc_per_m"]
+        if soft > 0:
+            weight = torch.sigmoid((halfwidth - torch.abs(rho - ring)) / soft)
+        else:
+            weight = (torch.abs(rho - ring) <= halfwidth).to(dtype)
+    else:
+        raise ValueError(
+            f"Unknown effective_spectrum_shape={shape!r}; expected "
+            "'square_minkowski' or 'radial_envelope'."
+        )
+
+    weight = weight.clamp(0.0, 1.0)
+    _EFFECTIVE_SPECTRUM_CACHE[cache_key] = weight
+    return weight
+
+
 def make_axicon_physics_maps(batch, size, cfg, device, dtype):
     xx, yy = make_axicon_coordinate_grid(size, cfg, device, dtype)
     radius = torch.sqrt(xx.pow(2) + yy.pow(2))
@@ -718,6 +847,154 @@ class PointwiseMLP2d(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+
+class AnnularSpectralConv2d(nn.Module):
+    """FNO spectral convolution restricted to the physical axicon support."""
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        model_size,
+        cfg,
+        low_modes=0,
+        support_threshold=0.01,
+    ):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.model_size = int(model_size)
+        self.low_modes = max(0, int(low_modes))
+        threshold = float(support_threshold)
+        if not 0.0 <= threshold < 1.0:
+            raise ValueError("Annular support threshold must lie in [0, 1).")
+
+        support = effective_axicon_spectrum_weight(
+            self.model_size,
+            self.model_size,
+            cfg,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            rfft=True,
+        ).clone()
+        active = support >= threshold
+        if self.low_modes:
+            low = torch.zeros_like(active)
+            my = min(self.low_modes, self.model_size // 2)
+            mx = min(self.low_modes, self.model_size // 2 + 1)
+            low[:my, :mx] = True
+            low[-my:, :mx] = True
+            active |= low
+            support = torch.where(low, torch.ones_like(support), support)
+
+        active_indices = torch.nonzero(active.reshape(-1), as_tuple=False).flatten()
+        if active_indices.numel() == 0:
+            raise ValueError("The effective axicon spectrum support is empty on the model grid.")
+        taper = support.reshape(-1).index_select(0, active_indices)
+        self.n_active_modes = int(active_indices.numel())
+        self.support_fraction = self.n_active_modes / float(support.numel())
+        self.register_buffer("active_indices", active_indices)
+        self.register_buffer("active_taper", taper)
+        self.register_buffer("support_weight", support)
+
+        scale = 1.0 / math.sqrt(self.in_channels * self.out_channels)
+        self.weight = nn.Parameter(
+            scale * torch.randn(
+                self.in_channels,
+                self.out_channels,
+                self.n_active_modes,
+                dtype=torch.cfloat,
+            )
+        )
+
+    def forward(self, x):
+        batch, _, height, width = x.shape
+        if height != self.model_size or width != self.model_size:
+            raise ValueError(
+                f"Annular FNO was built for {self.model_size}x{self.model_size}, "
+                f"received {height}x{width}."
+            )
+        x_ft = torch.fft.rfft2(x, norm="ortho")
+        x_flat = x_ft.reshape(batch, self.in_channels, -1)
+        x_active = torch.index_select(x_flat, -1, self.active_indices)
+        out_active = torch.einsum("bik,iok->bok", x_active, self.weight)
+        out_active = out_active * self.active_taper.view(1, 1, -1)
+        out_flat = torch.zeros(
+            batch,
+            self.out_channels,
+            x_flat.shape[-1],
+            device=x.device,
+            dtype=x_ft.dtype,
+        )
+        out_flat = out_flat.index_copy(-1, self.active_indices, out_active)
+        out_ft = out_flat.reshape(batch, self.out_channels, height, width // 2 + 1)
+        return torch.fft.irfft2(out_ft, s=(height, width), norm="ortho")
+
+
+class AnnularFNOBlock2d(nn.Module):
+    def __init__(self, width, model_size, cfg, low_modes=0, support_threshold=0.01, groups=4):
+        super().__init__()
+        self.spectral = AnnularSpectralConv2d(
+            width,
+            width,
+            model_size=model_size,
+            cfg=cfg,
+            low_modes=low_modes,
+            support_threshold=support_threshold,
+        )
+        self.local = nn.Conv2d(width, width, kernel_size=1)
+        self.norm = nn.GroupNorm(min(groups, width), width)
+
+    def forward(self, x):
+        return F.gelu(self.norm(self.spectral(x) + self.local(x)))
+
+
+class AnnularAxiconFNO2d(nn.Module):
+    """FNO whose global branch learns the convolution-expanded axicon ring."""
+
+    def __init__(
+        self,
+        in_ch,
+        out_ch,
+        width,
+        depth,
+        mlp_width,
+        model_size,
+        cfg,
+        low_modes=0,
+        support_threshold=0.01,
+    ):
+        super().__init__()
+        self.lift = nn.Sequential(
+            nn.Conv2d(in_ch, width, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(width, width, kernel_size=1),
+        )
+        self.blocks = nn.ModuleList([
+            AnnularFNOBlock2d(
+                width,
+                model_size=model_size,
+                cfg=cfg,
+                low_modes=low_modes,
+                support_threshold=support_threshold,
+            )
+            for _ in range(int(depth))
+        ])
+        self.project = nn.Sequential(
+            nn.Conv2d(width, mlp_width, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(mlp_width, out_ch, kernel_size=1),
+        )
+        first = self.blocks[0].spectral
+        self.n_active_modes = first.n_active_modes
+        self.support_fraction = first.support_fraction
+
+    def forward(self, x):
+        x = self.lift(x)
+        for block in self.blocks:
+            x = block(x)
+        return self.project(x)
 
 
 class PhysicsConstrainedSpectralPropagator2d(nn.Module):
@@ -949,6 +1226,18 @@ def build_operator_model(cfg, in_ch):
             depth=cfg["depth"],
             mlp_width=cfg["mlp_width"],
         )
+    if mode == "annular_fno":
+        return AnnularAxiconFNO2d(
+            in_ch=in_ch,
+            out_ch=2,
+            width=cfg["width"],
+            depth=cfg["depth"],
+            mlp_width=cfg["mlp_width"],
+            model_size=cfg["model_size"],
+            cfg=cfg,
+            low_modes=cfg["annular_fno_low_modes"],
+            support_threshold=cfg["effective_spectrum_support_threshold"],
+        )
     if mode == "spectral":
         return PhysicsConstrainedSpectralPropagator2d(
             in_ch=in_ch,
@@ -1036,6 +1325,52 @@ def spectrum_logmag_l1_per_sample(pred, target):
     return mean_per_sample(torch.abs(per_image_standardize(pred_mag) - per_image_standardize(target_mag)))
 
 
+def _field_fft(field):
+    field_c = torch.complex(field[:, 0], field[:, 1])
+    return torch.fft.fft2(field_c, norm="ortho")
+
+
+def _weighted_standardize_spectrum(values, weight, eps=1e-6):
+    weight = weight.unsqueeze(0)
+    denominator = weight.sum().clamp_min(eps)
+    mean = (values * weight).sum(dim=(-2, -1), keepdim=True) / denominator
+    variance = ((values - mean).pow(2) * weight).sum(dim=(-2, -1), keepdim=True) / denominator
+    return (values - mean) / torch.sqrt(variance + eps)
+
+
+def effective_spectrum_complex_nmse_per_sample(pred, target, cfg, eps=1e-8):
+    pred_fft = _field_fft(pred)
+    target_fft = _field_fft(target)
+    weight = effective_axicon_spectrum_weight(
+        pred.shape[-2], pred.shape[-1], cfg, pred.device, pred.dtype, rfft=False
+    ).unsqueeze(0)
+    numerator = (weight * (pred_fft - target_fft).abs().pow(2)).sum(dim=(-2, -1))
+    denominator = (weight * target_fft.abs().pow(2)).sum(dim=(-2, -1)).clamp_min(eps)
+    return numerator / denominator
+
+
+def effective_spectrum_logmag_l1_per_sample(pred, target, cfg, eps=1e-6):
+    pred_mag = torch.log1p(_field_fft(pred).abs())
+    target_mag = torch.log1p(_field_fft(target).abs())
+    weight = effective_axicon_spectrum_weight(
+        pred.shape[-2], pred.shape[-1], cfg, pred.device, pred.dtype, rfft=False
+    )
+    pred_norm = _weighted_standardize_spectrum(pred_mag, weight, eps=eps)
+    target_norm = _weighted_standardize_spectrum(target_mag, weight, eps=eps)
+    weighted_error = weight.unsqueeze(0) * torch.abs(pred_norm - target_norm)
+    return weighted_error.sum(dim=(-2, -1)) / weight.sum().clamp_min(eps)
+
+
+def effective_spectrum_energy_fraction_per_sample(field, cfg, eps=1e-8):
+    spectrum_energy = _field_fft(field).abs().pow(2)
+    weight = effective_axicon_spectrum_weight(
+        field.shape[-2], field.shape[-1], cfg, field.device, field.dtype, rfft=False
+    ).unsqueeze(0)
+    selected = (weight * spectrum_energy).sum(dim=(-2, -1))
+    total = spectrum_energy.sum(dim=(-2, -1)).clamp_min(eps)
+    return selected / total
+
+
 def synthetic_field_loss_per_sample(pred, target, cfg):
     pred_int = field_intensity(pred)
     target_int = field_intensity(target)
@@ -1055,6 +1390,14 @@ def synthetic_field_loss_per_sample(pred, target, cfg):
     )
     grad_l1 = gradient_l1_per_sample(pred, target) if cfg["w_field_grad"] > 0 else zeros
     spectrum = spectrum_logmag_l1_per_sample(pred, target) if cfg["w_spectrum"] > 0 else zeros
+    effective_spectrum_complex = (
+        effective_spectrum_complex_nmse_per_sample(pred, target, cfg)
+        if cfg["w_effective_spectrum_complex"] > 0 else zeros
+    )
+    effective_spectrum_logmag = (
+        effective_spectrum_logmag_l1_per_sample(pred, target, cfg)
+        if cfg["w_effective_spectrum_logmag"] > 0 else zeros
+    )
 
     total = (
         cfg["w_complex_mse"] * complex_mse
@@ -1064,6 +1407,8 @@ def synthetic_field_loss_per_sample(pred, target, cfg):
         + cfg["w_phase_circular"] * phase_circular
         + cfg["w_field_grad"] * grad_l1
         + cfg["w_spectrum"] * spectrum
+        + cfg["w_effective_spectrum_complex"] * effective_spectrum_complex
+        + cfg["w_effective_spectrum_logmag"] * effective_spectrum_logmag
     )
     return total, {
         "complex_mse": complex_mse,
@@ -1073,6 +1418,8 @@ def synthetic_field_loss_per_sample(pred, target, cfg):
         "phase_circular": phase_circular,
         "grad_l1": grad_l1,
         "spectrum": spectrum,
+        "effective_spectrum_complex_nmse": effective_spectrum_complex,
+        "effective_spectrum_logmag_l1": effective_spectrum_logmag,
         "pred_intensity_mse": mean_per_sample((pred_int - target_int).pow(2)),
     }
 
@@ -1131,7 +1478,7 @@ def radial_profile_batch(x, n_bins=64, eps=1e-6):
     return torch.stack(profiles, dim=0)
 
 
-def field_metrics_batch(pred, target, phase_amp_floor=0.02, radial_bins=64, eps=1e-8):
+def field_metrics_batch(pred, target, phase_amp_floor=0.02, radial_bins=64, cfg=None, eps=1e-8):
     pred_c = torch.complex(pred[:, 0], pred[:, 1])
     target_c = torch.complex(target[:, 0], target[:, 1])
     pred_int = field_intensity(pred)
@@ -1168,7 +1515,7 @@ def field_metrics_batch(pred, target, phase_amp_floor=0.02, radial_bins=64, eps=
     radial_profile_mse = ((pred_prof / scale - target_prof / scale).pow(2)).mean(dim=1)
 
     spectrum = spectrum_logmag_l1_per_sample(pred, target)
-    return {
+    metrics = {
         "complex_mse": complex_mse,
         "complex_nmse": complex_nmse,
         "global_phase_aligned_nmse": aligned_nmse,
@@ -1181,6 +1528,22 @@ def field_metrics_batch(pred, target, phase_amp_floor=0.02, radial_bins=64, eps=
         "radial_profile_mse": radial_profile_mse,
         "fft_logmag_l1": spectrum,
     }
+    if cfg is not None:
+        metrics.update({
+            "effective_spectrum_complex_nmse": effective_spectrum_complex_nmse_per_sample(
+                pred, target, cfg, eps=eps
+            ),
+            "effective_spectrum_logmag_l1": effective_spectrum_logmag_l1_per_sample(
+                pred, target, cfg
+            ),
+            "target_effective_spectrum_energy_fraction": effective_spectrum_energy_fraction_per_sample(
+                target, cfg, eps=eps
+            ),
+            "pred_effective_spectrum_energy_fraction": effective_spectrum_energy_fraction_per_sample(
+                pred, cfg, eps=eps
+            ),
+        })
+    return metrics
 
 
 def camera_metrics_batch(pred_field, camera, radial_bins=64, eps=1e-8):
@@ -1364,6 +1727,7 @@ def evaluate(model, loader, dataset, indices, device, cfg, stage, out_dir):
                 b["field"],
                 phase_amp_floor=cfg["phase_loss_amp_floor"],
                 radial_bins=cfg["radial_bins"],
+                cfg=cfg,
             )
             if stage == "stage2" and "camera" in b:
                 metrics.update(camera_metrics_batch(pred, b["camera"], radial_bins=cfg["radial_bins"]))
@@ -1472,6 +1836,10 @@ def plot_metric_summary(rows, path, stage):
         "coherent_overlap",
         "phase_rmse_rad",
         "intensity_ssim",
+        "effective_spectrum_complex_nmse",
+        "effective_spectrum_logmag_l1",
+        "target_effective_spectrum_energy_fraction",
+        "pred_effective_spectrum_energy_fraction",
         "camera_raw_mse",
         "camera_ssim",
     ]
@@ -1511,6 +1879,79 @@ def plot_metric_summary(rows, path, stage):
     fig.suptitle(f"{stage} per-sample metrics", y=1.0)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def standard_fno_effective_support_coverage(cfg):
+    size = int(cfg["model_size"])
+    weight = effective_axicon_spectrum_weight(
+        size, size, cfg, torch.device("cpu"), torch.float32, rfft=True
+    )
+    selected = torch.zeros_like(weight, dtype=torch.bool)
+    my = min(int(cfg.get("modes_y", 0)), size)
+    mx = min(int(cfg.get("modes_x", 0)), size // 2 + 1)
+    if my > 0 and mx > 0:
+        selected[:my, :mx] = True
+        selected[-my:, :mx] = True
+    return float((weight * selected).sum() / weight.sum().clamp_min(1e-8))
+
+
+def save_effective_spectrum_diagnostic(cfg, path):
+    size = int(cfg["model_size"])
+    geometry = effective_spectrum_geometry(cfg, height=size, width=size)
+    weight = effective_axicon_spectrum_weight(
+        size, size, cfg, torch.device("cpu"), torch.float32, rfft=False
+    ).numpy()
+    threshold = float(cfg["effective_spectrum_support_threshold"])
+    active_fraction = float(np.mean(weight >= threshold))
+    fno_coverage = standard_fno_effective_support_coverage(cfg)
+
+    shifted = np.fft.fftshift(weight)
+    fx = np.fft.fftshift(np.fft.fftfreq(size, d=geometry["field_dx_m"])) / 1000.0
+    fy = np.fft.fftshift(np.fft.fftfreq(size, d=geometry["field_dy_m"])) / 1000.0
+    center = size // 2
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.4))
+    im = axes[0].imshow(
+        shifted,
+        cmap="magma",
+        vmin=0.0,
+        vmax=1.0,
+        extent=[fx[0], fx[-1], fy[0], fy[-1]],
+        origin="lower",
+    )
+    axes[0].set_title("Convolution-expanded axicon support")
+    axes[0].set_xlabel("fx (kcyc/m)")
+    axes[0].set_ylabel("fy (kcyc/m)")
+    fig.colorbar(im, ax=axes[0], fraction=0.046, pad=0.03)
+
+    axes[1].plot(fx, shifted[center], label="fy = 0")
+    axes[1].axvline(geometry["axicon_ring_cyc_per_m"] / 1000.0, color="tab:green", ls="--", label="+f_r")
+    axes[1].axvline(-geometry["axicon_ring_cyc_per_m"] / 1000.0, color="tab:green", ls="--", label="-f_r")
+    axes[1].set_xlabel("fx (kcyc/m)")
+    axes[1].set_ylabel("support weight")
+    axes[1].set_ylim(-0.03, 1.03)
+    axes[1].set_title("Central spectral cross-section")
+    axes[1].grid(True, alpha=0.25)
+    axes[1].legend(fontsize=8)
+
+    axes[2].axis("off")
+    lines = [
+        f"shape: {cfg['effective_spectrum_shape']}",
+        f"axicon pitch: {cfg['axicon_grating_pitch_m'] * 1e6:.4f} um",
+        f"f_r: {geometry['axicon_ring_cyc_per_m'] / 1000.0:.2f} kcyc/m",
+        f"GS pixel: {geometry['gs_effective_pixel_size_m'] * 1e6:.4f} um",
+        f"f_N: {geometry['gs_nyquist_cyc_per_m'] / 1000.0:.2f} kcyc/m",
+        f"axis B/f_r: {100.0 * geometry['axis_halfwidth_over_ring']:.2f}%",
+        f"corner B/f_r: {100.0 * geometry['corner_halfwidth_over_ring']:.2f}%",
+        f"ring radius: {geometry['ring_bin_x']:.2f} FFT bins",
+        f"active grid: {100.0 * active_fraction:.2f}%",
+        f"legacy FNO weighted coverage: {100.0 * fno_coverage:.2f}%",
+    ]
+    axes[2].text(0.0, 1.0, "\n".join(lines), va="top", family="monospace", fontsize=10)
+    axes[2].set_title("Physical support summary")
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
     plt.close(fig)
 
 
@@ -1680,6 +2121,36 @@ def build_parser():
     parser.add_argument("--axicon-medium-index", type=float, default=1.471)
     parser.add_argument("--axicon-phase-sign", type=float, default=-1.0)
     parser.add_argument("--axicon-gaussian-waist-m", type=float, default=0.00638708 * 0.8)
+    parser.add_argument(
+        "--gs-effective-pixel-size-m",
+        type=float,
+        default=None,
+        help="Effective GS-mask pixel pitch. Defaults to --slm-pixel-size-m.",
+    )
+    parser.add_argument(
+        "--gs-bandwidth-nyquist-fraction",
+        type=float,
+        default=1.0,
+        help="GS phasor bandwidth B/f_N along each square-grid axis.",
+    )
+    parser.add_argument(
+        "--effective-spectrum-shape",
+        choices=["square_minkowski", "radial_envelope"],
+        default="square_minkowski",
+        help="Exact ring (+) square support or its conservative radial envelope.",
+    )
+    parser.add_argument(
+        "--effective-spectrum-soft-edge-fn",
+        type=float,
+        default=0.05,
+        help="Support-edge transition width as a fraction of GS f_N.",
+    )
+    parser.add_argument(
+        "--effective-spectrum-support-threshold",
+        type=float,
+        default=0.01,
+        help="Minimum soft support weight retained by annular_fno.",
+    )
 
     parser.add_argument("--field-scale-mode", choices=["raw", "sample_norm", "global_percentile"], default="global_percentile")
     parser.add_argument("--field-amp-percentile", type=float, default=99.9)
@@ -1696,7 +2167,13 @@ def build_parser():
     parser.add_argument("--modes-y", type=int, default=96)
     parser.add_argument("--modes-x", type=int, default=96)
     parser.add_argument("--mlp-width", type=int, default=128)
-    parser.add_argument("--operator-mode", choices=["fno", "spectral"], default="fno")
+    parser.add_argument("--operator-mode", choices=["fno", "annular_fno", "spectral"], default="fno")
+    parser.add_argument(
+        "--annular-fno-low-modes",
+        type=int,
+        default=0,
+        help="Optional legacy low-frequency square retained alongside the annular support.",
+    )
     parser.add_argument("--spectral-width", type=int, default=16)
     parser.add_argument("--spectral-depth", type=int, default=2)
     parser.add_argument("--spectral-radial-bins", type=int, default=256)
@@ -1738,6 +2215,8 @@ def build_parser():
     parser.add_argument("--w-phase-circular", type=float, default=0.30)
     parser.add_argument("--w-field-grad", type=float, default=0.05)
     parser.add_argument("--w-spectrum", type=float, default=0.05)
+    parser.add_argument("--w-effective-spectrum-complex", type=float, default=0.0)
+    parser.add_argument("--w-effective-spectrum-logmag", type=float, default=0.0)
     parser.add_argument("--w-spectral-amp-smooth", type=float, default=1e-4)
     parser.add_argument("--w-spectral-phase-smooth", type=float, default=1e-4)
     parser.add_argument("--w-spectral-amp-l2", type=float, default=1e-5)
@@ -1806,6 +2285,11 @@ def config_from_args(args):
         "axicon_na_air_equiv": float(args.axicon_wavelength_m) * axicon_frequency,
         "axicon_phase_sign": args.axicon_phase_sign,
         "axicon_gaussian_waist_m": args.axicon_gaussian_waist_m,
+        "gs_effective_pixel_size_m": args.gs_effective_pixel_size_m,
+        "gs_bandwidth_nyquist_fraction": args.gs_bandwidth_nyquist_fraction,
+        "effective_spectrum_shape": args.effective_spectrum_shape,
+        "effective_spectrum_soft_edge_fn": args.effective_spectrum_soft_edge_fn,
+        "effective_spectrum_support_threshold": args.effective_spectrum_support_threshold,
         "field_scale_mode": args.field_scale_mode,
         "field_amp_percentile": args.field_amp_percentile,
         "field_amp_scale": args.field_amp_scale,
@@ -1821,6 +2305,7 @@ def config_from_args(args):
         "modes_x": args.modes_x,
         "mlp_width": args.mlp_width,
         "operator_mode": args.operator_mode,
+        "annular_fno_low_modes": args.annular_fno_low_modes,
         "spectral_width": args.spectral_width,
         "spectral_depth": args.spectral_depth,
         "spectral_radial_bins": args.spectral_radial_bins,
@@ -1859,6 +2344,8 @@ def config_from_args(args):
         "w_phase_circular": args.w_phase_circular,
         "w_field_grad": args.w_field_grad,
         "w_spectrum": args.w_spectrum,
+        "w_effective_spectrum_complex": args.w_effective_spectrum_complex,
+        "w_effective_spectrum_logmag": args.w_effective_spectrum_logmag,
         "w_spectral_amp_smooth": args.w_spectral_amp_smooth,
         "w_spectral_phase_smooth": args.w_spectral_phase_smooth,
         "w_spectral_amp_l2": args.w_spectral_amp_l2,
@@ -1974,6 +2461,34 @@ def main():
     )
     cfg["group_loss_weights_normalized"] = group_weights
     cfg["train_group_counts"] = group_counts
+    spectrum_geometry = effective_spectrum_geometry(cfg)
+    support_cpu = effective_axicon_spectrum_weight(
+        cfg["model_size"],
+        cfg["model_size"],
+        cfg,
+        torch.device("cpu"),
+        torch.float32,
+        rfft=False,
+    )
+    support_threshold = float(cfg["effective_spectrum_support_threshold"])
+    spectrum_geometry["active_grid_fraction"] = float(
+        (support_cpu >= support_threshold).float().mean()
+    )
+    spectrum_geometry["mean_support_weight"] = float(support_cpu.mean())
+    spectrum_geometry["legacy_fno_weighted_coverage"] = standard_fno_effective_support_coverage(cfg)
+    conservative_outer_frequency = (
+        spectrum_geometry["axicon_ring_cyc_per_m"]
+        + spectrum_geometry["gs_bandwidth_corner_cyc_per_m"]
+    )
+    spectrum_geometry["conservative_outer_frequency_cyc_per_m"] = conservative_outer_frequency
+    spectrum_geometry["support_clipped_by_model_nyquist"] = bool(
+        conservative_outer_frequency
+        > min(
+            spectrum_geometry["model_nyquist_x_cyc_per_m"],
+            spectrum_geometry["model_nyquist_y_cyc_per_m"],
+        )
+    )
+    cfg["effective_spectrum_geometry"] = spectrum_geometry
 
     run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = ensure_dir(args.output_dir / run_name)
@@ -1982,6 +2497,7 @@ def main():
     with open(run_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
     save_split(run_dir / "split.json", dataset, train_idx, val_idx, cfg)
+    save_effective_spectrum_diagnostic(cfg, run_dir / "effective_spectrum_support.png")
 
     in_ch = infer_phase_input_channels(cfg)
     model = build_operator_model(cfg, in_ch).to(device)
@@ -1989,6 +2505,13 @@ def main():
     print(f"Input channels: {in_ch}")
     print(f"Input channel names: {', '.join(phase_input_channel_names(cfg))}")
     print(f"Operator mode: {cfg['operator_mode']}")
+    if cfg["operator_mode"] == "annular_fno":
+        print(
+            "Annular FNO: "
+            f"active_modes={model.n_active_modes}, "
+            f"rfft_fraction={100.0 * model.support_fraction:.2f}%, "
+            f"low_modes={cfg['annular_fno_low_modes']}"
+        )
     if cfg["operator_mode"] == "spectral":
         print(
             "Spectral operator: "
@@ -2004,6 +2527,32 @@ def main():
         f"f_r={cfg['axicon_transverse_frequency_actual']:.4g} 1/m, "
         f"NA_air={cfg['axicon_na_air_equiv']:.4f}"
     )
+    print(
+        "Effective spectrum: "
+        f"shape={cfg['effective_spectrum_shape']}, "
+        f"GS_pixel={spectrum_geometry['gs_effective_pixel_size_m'] * 1e6:.4f} um, "
+        f"f_N={spectrum_geometry['gs_nyquist_cyc_per_m'] / 1000.0:.2f} kcyc/m, "
+        f"ring={spectrum_geometry['axicon_ring_cyc_per_m'] / 1000.0:.2f} kcyc/m "
+        f"({spectrum_geometry['ring_bin_x']:.2f} bins), "
+        f"corner_halfwidth/ring={100.0 * spectrum_geometry['corner_halfwidth_over_ring']:.2f}%, "
+        f"active={100.0 * spectrum_geometry['active_grid_fraction']:.2f}%"
+    )
+    if spectrum_geometry["support_clipped_by_model_nyquist"]:
+        print(
+            "WARNING: the conservative effective spectrum extends beyond the "
+            "model-grid Nyquist limit. Increase model sampling density or reduce "
+            "the requested GS bandwidth before interpreting annular losses."
+        )
+    if cfg["operator_mode"] == "fno":
+        print(
+            "Legacy FNO effective-support coverage: "
+            f"{100.0 * spectrum_geometry['legacy_fno_weighted_coverage']:.2f}%"
+        )
+    print(
+        "Effective-spectrum loss weights: "
+        f"complex={cfg['w_effective_spectrum_complex']:.4g}, "
+        f"logmag={cfg['w_effective_spectrum_logmag']:.4g}"
+    )
     print(f"Model parameters: {n_params / 1e6:.3f} M")
     print(f"Run dir: {run_dir}")
 
@@ -2014,11 +2563,25 @@ def main():
         with torch.no_grad():
             x = build_phase_fno_input(b["phase"], b["z_mm"], cfg)
             y = model(x)
+            dry_metrics = field_metrics_batch(
+                y,
+                b["field"],
+                phase_amp_floor=cfg["phase_loss_amp_floor"],
+                radial_bins=cfg["radial_profile_bins"],
+                cfg=cfg,
+            )
         print(f"Dry run batch phase: {tuple(b['phase'].shape)}")
         print(f"Dry run model input: {tuple(x.shape)}")
         print(f"Dry run channels:    {', '.join(phase_input_channel_names(cfg))}")
         print(f"Dry run output:      {tuple(y.shape)}")
         print(f"Dry run field target:{tuple(b['field'].shape)}")
+        print(
+            "Dry run effective spectrum: "
+            f"complex_nmse={dry_metrics['effective_spectrum_complex_nmse'].mean().item():.6f}, "
+            f"logmag_l1={dry_metrics['effective_spectrum_logmag_l1'].mean().item():.6f}, "
+            f"target_energy={dry_metrics['target_effective_spectrum_energy_fraction'].mean().item():.4f}, "
+            f"pred_energy={dry_metrics['pred_effective_spectrum_energy_fraction'].mean().item():.4f}"
+        )
         if "camera" in b:
             print(f"Dry run camera:      {tuple(b['camera'].shape)}")
         print("Dry run complete.")
