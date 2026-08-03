@@ -209,6 +209,7 @@ class SLMToFieldDataset(torch.utils.data.Dataset):
         camera_dir="3.Aligned_Camera",
         model_size=608,
         fov_crop_size=608,
+        phase_spatial_mode="center_square",
         phase_flip_lr=True,
         phase_units="levels",
         phase_level_max=1023.0,
@@ -231,6 +232,7 @@ class SLMToFieldDataset(torch.utils.data.Dataset):
         self.camera_dir = camera_dir
         self.model_size = int(model_size)
         self.fov_crop_size = optional_int(fov_crop_size)
+        self.phase_spatial_mode = str(phase_spatial_mode).lower()
         self.phase_flip_lr = bool(phase_flip_lr)
         self.phase_units = phase_units
         self.phase_level_max = float(phase_level_max)
@@ -252,6 +254,8 @@ class SLMToFieldDataset(torch.utils.data.Dataset):
             raise ValueError(f"camera_scale_mode must be one of {sorted(self.valid_scale_modes)}")
         if self.phase_units not in {"levels", "radians"}:
             raise ValueError("phase_units must be 'levels' or 'radians'")
+        if self.phase_spatial_mode not in {"center_square", "stretch"}:
+            raise ValueError("phase_spatial_mode must be 'center_square' or 'stretch'")
 
         if z_mm is None:
             self.z_by_root = {
@@ -274,6 +278,24 @@ class SLMToFieldDataset(torch.utils.data.Dataset):
         if not self.samples:
             raise RuntimeError("No paired phase/field samples were found.")
 
+        first_phase = np.load(self.samples[0]["phase"], mmap_mode="r")
+        first_phase = np.squeeze(first_phase)
+        if first_phase.ndim != 2:
+            raise ValueError(
+                f"Phase mask must be 2D; got {first_phase.shape} in {self.samples[0]['phase']}"
+            )
+        phase_side = min(first_phase.shape)
+        self.phase_shape_info = {
+            "original": [int(first_phase.shape[0]), int(first_phase.shape[1])],
+            "pre_resize": (
+                [int(phase_side), int(phase_side)]
+                if self.phase_spatial_mode == "center_square"
+                else [int(first_phase.shape[0]), int(first_phase.shape[1])]
+            ),
+            "model": [self.model_size, self.model_size],
+            "mode": self.phase_spatial_mode,
+        }
+
         if self.field_scale_mode == "global_percentile" and self.field_amp_scale is None:
             self.field_amp_scale = self._compute_global_field_amp_scale()
         if self.require_camera and self.camera_scale_mode == "global_percentile" and self.camera_scale is None:
@@ -282,6 +304,13 @@ class SLMToFieldDataset(torch.utils.data.Dataset):
         print(f">>> Loaded {len(self.samples)} paired samples")
         print(f">>> First sample ids: {', '.join(s['id'] for s in self.samples[:5])}")
         print(f">>> z by root: {self.z_by_root}")
+        print(
+            ">>> Phase spatial mapping: "
+            f"mode={self.phase_spatial_mode}, "
+            f"original={tuple(self.phase_shape_info['original'])}, "
+            f"pre_resize={tuple(self.phase_shape_info['pre_resize'])}, "
+            f"model={tuple(self.phase_shape_info['model'])}"
+        )
         print(f">>> Field scale: mode={self.field_scale_mode}, amp_scale={self.field_amp_scale}")
         if self.require_camera:
             print(f">>> Camera scale: mode={self.camera_scale_mode}, scale={self.camera_scale}")
@@ -469,6 +498,11 @@ class SLMToFieldDataset(torch.utils.data.Dataset):
         phase = np.squeeze(phase)
         if phase.ndim != 2:
             raise ValueError(f"Phase mask must be 2D; got {phase.shape} in {path}")
+        if self.phase_spatial_mode == "center_square":
+            side = min(phase.shape)
+            y0 = (phase.shape[0] - side) // 2
+            x0 = (phase.shape[1] - side) // 2
+            phase = phase[y0:y0 + side, x0:x0 + side]
         if self.phase_flip_lr:
             phase = phase[:, ::-1].copy()
         if self.phase_units == "levels":
@@ -2096,6 +2130,15 @@ def build_parser():
     parser.add_argument("--camera-dir", type=str, default="3.Aligned_Camera")
     parser.add_argument("--fov-crop-size", type=optional_int, default=608)
     parser.add_argument("--model-size", type=int, default=608)
+    parser.add_argument(
+        "--phase-spatial-mode",
+        choices=["center_square", "stretch"],
+        default="center_square",
+        help=(
+            "center_square preserves phase x/y scale before square resize; "
+            "stretch reproduces the legacy rectangular-to-square mapping."
+        ),
+    )
     parser.add_argument("--phase-units", choices=["levels", "radians"], default="levels")
     parser.add_argument("--phase-level-max", type=float, default=1023.0)
     parser.add_argument("--no-phase-flip-lr", action="store_true")
@@ -2258,6 +2301,7 @@ def config_from_args(args):
         "camera_dir": args.camera_dir,
         "fov_crop_size": args.fov_crop_size,
         "model_size": args.model_size,
+        "phase_spatial_mode": args.phase_spatial_mode,
         "phase_units": args.phase_units,
         "phase_level_max": args.phase_level_max,
         "phase_flip_lr": not args.no_phase_flip_lr,
@@ -2427,6 +2471,7 @@ def main():
         camera_dir=args.camera_dir,
         model_size=args.model_size,
         fov_crop_size=args.fov_crop_size,
+        phase_spatial_mode=args.phase_spatial_mode,
         phase_flip_lr=not args.no_phase_flip_lr,
         phase_units=args.phase_units,
         phase_level_max=args.phase_level_max,
@@ -2446,6 +2491,7 @@ def main():
     cfg["field_amp_scale_actual"] = dataset.field_amp_scale
     cfg["camera_scale_actual"] = dataset.camera_scale
     cfg["z_by_root"] = dataset.z_by_root
+    cfg["phase_shape_info"] = dataset.phase_shape_info
 
     _, _, train_idx, val_idx = split_dataset(
         dataset,
