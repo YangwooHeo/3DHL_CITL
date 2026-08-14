@@ -13,6 +13,11 @@ For every phase_mask_*.npy in MASK_FOLDER:
 
 The on-disk training pool stays as individual .npy files. Only the in-memory
 stack is chunked. The Basler, SLM, and Arduino are opened once for the run.
+
+Optional reference-gain tracking inserts a fixed reference phase immediately
+before every target phase. Reference images are reduced to a robust scalar in
+memory and are not saved. The resulting temporal correction factors are written
+to reference_gain_log.csv.
 """
 
 import os
@@ -167,6 +172,22 @@ STAMP_NAME_ON_IMAGE = True
 # Write a capture_log.csv (index, mask name, output name, min, max, saturated %, OK/FAIL).
 WRITE_CSV_LOG = True
 
+# ---- Optional temporal intensity reference ----
+# When enabled, display and capture this fixed phase mask immediately before
+# every target. The reference frame itself is not saved; only robust intensity
+# metrics and correction gains are appended to REFERENCE_GAIN_CSV_NAME.
+REFERENCE_GAIN_ENABLED = False
+REFERENCE_MASK_PATH = None  # e.g. r'C:\CITL\reference_phase.npy'
+REFERENCE_GAIN_CSV_NAME = 'reference_gain_log.csv'
+
+# The first reference frame defines fixed signal/background pixel regions.
+# Every later frame is measured over those same pixels, avoiding the instability
+# of a single maximum pixel while remaining insensitive to dark image borders.
+REFERENCE_SIGNAL_PERCENTILE = 90.0
+REFERENCE_BACKGROUND_PERCENTILE = 20.0
+REFERENCE_MIN_ROI_PIXELS = 1024
+REFERENCE_MAX_SAT_PCT = 0.5
+
 # Per-file exposure overrides. Key = mask basename, value = pc.pattern kwargs.
 PER_FILE_OVERRIDE = {
     # 'phase_mask_dot.npy': dict(pwm_1=130, duration_ms=3000),
@@ -233,7 +254,56 @@ def build_mask_file_list():
         files = [os.path.join(MASK_FOLDER, name) for name in MASK_FILES_OVERRIDE]
     else:
         files = sorted(glob.glob(os.path.join(MASK_FOLDER, MASK_GLOB)))
-    return [f for f in files if os.path.isfile(f)]
+    files = [f for f in files if os.path.isfile(f)]
+    if REFERENCE_GAIN_ENABLED and REFERENCE_MASK_PATH:
+        reference_path = os.path.normcase(os.path.abspath(REFERENCE_MASK_PATH))
+        files = [f for f in files
+                 if os.path.normcase(os.path.abspath(f)) != reference_path]
+    return files
+
+
+def validate_reference_config():
+    if not REFERENCE_GAIN_ENABLED:
+        return
+    if not REFERENCE_MASK_PATH:
+        raise ValueError('REFERENCE_MASK_PATH is required when REFERENCE_GAIN_ENABLED=True')
+    if not os.path.isfile(REFERENCE_MASK_PATH):
+        raise FileNotFoundError(f'reference phase mask not found: {REFERENCE_MASK_PATH}')
+    if not (0.0 <= REFERENCE_BACKGROUND_PERCENTILE < REFERENCE_SIGNAL_PERCENTILE <= 100.0):
+        raise ValueError(
+            'reference percentiles must satisfy 0 <= background < signal <= 100')
+    if REFERENCE_MIN_ROI_PIXELS < 1:
+        raise ValueError('REFERENCE_MIN_ROI_PIXELS must be positive')
+
+
+def slm_frames_per_target():
+    if REFERENCE_GAIN_ENABLED and not MANUAL_ADVANCE_AFTER_SAVE:
+        return 2
+    return 1
+
+
+def max_target_chunk_size():
+    if not REFERENCE_GAIN_ENABLED:
+        return SLM_MEMORY_CAPACITY
+    if MANUAL_ADVANCE_AFTER_SAVE:
+        return SLM_MEMORY_CAPACITY - 1
+    return SLM_MEMORY_CAPACITY // 2
+
+
+def reference_memory_location(target_offset):
+    if not REFERENCE_GAIN_ENABLED:
+        return None
+    if MANUAL_ADVANCE_AFTER_SAVE:
+        return 1
+    return target_offset * 2 + 1
+
+
+def target_memory_location(target_offset):
+    if REFERENCE_GAIN_ENABLED:
+        if MANUAL_ADVANCE_AFTER_SAVE:
+            return target_offset + 2
+        return target_offset * 2 + 2
+    return target_offset + 1
 
 
 def open_camera():
@@ -303,6 +373,137 @@ def raw_image_stats(img):
     sat_pct = 100.0 * np.count_nonzero(img >= 4091) / img.size
     stats = dict(raw_min=raw_min, raw_max=raw_max, sat_pct=sat_pct)
     return img, stats
+
+
+class ReferenceGainTracker:
+    """Reduce reference frames to a stable scalar and append one CSV row per target."""
+
+    CSV_FIELDS = [
+        'index', 'chunk', 'mask_name', 'reference_name', 'captured_at',
+        'elapsed_s', 'status', 'reference_metric', 'baseline_metric',
+        'relative_intensity', 'correction_gain', 'background_level',
+        'signal_mean', 'roi_pixels', 'reference_raw_min',
+        'reference_raw_max', 'reference_sat_pct', 'target_status'
+    ]
+
+    def __init__(self, csv_path, reference_path):
+        self.csv_path = csv_path
+        self.reference_path = reference_path
+        self.started_at = time.perf_counter()
+        self.signal_mask = None
+        self.background_mask = None
+        self.baseline_metric = None
+
+        with open(self.csv_path, 'w', newline='') as f:
+            csv.DictWriter(f, fieldnames=self.CSV_FIELDS).writeheader()
+
+    def _initialize_regions(self, raw):
+        flat = raw.reshape(-1)
+        signal_fraction = (100.0 - REFERENCE_SIGNAL_PERCENTILE) / 100.0
+        n_signal = max(REFERENCE_MIN_ROI_PIXELS,
+                       int(np.ceil(flat.size * signal_fraction)))
+        n_signal = min(n_signal, flat.size)
+        n_background = max(
+            1, int(np.ceil(flat.size * REFERENCE_BACKGROUND_PERCENTILE / 100.0)))
+        n_background = min(n_background, flat.size)
+
+        signal_indices = np.argpartition(flat, flat.size - n_signal)[-n_signal:]
+        background_indices = np.argpartition(flat, n_background - 1)[:n_background]
+        signal_mask = np.zeros(flat.size, dtype=bool)
+        background_mask = np.zeros(flat.size, dtype=bool)
+        signal_mask[signal_indices] = True
+        background_mask[background_indices] = True
+        signal_mask = signal_mask.reshape(raw.shape)
+        background_mask = background_mask.reshape(raw.shape)
+
+        self.signal_mask = signal_mask
+        self.background_mask = background_mask
+        _log(
+            f'  reference ROI initialized: signal={np.count_nonzero(signal_mask)} px, '
+            f'background={np.count_nonzero(background_mask)} px')
+
+    def measure(self, img):
+        raw, stats = raw_image_stats(img)
+        if self.signal_mask is None:
+            self._initialize_regions(raw)
+        elif raw.shape != self.signal_mask.shape:
+            raise RuntimeError(
+                f'reference camera shape changed from {self.signal_mask.shape} to {raw.shape}')
+
+        raw_float = raw.astype(np.float32, copy=False)
+        background_level = float(np.median(raw_float[self.background_mask]))
+        signal_mean = float(np.mean(raw_float[self.signal_mask]))
+        metric = signal_mean - background_level
+        if not np.isfinite(metric) or metric <= 0:
+            raise RuntimeError(f'invalid reference metric {metric!r}')
+
+        if self.baseline_metric is None:
+            self.baseline_metric = metric
+            _log(f'  reference baseline initialized: {metric:.6g}')
+
+        relative_intensity = metric / self.baseline_metric
+        correction_gain = self.baseline_metric / metric
+        status = 'SATURATED' if stats['sat_pct'] > REFERENCE_MAX_SAT_PCT else 'OK'
+        return {
+            'captured_at': datetime.now().isoformat(timespec='milliseconds'),
+            'elapsed_s': time.perf_counter() - self.started_at,
+            'status': status,
+            'reference_metric': metric,
+            'baseline_metric': self.baseline_metric,
+            'relative_intensity': relative_intensity,
+            'correction_gain': correction_gain,
+            'background_level': background_level,
+            'signal_mean': signal_mean,
+            'roi_pixels': int(np.count_nonzero(self.signal_mask)),
+            'reference_raw_min': stats['raw_min'],
+            'reference_raw_max': stats['raw_max'],
+            'reference_sat_pct': stats['sat_pct'],
+        }
+
+    def failed_measurement(self, error):
+        return {
+            'captured_at': datetime.now().isoformat(timespec='milliseconds'),
+            'elapsed_s': time.perf_counter() - self.started_at,
+            'status': f'FAIL: {error}',
+        }
+
+    def record(self, idx, chunk_no, mask_path, measurement, target_status):
+        row = {field: '' for field in self.CSV_FIELDS}
+        row.update(measurement)
+        row.update({
+            'index': idx,
+            'chunk': chunk_no,
+            'mask_name': os.path.basename(mask_path),
+            'reference_name': os.path.basename(self.reference_path),
+            'target_status': target_status,
+        })
+        for key in (
+                'elapsed_s', 'reference_metric', 'baseline_metric',
+                'relative_intensity', 'correction_gain', 'background_level',
+                'signal_mean', 'reference_sat_pct'):
+            if row.get(key) != '':
+                row[key] = f'{row[key]:.9g}'
+
+        with open(self.csv_path, 'a', newline='') as f:
+            csv.DictWriter(f, fieldnames=self.CSV_FIELDS).writerow(row)
+
+
+def capture_reference_measurement(cam, tracker):
+    """Capture and measure a reference without retaining or saving its image."""
+    try:
+        measurement = tracker.measure(grab_frame(cam))
+        _log(
+            '  reference -> '
+            f'metric={measurement["reference_metric"]:.6g}  '
+            f'rel={measurement["relative_intensity"]:.6f}  '
+            f'gain={measurement["correction_gain"]:.6f}  '
+            f'sat={measurement["reference_sat_pct"]:.7f}%')
+        if measurement['status'] == 'SATURATED':
+            _log('  !! WARNING reference is saturated; correction gain may be biased')
+        return measurement
+    except Exception as e:
+        _log(f'  reference measurement failed (target capture will continue): {e!r}')
+        return tracker.failed_measurement(repr(e))
 
 
 def save_png(img, out_path, label=None):
@@ -405,8 +606,11 @@ def exposure_params_for_mask(mask_path):
 
 def iter_param_chunks(mask_files, chunk_size):
     """Yield chunks that fit SLM memory and share one exposure parameter set."""
-    if chunk_size < 1 or chunk_size > SLM_MEMORY_CAPACITY:
-        raise ValueError(f'CHUNK_SIZE must be between 1 and {SLM_MEMORY_CAPACITY}')
+    max_targets = max_target_chunk_size()
+    if chunk_size < 1 or chunk_size > max_targets:
+        raise ValueError(
+            f'CHUNK_SIZE must be between 1 and {max_targets} with '
+            f'REFERENCE_GAIN_ENABLED={REFERENCE_GAIN_ENABLED}')
 
     chunk = []
     chunk_params = None
@@ -426,23 +630,26 @@ def iter_param_chunks(mask_files, chunk_size):
 
 
 def build_chunk_mask_stack(chunk_files):
-    """Build one temporary MaskStack from individual .npy mask files."""
+    """Build a stack, optionally ordered as reference,target pairs."""
     masks = []
 
-    if WFC_FILE_PATH is None:
-        for mask_path in chunk_files:
-            ms = hololith.Mask.maskstack.MaskStack(
-                mask_path, wavefront_correction=None, pad_mode='constant')
-            masks.append(ms.master_mask)
-        chunk_array = np.concatenate(masks, axis=2)
-        return hololith.Mask.maskstack.MaskStack(
-            chunk_array, wavefront_correction=None, pad_mode='constant')
-
-    # Preserve the old per-file effective-region behavior when WFC is enabled.
-    for mask_path in chunk_files:
+    def load_mask(mask_path):
         ms = hololith.Mask.maskstack.MaskStack(
             mask_path, wavefront_correction=WFC_FILE_PATH, pad_mode='constant')
-        masks.append(np.atleast_3d(ms.getMaskWithWavefrontCorrection()))
+        if WFC_FILE_PATH is None:
+            return ms.master_mask
+        return np.atleast_3d(ms.getMaskWithWavefrontCorrection())
+
+    reference_mask = load_mask(REFERENCE_MASK_PATH) if REFERENCE_GAIN_ENABLED else None
+
+    if reference_mask is not None and MANUAL_ADVANCE_AFTER_SAVE:
+        masks.append(reference_mask)
+
+    for mask_path in chunk_files:
+        if reference_mask is not None and not MANUAL_ADVANCE_AFTER_SAVE:
+            masks.append(reference_mask)
+        masks.append(load_mask(mask_path))
+
     chunk_array = np.concatenate(masks, axis=2).astype(np.uint16, copy=False)
     return hololith.Mask.maskstack.MaskStack(
         chunk_array, wavefront_correction=None, pad_mode='constant')
@@ -568,8 +775,10 @@ def capture_and_save_mask(cam, mask_path, idx):
     return save_captured_mask(img, mask_path, idx)
 
 
-def run_manual_chunk_capture(pc, cam, chunk_files, frame_params, start_idx):
-    """Display one memory slot, capture, save, then advance only after save."""
+def run_manual_chunk_capture(
+        pc, cam, chunk_files, frame_params, start_idx,
+        chunk_no, reference_tracker=None):
+    """Capture targets manually, optionally measuring a reference before each one."""
     if MANUAL_LASER_TIMING_MODE not in ('per_frame', 'chunk_static', 'run_static'):
         raise ValueError(
             "MANUAL_LASER_TIMING_MODE must be 'per_frame', 'chunk_static', or 'run_static'")
@@ -597,27 +806,48 @@ def run_manual_chunk_capture(pc, cam, chunk_files, frame_params, start_idx):
         for j, mask_path in enumerate(chunk_files):
             idx = start_idx + j
             name = os.path.basename(mask_path)
-            memory_location = j + 1
-
-            _log(f'  display memory {memory_location} -> {name}')
             t_frame = time.perf_counter()
-            t0 = time.perf_counter()
-            pc.slm_ctrl.displayPatternAtMemory(memory_location)
-            t_display = time.perf_counter() - t0
-            t0 = time.perf_counter()
-            if MANUAL_SLM_SETTLE_S > 0:
-                time.sleep(MANUAL_SLM_SETTLE_S)
-            t_slm_settle = time.perf_counter() - t0
-
             laser_on = False
             t_laser_on = 0.0
             t_laser_off = 0.0
+            t_reference = 0.0
+            measurement = None
             try:
-                if MANUAL_LASER_TIMING_MODE == 'per_frame':
+                if REFERENCE_GAIN_ENABLED:
+                    ref_location = reference_memory_location(j)
+                    _log(
+                        f'  display memory {ref_location} -> reference for {name}')
                     t0 = time.perf_counter()
-                    set_laser(pc, pwm_1=frame_params['pwm_1'], pwm_2=0)
-                    t_laser_on = time.perf_counter() - t0
-                    laser_on = True
+                    pc.slm_ctrl.displayPatternAtMemory(ref_location)
+                    if MANUAL_SLM_SETTLE_S > 0:
+                        time.sleep(MANUAL_SLM_SETTLE_S)
+
+                    if MANUAL_LASER_TIMING_MODE == 'per_frame':
+                        t_laser_start = time.perf_counter()
+                        set_laser(pc, pwm_1=frame_params['pwm_1'], pwm_2=0)
+                        t_laser_on = time.perf_counter() - t_laser_start
+                        laser_on = True
+
+                    time.sleep(capture_delay_s)
+                    measurement = capture_reference_measurement(cam, reference_tracker)
+                    t_reference = time.perf_counter() - t0
+
+                memory_location = target_memory_location(j)
+                _log(f'  display memory {memory_location} -> {name}')
+                t0 = time.perf_counter()
+                pc.slm_ctrl.displayPatternAtMemory(memory_location)
+                t_display = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                if MANUAL_SLM_SETTLE_S > 0:
+                    time.sleep(MANUAL_SLM_SETTLE_S)
+                t_slm_settle = time.perf_counter() - t0
+
+                if MANUAL_LASER_TIMING_MODE == 'per_frame':
+                    if not laser_on:
+                        t0 = time.perf_counter()
+                        set_laser(pc, pwm_1=frame_params['pwm_1'], pwm_2=0)
+                        t_laser_on = time.perf_counter() - t0
+                        laser_on = True
 
                 t0 = time.perf_counter()
                 time.sleep(capture_delay_s)
@@ -636,6 +866,9 @@ def run_manual_chunk_capture(pc, cam, chunk_files, frame_params, start_idx):
                 stats = save_captured_mask(img, mask_path, idx=idx)
                 t_save = time.perf_counter() - t0
                 results.append((idx, name, True, stats))
+                if reference_tracker is not None:
+                    reference_tracker.record(
+                        idx, chunk_no, mask_path, measurement, target_status='OK')
                 if PROFILE_TIMING:
                     t_total = time.perf_counter() - t_frame
                     _log(
@@ -643,9 +876,15 @@ def run_manual_chunk_capture(pc, cam, chunk_files, frame_params, start_idx):
                         f'mode={MANUAL_LASER_TIMING_MODE} total={t_total:.3f} '
                         f'display={t_display:.3f} slm_settle={t_slm_settle:.3f} '
                         f'laser_on={t_laser_on:.3f} capture_wait={t_capture_delay:.3f} '
-                        f'grab={t_grab:.3f} laser_off={t_laser_off:.3f} save={t_save:.3f}'
+                        f'grab={t_grab:.3f} laser_off={t_laser_off:.3f} '
+                        f'reference={t_reference:.3f} save={t_save:.3f}'
                     )
-            except Exception:
+            except Exception as e:
+                if reference_tracker is not None:
+                    if measurement is None:
+                        measurement = reference_tracker.failed_measurement(repr(e))
+                    reference_tracker.record(
+                        idx, chunk_no, mask_path, measurement, target_status='FAIL')
                 # Keep the current phase from advancing to the next target if saving failed.
                 if laser_on:
                     set_laser(pc, pwm_1=0, pwm_2=0)
@@ -679,7 +918,9 @@ tm_1 = hololith.Mask.tonemapper.ToneMapper(
 # 4. PER-CHUNK ROUTINE
 # ============================================================
 
-def run_one_chunk(pc, cam, chunk_files, frame_params, chunk_no, total_chunks, start_idx):
+def run_one_chunk(
+        pc, cam, chunk_files, frame_params, chunk_no, total_chunks, start_idx,
+        reference_tracker=None):
     n_frames = len(chunk_files)
     _log(f'===== chunk [{chunk_no}/{total_chunks}] {n_frames} mask(s) =====')
 
@@ -694,13 +935,16 @@ def run_one_chunk(pc, cam, chunk_files, frame_params, chunk_no, total_chunks, st
 
         if MANUAL_ADVANCE_AFTER_SAVE:
             _log('  manual advance mode: next phase waits for capture save success')
-            return run_manual_chunk_capture(pc, cam, chunk_files, frame_params, start_idx)
+            return run_manual_chunk_capture(
+                pc, cam, chunk_files, frame_params, start_idx,
+                chunk_no, reference_tracker=reference_tracker)
 
-        pattern_params, frame_s = chunk_pattern_params(frame_params, n_frames)
+        n_slm_frames = n_frames * slm_frames_per_target()
+        pattern_params, frame_s = chunk_pattern_params(frame_params, n_slm_frames)
         _log(f'  chunk exposure -> pwm_1={pattern_params["pwm_1"]}, '
              f'fps={format_arduino_number(pattern_params["fps"])}, '
              f'total_duration_ms={pattern_params["duration_ms"]}, '
-             f'per_mask_ms={frame_params["duration_ms"]}')
+             f'per_slm_frame_ms={frame_params["duration_ms"]}')
 
         cmd = start_chunk_pattern_nonblocking(pc, pattern_params, wl_first=1)
         t0 = time.perf_counter()
@@ -709,7 +953,19 @@ def run_one_chunk(pc, cam, chunk_files, frame_params, chunk_no, total_chunks, st
         for j, mask_path in enumerate(chunk_files):
             idx = start_idx + j
             name = os.path.basename(mask_path)
-            target_t = t0 + (j + CAPTURE_AT_FRACTION) * frame_s
+            measurement = None
+
+            if REFERENCE_GAIN_ENABLED:
+                reference_t = t0 + (2 * j + CAPTURE_AT_FRACTION) * frame_s
+                wait_s = reference_t - time.perf_counter()
+                if wait_s > 0:
+                    time.sleep(wait_s)
+                measurement = capture_reference_measurement(cam, reference_tracker)
+
+            target_frame_offset = j * slm_frames_per_target()
+            if REFERENCE_GAIN_ENABLED:
+                target_frame_offset += 1
+            target_t = t0 + (target_frame_offset + CAPTURE_AT_FRACTION) * frame_s
             wait_s = target_t - time.perf_counter()
             if wait_s > 0:
                 time.sleep(wait_s)
@@ -717,11 +973,19 @@ def run_one_chunk(pc, cam, chunk_files, frame_params, chunk_no, total_chunks, st
             try:
                 stats = capture_and_save_mask(cam, mask_path, idx=idx)
                 results.append((idx, name, True, stats))
+                if reference_tracker is not None:
+                    reference_tracker.record(
+                        idx, chunk_no, mask_path, measurement, target_status='OK')
             except Exception as e:
                 _log(f'  ERROR on {name}: {e!r}')
                 results.append((idx, name, False, None))
+                if reference_tracker is not None:
+                    if measurement is None:
+                        measurement = reference_tracker.failed_measurement(repr(e))
+                    reference_tracker.record(
+                        idx, chunk_no, mask_path, measurement, target_status='FAIL')
 
-        end_t = t0 + n_frames * frame_s + POST_PATTERN_BUFFER_S
+        end_t = t0 + n_slm_frames * frame_s + POST_PATTERN_BUFFER_S
         wait_s = end_t - time.perf_counter()
         if wait_s > 0:
             time.sleep(wait_s)
@@ -747,6 +1011,7 @@ def run_one_chunk(pc, cam, chunk_files, frame_params, chunk_no, total_chunks, st
 def main():
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
     patch_hololith_timing()
+    validate_reference_config()
 
     mask_files = build_mask_file_list()
     _log(f'{len(mask_files)} mask file(s) queued from {MASK_FOLDER}')
@@ -770,16 +1035,32 @@ def main():
     chunks = list(iter_param_chunks(pending_files, CHUNK_SIZE))
     _log(f'{len(pending_files)} mask(s) pending in {len(chunks)} chunk(s), '
          f'CHUNK_SIZE={CHUNK_SIZE}')
+    if REFERENCE_GAIN_ENABLED:
+        slot_layout = (
+            'one reusable reference slot plus one slot per target'
+            if MANUAL_ADVANCE_AFTER_SAVE else
+            'interleaved reference,target slots')
+        _log(
+            f'Reference gain enabled: {REFERENCE_MASK_PATH} '
+            f'({slot_layout}; reference images are not saved)')
     if not pending_files:
         _log('Nothing pending after skip check.')
 
     cam = None
     pc = None
     run_laser_on = False
+    reference_tracker = None
     t_start = time.time()
 
     try:
         if pending_files:
+            if REFERENCE_GAIN_ENABLED:
+                reference_csv_path = os.path.join(
+                    OUTPUT_FOLDER, REFERENCE_GAIN_CSV_NAME)
+                reference_tracker = ReferenceGainTracker(
+                    reference_csv_path, REFERENCE_MASK_PATH)
+                _log(f'Reference gains will be appended to {reference_csv_path}')
+
             cam = open_camera()
             pc = hololith.main.PatterningControl(
                 config,
@@ -818,7 +1099,8 @@ def main():
             for chunk_no, (chunk_files, params) in enumerate(chunks, start=1):
                 chunk_results = run_one_chunk(
                     pc, cam, chunk_files, frame_params=params,
-                    chunk_no=chunk_no, total_chunks=len(chunks), start_idx=next_idx)
+                    chunk_no=chunk_no, total_chunks=len(chunks), start_idx=next_idx,
+                    reference_tracker=reference_tracker)
                 results.extend(chunk_results)
                 next_idx += len(chunk_files)
 
