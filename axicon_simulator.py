@@ -13,6 +13,22 @@ import mbvam.Geometry.visualize
 np.math = math
 
 
+# Shared physical defaults. Training/calibration scripts import these values so
+# that simulator changes cannot silently leave their forward model out of sync.
+DEFAULT_Z_TARGET_M = 0.006
+DEFAULT_AXICON_GRATING_PITCH_M = 1.396e-6
+DEFAULT_UPSAMPLE_FACTOR = 20
+DEFAULT_PROPAGATION_MEDIUM_INDEX = 1.0
+DEFAULT_AXICON_ANGLE_IN_MEDIUM = False
+DEFAULT_ROI_SIZE = 1024
+DEFAULT_ASM_MARGIN_FACTOR = 5000
+DEFAULT_APPLY_SPATIAL_FILTER = True
+DEFAULT_PHASE_LEVEL_MAX = 1023.0
+DEFAULT_TRANSPOSE_PHASE = True
+DEFAULT_FLIP_PHASE_FIRST_AXIS = True
+DEFAULT_TRANSPOSE_OUTPUT_FIELD = True
+
+
 def load_slm_phase_tensor(phase_path, beam_config, transpose=True,
                           flip_first_axis=True, phase_level_max=1023.0):
     phase_path = Path(phase_path)
@@ -68,7 +84,8 @@ def list_phase_files(phase_directory, pattern):
 
 def propagate_axicon_field(beam, phase_tensor, cone_angle, upsample_factor, h_asm,
                            roi_size, propagation_medium_index,
-                           axicon_angle_in_medium, axicon_transverse_frequency):
+                           axicon_angle_in_medium, axicon_transverse_frequency,
+                           apply_spatial_filter=DEFAULT_APPLY_SPATIAL_FILTER):
     with torch.no_grad():
         return beam.propagateToVolume_Axicon2(
             axicon_angle=cone_angle,
@@ -76,7 +93,7 @@ def propagate_axicon_field(beam, phase_tensor, cone_angle, upsample_factor, h_as
             phase_mask=phase_tensor,
             H_asm=h_asm,
             roi_size=roi_size,
-            apply_spatial_filter=True,
+            apply_spatial_filter=apply_spatial_filter,
             n_medium=propagation_medium_index,
             axicon_angle_in_medium=axicon_angle_in_medium,
             axicon_transverse_frequency=axicon_transverse_frequency,
@@ -543,7 +560,8 @@ if __name__ == "__main__":
     RUN_MODE = "viewer"  # "export_field", "viewer", "fno_viewer", or "fno_batch"
 
     #PHASE_MASK = r"C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment\Proxy_calibration_AltBeam_1image\Epoch_500\Proxy_train_pool\HollowRectangle\slm_phase.npy"
-    PHASE_MASK = r"C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment\Checkerboard_generation\files\phase_mask_pitch2x.npy"
+    #PHASE_MASK = r"C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CITL_Experiment\Checkerboard_generation\files\phase_mask_pitch2x.npy"
+    PHASE_MASK = r"C:\Users\cowgr\Documents\PhD\Research\REVAMP\Holographic\3DHL\CODE\3DHL_CITL\util_funcs\tilted_phase_masks\real_00_baseline_xfreq0.125_amp1.0.npy"
     #PHASE_MASK = r"G:\shared drive\taylorlab\3DHL\CITL\Fourier Neural Operator_Training phase masks\test_hollowsquares\00_baseline.npy"
 
     FNO_CHECKPOINT = r""  # e.g. r"C:\...\05_18_2026_FNO_training\20260525_123456\best.pt"
@@ -553,24 +571,24 @@ if __name__ == "__main__":
 
     SLM_PHASE_DIRECTORY = Path(PHASE_MASK).parent
     PHASE_GLOB = "*.npy"
-    Z_TARGET = 0.01149  # Physical propagation distance in the selected medium [m], 11.49mm for cuvette condition
+    Z_TARGET = DEFAULT_Z_TARGET_M  # Physical propagation distance in the selected medium [m]
     SAVE_DIRECTORY = SLM_PHASE_DIRECTORY / f"electric_fields_z{Z_TARGET * 1000:.1f}mm"
 
-    TRANSPOSE_PHASE = True
-    FLIP_PHASE_FIRST_AXIS = True
-    PHASE_LEVEL_MAX = 1023.0
-    EXPORT_ROI_SIZE = 1024
-    VIEWER_ROI_SIZE = 1024
+    TRANSPOSE_PHASE = DEFAULT_TRANSPOSE_PHASE
+    FLIP_PHASE_FIRST_AXIS = DEFAULT_FLIP_PHASE_FIRST_AXIS
+    PHASE_LEVEL_MAX = DEFAULT_PHASE_LEVEL_MAX
+    EXPORT_ROI_SIZE = DEFAULT_ROI_SIZE
+    VIEWER_ROI_SIZE = DEFAULT_ROI_SIZE
     OVERWRITE_OUTPUTS = True
-    MATCH_VIEWER_ORIENTATION = True
+    MATCH_VIEWER_ORIENTATION = DEFAULT_TRANSPOSE_OUTPUT_FIELD
     SHOW_TRANSFER_FUNCTION_PLOT = RUN_MODE.lower() in {"viewer", "fno_viewer"}
 
     beam_config = build_beam_config()
 
-    axicon_grating_pitch = 1.396e-6
-    upsample_factor = 20
-    propagation_medium_index = 1.471
-    axicon_angle_in_medium = False
+    axicon_grating_pitch = DEFAULT_AXICON_GRATING_PITCH_M
+    upsample_factor = DEFAULT_UPSAMPLE_FACTOR
+    propagation_medium_index = DEFAULT_PROPAGATION_MEDIUM_INDEX
+    axicon_angle_in_medium = DEFAULT_AXICON_ANGLE_IN_MEDIUM
     axicon_transverse_frequency = 1.0 / axicon_grating_pitch
     axicon_na_air_equiv = beam_config.lambda_ * axicon_transverse_frequency
     if axicon_na_air_equiv >= 1.0:
@@ -597,7 +615,7 @@ if __name__ == "__main__":
         axicon_angle=cone_angle,
         axicon_angle_in_medium=axicon_angle_in_medium,
         axicon_transverse_frequency=axicon_transverse_frequency,
-        margin_factor=5000,
+        margin_factor=DEFAULT_ASM_MARGIN_FACTOR,
     )
     print('2. Transfer function computation has been completed')
 
