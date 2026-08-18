@@ -17,6 +17,8 @@ The learned proxy is deliberately low dimensional:
 
 * Zernike coefficients describe SLM-plane wavefront error.
 * A bounded, coarse source map describes smooth illumination non-uniformity.
+* A polar complex transfer correction describes deterministic coherent
+  camera-path aberrations with aggressive radial/azimuthal capacity.
 * A positive log-parameterized scalar describes camera/throughput gain.
 
 The visual data term and grouped train/validation split are shared with the FNO
@@ -272,7 +274,13 @@ class AxiconProxyParameters(nn.Module):
 
     def __init__(self, num_zernike: int = 20,
                  source_grid_shape: tuple[int, int] = (64, 48),
-                 source_max_deviation: float = 0.30) -> None:
+                 source_max_deviation: float = 0.30,
+                 transfer_enabled: bool = True,
+                 transfer_radial_bins: int = 128,
+                 transfer_azimuthal_order: int = 96,
+                 transfer_angular_samples: int = 256,
+                 transfer_max_log_amplitude: float = 1.0,
+                 transfer_max_phase_rad: float = math.pi) -> None:
         super().__init__()
         if num_zernike <= 0:
             raise ValueError("num_zernike must be positive")
@@ -280,12 +288,46 @@ class AxiconProxyParameters(nn.Module):
             raise ValueError("source_grid_shape values must be positive")
         if not 0 <= source_max_deviation < 1:
             raise ValueError("source_max_deviation must be in [0, 1)")
+        if transfer_radial_bins < 2:
+            raise ValueError("transfer_radial_bins must be at least 2")
+        if transfer_azimuthal_order < 0:
+            raise ValueError("transfer_azimuthal_order must be non-negative")
+        minimum_angular_samples = 2 * transfer_azimuthal_order + 1
+        if transfer_angular_samples < minimum_angular_samples:
+            raise ValueError(
+                "transfer_angular_samples must be at least "
+                f"2 * transfer_azimuthal_order + 1 ({minimum_angular_samples})"
+            )
+        if transfer_max_log_amplitude <= 0 or transfer_max_phase_rad <= 0:
+            raise ValueError("transfer amplitude/phase limits must be positive")
         self.zernike_coeffs = nn.Parameter(torch.zeros(num_zernike))
         self.source_latent = nn.Parameter(
             torch.zeros(1, 1, source_grid_shape[0], source_grid_shape[1])
         )
         self.log_camera_scale = nn.Parameter(torch.zeros(()))
         self.source_max_deviation = float(source_max_deviation)
+        self.transfer_enabled = bool(transfer_enabled)
+        self.transfer_radial_bins = int(transfer_radial_bins)
+        self.transfer_azimuthal_order = int(transfer_azimuthal_order)
+        self.transfer_angular_samples = int(transfer_angular_samples)
+        self.transfer_max_log_amplitude = float(transfer_max_log_amplitude)
+        self.transfer_max_phase_rad = float(transfer_max_phase_rad)
+
+        # Real polar Fourier series.  Cosine includes m=0; sine starts at m=1.
+        # All-zero initialization makes the correction exactly C(rho, phi)=1.
+        cos_shape = (self.transfer_radial_bins,
+                     self.transfer_azimuthal_order + 1)
+        sin_shape = (self.transfer_radial_bins,
+                     self.transfer_azimuthal_order)
+        self.transfer_log_amp_cos = nn.Parameter(torch.zeros(cos_shape))
+        self.transfer_log_amp_sin = nn.Parameter(torch.zeros(sin_shape))
+        self.transfer_phase_cos = nn.Parameter(torch.zeros(cos_shape))
+        self.transfer_phase_sin = nn.Parameter(torch.zeros(sin_shape))
+
+        # Coordinate grids and trigonometric bases are deterministic and can be
+        # cached without entering checkpoints/state_dict.
+        self._transfer_basis_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._transfer_grid_cache: dict[tuple, torch.Tensor] = {}
 
     def source_map(self, shape: tuple[int, int]) -> torch.Tensor:
         latent = F.interpolate(
@@ -298,6 +340,162 @@ class AxiconProxyParameters(nn.Module):
 
     def camera_scale(self) -> torch.Tensor:
         return torch.exp(self.log_camera_scale.clamp(-20.0, 20.0))
+
+    def transfer_parameters(self) -> tuple[nn.Parameter, ...]:
+        parameters = (
+            self.transfer_log_amp_cos,
+            self.transfer_log_amp_sin,
+            self.transfer_phase_cos,
+            self.transfer_phase_sin,
+        )
+        return tuple(parameter for parameter in parameters if parameter.numel() > 0)
+
+    def _transfer_angular_basis(self, device: torch.device,
+                                dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (str(device), dtype, self.transfer_azimuthal_order,
+               self.transfer_angular_samples)
+        cached = self._transfer_basis_cache.get(key)
+        if cached is not None:
+            return cached
+        angles = torch.linspace(
+            -math.pi, math.pi, self.transfer_angular_samples + 1,
+            device=device, dtype=dtype,
+        )
+        cos_orders = torch.arange(
+            self.transfer_azimuthal_order + 1, device=device, dtype=dtype
+        )
+        sin_orders = torch.arange(
+            1, self.transfer_azimuthal_order + 1, device=device, dtype=dtype
+        )
+        cos_basis = torch.cos(cos_orders[:, None] * angles[None, :])
+        sin_basis = torch.sin(sin_orders[:, None] * angles[None, :])
+        self._transfer_basis_cache[key] = (cos_basis, sin_basis)
+        return cos_basis, sin_basis
+
+    def transfer_polar_maps(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return bounded log-amplitude and phase on a polar control grid."""
+        dtype = self.transfer_phase_cos.dtype
+        device = self.transfer_phase_cos.device
+        cos_basis, sin_basis = self._transfer_angular_basis(device, dtype)
+
+        raw_log_amp = self.transfer_log_amp_cos @ cos_basis
+        raw_phase = self.transfer_phase_cos @ cos_basis
+        if self.transfer_azimuthal_order > 0:
+            raw_log_amp = raw_log_amp + self.transfer_log_amp_sin @ sin_basis
+            raw_phase = raw_phase + self.transfer_phase_sin @ sin_basis
+
+        log_amp = self.transfer_max_log_amplitude * torch.tanh(raw_log_amp)
+        phase = self.transfer_max_phase_rad * torch.tanh(raw_phase)
+        # Remove the two unidentifiable gauges: global amplitude is represented
+        # by camera_scale and a phase piston cannot change measured intensity.
+        # Mean removal can expand the tanh bounds, so enforce them once more.
+        log_amp = (log_amp - log_amp.mean()).clamp(
+            -self.transfer_max_log_amplitude,
+            self.transfer_max_log_amplitude,
+        )
+        phase = (phase - phase.mean()).clamp(
+            -self.transfer_max_phase_rad,
+            self.transfer_max_phase_rad,
+        )
+        return log_amp, phase
+
+    def _transfer_cartesian_grid(self, shape: tuple[int, int],
+                                 device: torch.device,
+                                 dtype: torch.dtype) -> torch.Tensor:
+        key = (tuple(shape), str(device), dtype)
+        cached = self._transfer_grid_cache.get(key)
+        if cached is not None:
+            return cached
+        height, width = shape
+        fy = torch.fft.fftfreq(height, device=device, dtype=dtype)
+        fx = torch.fft.fftfreq(width, device=device, dtype=dtype)
+        radius = torch.sqrt(fy[:, None].square() + fx[None, :].square())
+        radius_max = torch.sqrt(fy.abs().max().square() + fx.abs().max().square())
+        angle = torch.atan2(fy[:, None], fx[None, :])
+        grid = torch.stack(
+            (angle / math.pi, 2.0 * radius / radius_max.clamp_min(1e-12) - 1.0),
+            dim=-1,
+        ).unsqueeze(0)
+        self._transfer_grid_cache[key] = grid
+        return grid
+
+    def transfer_correction_maps(self, shape: tuple[int, int],
+                                 dtype: torch.dtype | None = None,
+                                 device: torch.device | None = None,
+                                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return complex correction, log-amplitude, and phase on an FFT grid."""
+        dtype = dtype or self.transfer_phase_cos.dtype
+        device = device or self.transfer_phase_cos.device
+        polar_log_amp, polar_phase = self.transfer_polar_maps()
+        polar_log_amp = polar_log_amp.to(device=device, dtype=dtype)
+        polar_phase = polar_phase.to(device=device, dtype=dtype)
+        grid = self._transfer_cartesian_grid(shape, device, dtype)
+
+        def sample(polar_map: torch.Tensor) -> torch.Tensor:
+            return F.grid_sample(
+                polar_map[None, None], grid,
+                mode="bilinear", padding_mode="border", align_corners=True,
+            )[0, 0]
+
+        log_amp = sample(polar_log_amp)
+        phase = sample(polar_phase)
+        log_amp = (log_amp - log_amp.mean()).clamp(
+            -self.transfer_max_log_amplitude,
+            self.transfer_max_log_amplitude,
+        )
+        phase = (phase - phase.mean()).clamp(
+            -self.transfer_max_phase_rad,
+            self.transfer_max_phase_rad,
+        )
+        correction = torch.polar(log_amp.exp(), phase)
+        return correction, log_amp, phase
+
+    def apply_transfer_correction(self, field: torch.Tensor) -> torch.Tensor:
+        """Apply a global coherent camera-domain transfer correction."""
+        if not self.transfer_enabled:
+            return field
+        if field.ndim != 2:
+            raise ValueError(f"transfer correction expects a 2D field; got {field.shape}")
+        correction, _, _ = self.transfer_correction_maps(
+            tuple(field.shape), dtype=field.real.dtype, device=field.device
+        )
+        spectrum = torch.fft.fft2(field, norm="ortho")
+        return torch.fft.ifft2(spectrum * correction, norm="ortho")
+
+    def transfer_regularization_terms(self) -> dict[str, torch.Tensor]:
+        parameters = self.transfer_parameters()
+        coefficient_l2 = sum(parameter.square().mean() for parameter in parameters)
+        radial_smooth = sum(
+            (parameter[1:] - parameter[:-1]).square().mean()
+            for parameter in parameters
+        )
+
+        cos_order = torch.arange(
+            self.transfer_azimuthal_order + 1,
+            device=self.transfer_phase_cos.device,
+            dtype=self.transfer_phase_cos.dtype,
+        )
+        cos_weight = (cos_order / max(self.transfer_azimuthal_order, 1)).square()
+        angular_order = (
+            (self.transfer_log_amp_cos.square() * cos_weight).mean()
+            + (self.transfer_phase_cos.square() * cos_weight).mean()
+        )
+        if self.transfer_azimuthal_order > 0:
+            sin_order = torch.arange(
+                1, self.transfer_azimuthal_order + 1,
+                device=self.transfer_phase_sin.device,
+                dtype=self.transfer_phase_sin.dtype,
+            )
+            sin_weight = (sin_order / self.transfer_azimuthal_order).square()
+            angular_order = angular_order + (
+                (self.transfer_log_amp_sin.square() * sin_weight).mean()
+                + (self.transfer_phase_sin.square() * sin_weight).mean()
+            )
+        return {
+            "transfer_l2": coefficient_l2,
+            "transfer_radial_smooth": radial_smooth,
+            "transfer_angular_order": angular_order,
+        }
 
 
 def base_illumination(beam: HoloBeam) -> torch.Tensor:
@@ -355,7 +553,8 @@ def axicon_forward_proxy(
         axicon_angle_in_medium=axicon_angle_in_medium,
         axicon_transverse_frequency=axicon_transverse_frequency,
     )
-    intensity = volume[:, :, 0].abs().square()
+    field = proxy.apply_transfer_correction(volume[:, :, 0])
+    intensity = field.abs().square()
     if transpose_output:
         intensity = intensity.transpose(0, 1)
     intensity = center_crop_tensor(intensity, fov_crop_size)
@@ -388,15 +587,20 @@ def proxy_regularization(proxy: AxiconProxyParameters,
         + (source[:, 1:] - source[:, :-1]).square().mean()
     )
     zernike_l2 = proxy.zernike_coeffs.square().mean()
+    transfer_terms = proxy.transfer_regularization_terms()
     total = (
         cfg["w_source_prior"] * source_prior
         + cfg["w_source_smooth"] * source_smooth
         + cfg["w_zernike_l2"] * zernike_l2
+        + cfg["w_transfer_l2"] * transfer_terms["transfer_l2"]
+        + cfg["w_transfer_radial_smooth"] * transfer_terms["transfer_radial_smooth"]
+        + cfg["w_transfer_angular_order"] * transfer_terms["transfer_angular_order"]
     )
     return total, {
         "source_prior": source_prior.detach(),
         "source_smooth": source_smooth.detach(),
         "zernike_l2": zernike_l2.detach(),
+        **{name: value.detach() for name, value in transfer_terms.items()},
     }
 
 
@@ -529,14 +733,19 @@ def evaluate_indices(beam, proxy, dataset, indices, base_profile,
 
 def build_optimizer(proxy: AxiconProxyParameters, cfg: dict):
     groups = []
-    for parameter, lr, name in [
-        (proxy.zernike_coeffs, cfg["lr_zernike"], "zernike"),
-        (proxy.source_latent, cfg["lr_source"], "source"),
-        (proxy.log_camera_scale, cfg["lr_scale"], "camera_scale"),
-    ]:
-        parameter.requires_grad_(lr > 0)
+    specifications = [
+        ([proxy.zernike_coeffs], cfg["lr_zernike"], "zernike"),
+        ([proxy.source_latent], cfg["lr_source"], "source"),
+        ([proxy.log_camera_scale], cfg["lr_scale"], "camera_scale"),
+        (list(proxy.transfer_parameters()),
+         cfg["lr_transfer"] if proxy.transfer_enabled else 0.0,
+         "polar_transfer"),
+    ]
+    for parameters, lr, name in specifications:
+        for parameter in parameters:
+            parameter.requires_grad_(lr > 0)
         if lr > 0:
-            groups.append({"params": [parameter], "lr": lr, "name": name})
+            groups.append({"params": parameters, "lr": lr, "name": name})
         else:
             print(f">>> Frozen parameter group: {name}")
     if not groups:
@@ -559,6 +768,10 @@ def checkpoint_payload(proxy, optimizer, epoch, history, cfg, dataset,
         "zernike_coeffs": proxy.zernike_coeffs.detach().cpu(),
         "source_modulation_map": source_map,
         "camera_scale_factor": proxy.camera_scale().detach().cpu(),
+        "transfer_log_amp_cos": proxy.transfer_log_amp_cos.detach().cpu(),
+        "transfer_log_amp_sin": proxy.transfer_log_amp_sin.detach().cpu(),
+        "transfer_phase_cos": proxy.transfer_phase_cos.detach().cpu(),
+        "transfer_phase_sin": proxy.transfer_phase_sin.detach().cpu(),
     }
 
 
@@ -589,23 +802,98 @@ def write_history(history: list[dict], run_dir: Path) -> None:
 
 @torch.no_grad()
 def save_parameter_plots(proxy: AxiconProxyParameters,
-                         source_shape: tuple[int, int], run_dir: Path) -> None:
+                         source_shape: tuple[int, int],
+                         transfer_shape: tuple[int, int],
+                         run_dir: Path) -> None:
     source = proxy.source_map(source_shape).detach().cpu().numpy()
     zernike = proxy.zernike_coeffs.detach().cpu().numpy()
+    correction, log_amp, phase = proxy.transfer_correction_maps(transfer_shape)
+    log_amp_np = torch.fft.fftshift(log_amp).detach().cpu().numpy()
+    phase_np = torch.fft.fftshift(phase).detach().cpu().numpy()
+    residual_kernel = torch.fft.fftshift(
+        torch.fft.ifft2(correction - 1.0, norm="ortho")
+    ).abs().square().detach().cpu().numpy()
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    image = axes[0].imshow(source.T, cmap="RdBu_r", aspect="auto")
-    axes[0].set_title(
+    cos_power = (
+        proxy.transfer_log_amp_cos.detach().square()
+        + proxy.transfer_phase_cos.detach().square()
+    )
+    if proxy.transfer_azimuthal_order > 0:
+        sin_power = (
+            proxy.transfer_log_amp_sin.detach().square()
+            + proxy.transfer_phase_sin.detach().square()
+        )
+        sin_power = F.pad(sin_power, (1, 0))
+        coefficient_power = torch.sqrt(cos_power + sin_power)
+    else:
+        coefficient_power = torch.sqrt(cos_power)
+    coefficient_power_np = coefficient_power.cpu().numpy()
+
+    fig, axes = plt.subplots(2, 3, figsize=(19, 11))
+    image = axes[0, 0].imshow(source.T, cmap="RdBu_r", aspect="auto")
+    axes[0, 0].set_title(
         f"Source modulation (min={source.min():.3f}, max={source.max():.3f})"
     )
-    fig.colorbar(image, ax=axes[0], label="Amplitude multiplier")
-    axes[1].bar(np.arange(len(zernike)), zernike)
-    axes[1].set(xlabel="Zernike index", ylabel="Coefficient (rad)",
-                title=f"Camera scale = {proxy.camera_scale().item():.4g}")
-    axes[1].grid(True, axis="y", alpha=0.3)
+    fig.colorbar(image, ax=axes[0, 0], label="Amplitude multiplier")
+
+    axes[0, 1].bar(np.arange(len(zernike)), zernike)
+    axes[0, 1].set(
+        xlabel="Zernike index", ylabel="Coefficient (rad)",
+        title=f"Camera scale = {proxy.camera_scale().item():.4g}",
+    )
+    axes[0, 1].grid(True, axis="y", alpha=0.3)
+
+    limit = max(float(np.quantile(np.abs(log_amp_np), 0.999)), 1e-6)
+    image = axes[0, 2].imshow(
+        log_amp_np, cmap="RdBu_r", vmin=-limit, vmax=limit,
+    )
+    axes[0, 2].set_title(
+        "Transfer log-amplitude" + ("" if proxy.transfer_enabled else " (disabled)")
+    )
+    axes[0, 2].axis("off")
+    fig.colorbar(image, ax=axes[0, 2], fraction=0.046)
+
+    phase_display_limit = max(float(np.quantile(np.abs(phase_np), 0.999)), 1e-6)
+    image = axes[1, 0].imshow(
+        phase_np,
+        cmap="twilight",
+        vmin=-phase_display_limit,
+        vmax=phase_display_limit,
+    )
+    axes[1, 0].set_title("Transfer phase correction (rad)")
+    axes[1, 0].axis("off")
+    fig.colorbar(image, ax=axes[1, 0], fraction=0.046)
+
+    axes[1, 1].imshow(
+        np.log1p(residual_kernel / max(float(np.quantile(residual_kernel, 0.999)), 1e-12)),
+        cmap="magma",
+    )
+    axes[1, 1].set_title("Coherent residual PSF |IFFT(C-1)|²")
+    axes[1, 1].axis("off")
+
+    image = axes[1, 2].imshow(
+        coefficient_power_np.T, origin="lower", aspect="auto", cmap="viridis",
+    )
+    axes[1, 2].set(
+        xlabel="Radial control bin", ylabel="Azimuthal order m",
+        title="Polar coefficient magnitude",
+    )
+    fig.colorbar(image, ax=axes[1, 2], fraction=0.046)
     fig.tight_layout()
     fig.savefig(run_dir / "learned_proxy_parameters.png", dpi=150)
     plt.close(fig)
+
+    np.savez_compressed(
+        run_dir / "learned_transfer_correction.npz",
+        log_amplitude=log_amp_np.astype(np.float32),
+        phase_rad=phase_np.astype(np.float32),
+        amplitude=np.exp(log_amp_np).astype(np.float32),
+        residual_psf_intensity=residual_kernel.astype(np.float32),
+        log_amp_cos=proxy.transfer_log_amp_cos.detach().cpu().numpy(),
+        log_amp_sin=proxy.transfer_log_amp_sin.detach().cpu().numpy(),
+        phase_cos=proxy.transfer_phase_cos.detach().cpu().numpy(),
+        phase_sin=proxy.transfer_phase_sin.detach().cpu().numpy(),
+    )
 
 
 def quantile_display(array: np.ndarray) -> np.ndarray:
@@ -715,6 +1003,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-grid-x", type=int, default=64)
     parser.add_argument("--source-grid-y", type=int, default=48)
     parser.add_argument("--source-max-deviation", type=float, default=0.30)
+    parser.add_argument(
+        "--transfer-correction", action=argparse.BooleanOptionalAction,
+        default=True,
+        help="learn a coherent polar complex transfer correction on the propagated ROI",
+    )
+    parser.add_argument("--transfer-radial-bins", type=int, default=128)
+    parser.add_argument("--transfer-azimuthal-order", type=int, default=96)
+    parser.add_argument(
+        "--transfer-angular-samples", type=int, default=256,
+        help="polar synthesis samples; must be >= 2*azimuthal_order+1",
+    )
+    parser.add_argument("--transfer-max-log-amplitude", type=float, default=1.0)
+    parser.add_argument("--transfer-max-phase-rad", type=float, default=math.pi)
 
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -722,11 +1023,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr-zernike", type=float, default=2e-2)
     parser.add_argument("--lr-source", type=float, default=1e-2)
     parser.add_argument("--lr-scale", type=float, default=2e-2)
+    parser.add_argument("--lr-transfer", type=float, default=5e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--w-source-prior", type=float, default=1e-2)
     parser.add_argument("--w-source-smooth", type=float, default=1e-3)
     parser.add_argument("--w-zernike-l2", type=float, default=1e-4)
+    parser.add_argument("--w-transfer-l2", type=float, default=1e-5)
+    parser.add_argument("--w-transfer-radial-smooth", type=float, default=1e-5)
+    parser.add_argument("--w-transfer-angular-order", type=float, default=1e-6)
 
     # Same visual objective family as train_fno_axicon.py.
     parser.add_argument("--w-log-display-smooth-l1", type=float, default=0.0)
@@ -796,6 +1101,15 @@ def main() -> None:
         raise ValueError("medium index and axicon grating pitch must be positive")
     if args.fov_crop_size is not None and args.fov_crop_size > args.roi_size:
         raise ValueError("--fov-crop-size cannot exceed --roi-size")
+    if args.transfer_radial_bins < 2 or args.transfer_azimuthal_order < 0:
+        raise ValueError("invalid polar transfer radial/order configuration")
+    if args.transfer_angular_samples < 2 * args.transfer_azimuthal_order + 1:
+        raise ValueError(
+            "--transfer-angular-samples must be >= "
+            "2*--transfer-azimuthal-order+1"
+        )
+    if args.transfer_max_log_amplitude <= 0 or args.transfer_max_phase_rad <= 0:
+        raise ValueError("transfer correction limits must be positive")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -874,6 +1188,14 @@ def main() -> None:
         f"upsample={args.upsample_factor}, ROI={args.roi_size}, "
         f"FOV={args.fov_crop_size}, n={args.propagation_medium_index:.4g}"
     )
+    print(
+        f">>> Polar transfer: enabled={args.transfer_correction}, "
+        f"radial_bins={args.transfer_radial_bins}, "
+        f"azimuthal_order={args.transfer_azimuthal_order}, "
+        f"angular_samples={args.transfer_angular_samples}, "
+        f"max_log_amp={args.transfer_max_log_amplitude:g}, "
+        f"max_phase={args.transfer_max_phase_rad:g} rad"
+    )
 
     beam = HoloBeam(beam_config)
     z_query = torch.tensor([args.z_m], device=device, dtype=beam_config.fdtype)
@@ -900,6 +1222,12 @@ def main() -> None:
         num_zernike=args.num_zernike,
         source_grid_shape=(args.source_grid_x, args.source_grid_y),
         source_max_deviation=args.source_max_deviation,
+        transfer_enabled=args.transfer_correction,
+        transfer_radial_bins=args.transfer_radial_bins,
+        transfer_azimuthal_order=args.transfer_azimuthal_order,
+        transfer_angular_samples=args.transfer_angular_samples,
+        transfer_max_log_amplitude=args.transfer_max_log_amplitude,
+        transfer_max_phase_rad=args.transfer_max_phase_rad,
     ).to(device)
     optimizer = build_optimizer(proxy, cfg)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -909,8 +1237,22 @@ def main() -> None:
     start_epoch = 1
     if args.resume is not None:
         checkpoint = torch_load_checkpoint(args.resume, device)
-        proxy.load_state_dict(checkpoint["parameter_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        incompatible = proxy.load_state_dict(
+            checkpoint["parameter_state_dict"], strict=False
+        )
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            print(
+                ">>> Resume parameter compatibility: "
+                f"missing={incompatible.missing_keys}, "
+                f"unexpected={incompatible.unexpected_keys}"
+            )
+        try:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        except ValueError as error:
+            print(
+                ">>> Optimizer state was not restored because parameter groups "
+                f"changed: {error}"
+            )
         history = list(checkpoint.get("history", []))
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
         print(f">>> Resumed from {args.resume} at epoch {start_epoch}")
@@ -978,7 +1320,12 @@ def main() -> None:
     if best_path.exists():
         best = torch_load_checkpoint(best_path, device)
         proxy.load_state_dict(best["parameter_state_dict"])
-    save_parameter_plots(proxy, tuple(base_profile.shape), run_dir)
+    save_parameter_plots(
+        proxy,
+        tuple(base_profile.shape),
+        (args.roi_size, args.roi_size),
+        run_dir,
+    )
     preview_indices = evenly_spaced(val_indices if val_indices else train_indices,
                                     args.n_vis)
     save_previews(
