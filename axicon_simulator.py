@@ -1,4 +1,5 @@
 import math
+import warnings
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -20,6 +21,12 @@ DEFAULT_AXICON_GRATING_PITCH_M = 1.396e-6
 DEFAULT_UPSAMPLE_FACTOR = 20
 DEFAULT_PROPAGATION_MEDIUM_INDEX = 1.0
 DEFAULT_AXICON_ANGLE_IN_MEDIUM = False
+DEFAULT_AXICON_PROFILE = "binary"
+DEFAULT_AXICON_PHASE_DEPTH_RAD = math.pi
+DEFAULT_AXICON_DUTY_CYCLE = 0.5
+DEFAULT_AXICON_RADIAL_OFFSET = 0.0
+# None selects all theoretically non-negligible propagating/sampled orders.
+DEFAULT_AXICON_DIFFRACTION_ORDERS = None
 DEFAULT_ROI_SIZE = 1024
 DEFAULT_ASM_MARGIN_FACTOR = 5000
 DEFAULT_APPLY_SPATIAL_FILTER = True
@@ -85,7 +92,11 @@ def list_phase_files(phase_directory, pattern):
 def propagate_axicon_field(beam, phase_tensor, cone_angle, upsample_factor, h_asm,
                            roi_size, propagation_medium_index,
                            axicon_angle_in_medium, axicon_transverse_frequency,
-                           apply_spatial_filter=DEFAULT_APPLY_SPATIAL_FILTER):
+                           apply_spatial_filter=DEFAULT_APPLY_SPATIAL_FILTER,
+                           axicon_profile=DEFAULT_AXICON_PROFILE,
+                           axicon_phase_depth=DEFAULT_AXICON_PHASE_DEPTH_RAD,
+                           axicon_duty_cycle=DEFAULT_AXICON_DUTY_CYCLE,
+                           axicon_radial_offset=DEFAULT_AXICON_RADIAL_OFFSET):
     with torch.no_grad():
         return beam.propagateToVolume_Axicon2(
             axicon_angle=cone_angle,
@@ -97,6 +108,10 @@ def propagate_axicon_field(beam, phase_tensor, cone_angle, upsample_factor, h_as
             n_medium=propagation_medium_index,
             axicon_angle_in_medium=axicon_angle_in_medium,
             axicon_transverse_frequency=axicon_transverse_frequency,
+            axicon_profile=axicon_profile,
+            axicon_phase_depth=axicon_phase_depth,
+            axicon_duty_cycle=axicon_duty_cycle,
+            axicon_radial_offset=axicon_radial_offset,
         )
 
 
@@ -281,7 +296,11 @@ def run_fno_proxy_inference(beam, beam_config, phase_path, fno_model, fno_cfg,
                             axicon_transverse_frequency, transpose_phase,
                             flip_phase_first_axis, phase_level_max,
                             transpose_output_field, output_directory,
-                            crop_visualization_to_roi=True, show_plot=False):
+                            crop_visualization_to_roi=True, show_plot=False,
+                            axicon_profile=DEFAULT_AXICON_PROFILE,
+                            axicon_phase_depth=DEFAULT_AXICON_PHASE_DEPTH_RAD,
+                            axicon_duty_cycle=DEFAULT_AXICON_DUTY_CYCLE,
+                            axicon_radial_offset=DEFAULT_AXICON_RADIAL_OFFSET):
     from train_fno_axicon import predict_camera, resize_batch
 
     output_directory = Path(output_directory)
@@ -305,6 +324,10 @@ def run_fno_proxy_inference(beam, beam_config, phase_path, fno_model, fno_cfg,
         propagation_medium_index,
         axicon_angle_in_medium,
         axicon_transverse_frequency,
+        axicon_profile=axicon_profile,
+        axicon_phase_depth=axicon_phase_depth,
+        axicon_duty_cycle=axicon_duty_cycle,
+        axicon_radial_offset=axicon_radial_offset,
     )
     field_channels_raw = field_to_amp_cos_sin(recon_field, transpose_xy=transpose_output_field)
     field_channels = scale_field_channels_for_fno(field_channels_raw, fno_cfg)
@@ -371,12 +394,101 @@ def build_axicon_transfer_function(beam, show_debug_plot, **kwargs):
     return h_asm
 
 
+def validate_axicon_sampling(beam, upsample_factor, propagation_medium_index,
+                             axicon_transverse_frequency,
+                             axicon_profile=DEFAULT_AXICON_PROFILE,
+                             axicon_phase_depth=DEFAULT_AXICON_PHASE_DEPTH_RAD,
+                             axicon_duty_cycle=DEFAULT_AXICON_DUTY_CYCLE,
+                             axicon_diffraction_orders=DEFAULT_AXICON_DIFFRACTION_ORDERS):
+    """Report whether the sampled grid can represent a binary axicon profile.
+
+    The warning threshold of eight samples per period is a practical edge-
+    resolution target, not a change to the physical model. The strict Nyquist
+    requirement for each retained diffraction order is reported separately.
+    """
+    if int(upsample_factor) <= 0:
+        raise ValueError('upsample_factor must be positive.')
+    if float(propagation_medium_index) <= 0:
+        raise ValueError('propagation_medium_index must be positive.')
+
+    profile = beam._normalize_axicon_profile(axicon_profile)
+    radial_frequency = float(axicon_transverse_frequency)
+    if radial_frequency <= 0:
+        raise ValueError('axicon_transverse_frequency must be positive.')
+
+    original_pitch = float(beam.beam_config.psSLM)
+    sampled_pitch = original_pitch / int(upsample_factor)
+    grating_period = 1.0 / radial_frequency
+    samples_per_period = grating_period / sampled_pitch
+    axis_nyquist = 1.0 / (2.0 * sampled_pitch)
+    max_radial_frequency = min(
+        math.sqrt(2.0) * axis_nyquist,
+        float(propagation_medium_index) / float(beam.beam_config.lambda_),
+    )
+    orders = beam._resolve_axicon_diffraction_orders(
+        axicon_profile=profile,
+        radial_frequency=radial_frequency,
+        max_radial_frequency=max_radial_frequency,
+        axicon_phase_depth=axicon_phase_depth,
+        axicon_duty_cycle=axicon_duty_cycle,
+        axicon_diffraction_orders=axicon_diffraction_orders,
+    )
+    clipped_orders = tuple(
+        order for order in orders
+        if order > 0 and order * radial_frequency > axis_nyquist
+    )
+    max_order = max(orders)
+    recommended_samples = 2 * max_order
+    if profile == 'binary':
+        recommended_samples = max(8, recommended_samples)
+    recommended_upsample = max(
+        1, math.ceil(recommended_samples * original_pitch * radial_frequency)
+    )
+
+    print(
+        f"Axicon profile={profile}, phase depth={float(axicon_phase_depth):.4f} rad, "
+        f"duty={float(axicon_duty_cycle):.3f}, samples/period={samples_per_period:.2f}, "
+        f"sparse orders={orders}"
+    )
+    if profile == 'binary' and samples_per_period < 8.0:
+        warnings.warn(
+            f"Binary axicon edges have only {samples_per_period:.2f} samples per "
+            f"full period. Use upsample_factor >= {recommended_upsample} for the "
+            "recommended >=8 samples/period (subject to GPU memory).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if clipped_orders:
+        strict_order_upsample = math.ceil(
+            2 * max(clipped_orders) * original_pitch * radial_frequency
+        )
+        warnings.warn(
+            f"Diffraction order(s) {clipped_orders} exceed the Cartesian-axis "
+            f"Nyquist limit and their rings are clipped. Use upsample_factor >= "
+            f"{strict_order_upsample} to represent the highest order on all axes.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return {
+        'profile': profile,
+        'samples_per_period': samples_per_period,
+        'axis_nyquist': axis_nyquist,
+        'diffraction_orders': orders,
+        'clipped_orders': clipped_orders,
+        'recommended_upsample_factor': recommended_upsample,
+    }
+
+
 def export_electric_fields(beam, beam_config, phase_paths, save_directory,
                            cone_angle, upsample_factor, h_asm, roi_size,
                            propagation_medium_index, axicon_angle_in_medium,
                            axicon_transverse_frequency, transpose_phase,
                            flip_phase_first_axis, phase_level_max,
-                           overwrite_outputs, transpose_output_field):
+                           overwrite_outputs, transpose_output_field,
+                           axicon_profile=DEFAULT_AXICON_PROFILE,
+                           axicon_phase_depth=DEFAULT_AXICON_PHASE_DEPTH_RAD,
+                           axicon_duty_cycle=DEFAULT_AXICON_DUTY_CYCLE,
+                           axicon_radial_offset=DEFAULT_AXICON_RADIAL_OFFSET):
     save_directory = Path(save_directory)
     save_directory.mkdir(parents=True, exist_ok=True)
 
@@ -407,6 +519,10 @@ def export_electric_fields(beam, beam_config, phase_paths, save_directory,
             propagation_medium_index,
             axicon_angle_in_medium,
             axicon_transverse_frequency,
+            axicon_profile=axicon_profile,
+            axicon_phase_depth=axicon_phase_depth,
+            axicon_duty_cycle=axicon_duty_cycle,
+            axicon_radial_offset=axicon_radial_offset,
         )
         field_channels = field_to_amp_cos_sin(recon_field, transpose_xy=transpose_output_field)
         np.save(output_path, field_channels.astype(np.float32, copy=False))
@@ -419,7 +535,11 @@ def export_electric_fields(beam, beam_config, phase_paths, save_directory,
 
 def visualize_kspace_distortion(beam, phase_tensor, cone_angle, upsample_factor,
                                 n_medium=1.0, axicon_angle_in_medium=False,
-                                axicon_transverse_frequency=None):
+                                axicon_transverse_frequency=None,
+                                axicon_profile=DEFAULT_AXICON_PROFILE,
+                                axicon_phase_depth=DEFAULT_AXICON_PHASE_DEPTH_RAD,
+                                axicon_duty_cycle=DEFAULT_AXICON_DUTY_CYCLE,
+                                axicon_radial_offset=DEFAULT_AXICON_RADIAL_OFFSET):
     print("\n--- [K-space Visualization Started] ---")
 
     slm_field = torch.exp(1j * phase_tensor)
@@ -442,7 +562,6 @@ def visualize_kspace_distortion(beam, phase_tensor, cone_angle, upsample_factor,
         axicon_transverse_frequency=axicon_transverse_frequency,
     )
     radial_frequency_value = float(radial_frequency.detach().cpu().item())
-    k_sin_alpha = 2 * torch.pi * radial_frequency
 
     print("  Applying Axicon Phase...")
     chunk_size = 1024
@@ -450,7 +569,15 @@ def visualize_kspace_distortion(beam, phase_tensor, cone_angle, upsample_factor,
         end_idx = min(i + chunk_size, nx_up)
         x2_chunk = x[i:end_idx].view(-1, 1) ** 2
         r_chunk = torch.sqrt(x2_chunk + y2)
-        slm_field_up[i:end_idx] *= torch.exp(-1j * k_sin_alpha * r_chunk)
+        phase_chunk = beam._axicon_phase_from_radius(
+            r_chunk,
+            radial_frequency,
+            axicon_profile=axicon_profile,
+            axicon_phase_depth=axicon_phase_depth,
+            axicon_duty_cycle=axicon_duty_cycle,
+            axicon_radial_offset=axicon_radial_offset,
+        )
+        slm_field_up[i:end_idx] *= torch.exp(1j * phase_chunk)
 
     print("  Calculating FFT2 (GPU)...")
     k_space = torch.fft.fftshift(torch.fft.fft2(slm_field_up, norm="ortho"))
@@ -589,6 +716,11 @@ if __name__ == "__main__":
     upsample_factor = DEFAULT_UPSAMPLE_FACTOR
     propagation_medium_index = DEFAULT_PROPAGATION_MEDIUM_INDEX
     axicon_angle_in_medium = DEFAULT_AXICON_ANGLE_IN_MEDIUM
+    axicon_profile = DEFAULT_AXICON_PROFILE
+    axicon_phase_depth = DEFAULT_AXICON_PHASE_DEPTH_RAD
+    axicon_duty_cycle = DEFAULT_AXICON_DUTY_CYCLE
+    axicon_radial_offset = DEFAULT_AXICON_RADIAL_OFFSET
+    axicon_diffraction_orders = DEFAULT_AXICON_DIFFRACTION_ORDERS
     axicon_transverse_frequency = 1.0 / axicon_grating_pitch
     axicon_na_air_equiv = beam_config.lambda_ * axicon_transverse_frequency
     if axicon_na_air_equiv >= 1.0:
@@ -602,6 +734,16 @@ if __name__ == "__main__":
 
     print('1. Initializing beam')
     beam = HoloBeam(beam_config)
+    validate_axicon_sampling(
+        beam,
+        upsample_factor=upsample_factor,
+        propagation_medium_index=propagation_medium_index,
+        axicon_transverse_frequency=axicon_transverse_frequency,
+        axicon_profile=axicon_profile,
+        axicon_phase_depth=axicon_phase_depth,
+        axicon_duty_cycle=axicon_duty_cycle,
+        axicon_diffraction_orders=axicon_diffraction_orders,
+    )
     z_eval_planes = torch.tensor([Z_TARGET],
                                  device=beam_config.device,
                                  dtype=beam_config.fdtype)
@@ -615,6 +757,10 @@ if __name__ == "__main__":
         axicon_angle=cone_angle,
         axicon_angle_in_medium=axicon_angle_in_medium,
         axicon_transverse_frequency=axicon_transverse_frequency,
+        axicon_profile=axicon_profile,
+        axicon_phase_depth=axicon_phase_depth,
+        axicon_duty_cycle=axicon_duty_cycle,
+        axicon_diffraction_orders=axicon_diffraction_orders,
         margin_factor=DEFAULT_ASM_MARGIN_FACTOR,
     )
     print('2. Transfer function computation has been completed')
@@ -642,6 +788,10 @@ if __name__ == "__main__":
             phase_level_max=PHASE_LEVEL_MAX,
             overwrite_outputs=OVERWRITE_OUTPUTS,
             transpose_output_field=MATCH_VIEWER_ORIENTATION,
+            axicon_profile=axicon_profile,
+            axicon_phase_depth=axicon_phase_depth,
+            axicon_duty_cycle=axicon_duty_cycle,
+            axicon_radial_offset=axicon_radial_offset,
         )
     elif run_mode == "viewer":
         phase_tensor, phase_data = load_slm_phase_tensor(
@@ -672,6 +822,10 @@ if __name__ == "__main__":
             propagation_medium_index,
             axicon_angle_in_medium,
             axicon_transverse_frequency,
+            axicon_profile=axicon_profile,
+            axicon_phase_depth=axicon_phase_depth,
+            axicon_duty_cycle=axicon_duty_cycle,
+            axicon_radial_offset=axicon_radial_offset,
         )
         print('3. Axicon propagation is successfully computed')
         recon_np = recon.detach().cpu().numpy()
@@ -695,6 +849,14 @@ if __name__ == "__main__":
 
         fno_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         fno_model, fno_cfg = load_fno_proxy(FNO_CHECKPOINT, fno_device)
+        trained_profile = fno_cfg.get('axicon_profile', 'continuous')
+        if beam._normalize_axicon_profile(trained_profile) != axicon_profile:
+            warnings.warn(
+                f"FNO checkpoint axicon_profile={trained_profile!r}, but the "
+                f"forward simulator uses {axicon_profile!r}. Regenerate training "
+                "fields/retrain the proxy for quantitatively valid inference.",
+                RuntimeWarning,
+            )
         phase_paths = [Path(PHASE_MASK)] if run_mode == "fno_viewer" else list_phase_files(SLM_PHASE_DIRECTORY, PHASE_GLOB)
 
         print(f"Running FNO proxy inference for {len(phase_paths)} phase mask(s)")
@@ -720,6 +882,10 @@ if __name__ == "__main__":
                 output_directory=FNO_OUTPUT_DIRECTORY,
                 crop_visualization_to_roi=FNO_CROP_VISUALIZATION_TO_ROI,
                 show_plot=FNO_SHOW_SINGLE_PLOT and run_mode == "fno_viewer",
+                axicon_profile=axicon_profile,
+                axicon_phase_depth=axicon_phase_depth,
+                axicon_duty_cycle=axicon_duty_cycle,
+                axicon_radial_offset=axicon_radial_offset,
             )
     else:
         raise ValueError(f"Unsupported RUN_MODE={RUN_MODE!r}. "

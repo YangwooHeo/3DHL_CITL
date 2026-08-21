@@ -65,6 +65,114 @@ class HoloBeam(Beam):
             return n * torch.sin(angle) / self.beam_config.lambda_
         return torch.sin(angle) / self.beam_config.lambda_
 
+    @staticmethod
+    def _normalize_axicon_profile(axicon_profile):
+        profile = str(axicon_profile).strip().lower()
+        aliases = {
+            'continuous': 'continuous',
+            'kinoform': 'continuous',
+            'blazed': 'continuous',
+            'binary': 'binary',
+            'binary_phase': 'binary',
+        }
+        try:
+            return aliases[profile]
+        except KeyError as exc:
+            raise ValueError(
+                "axicon_profile must be 'continuous' (aliases: 'kinoform', "
+                "'blazed') or 'binary' (alias: 'binary_phase')."
+            ) from exc
+
+    @classmethod
+    def _axicon_phase_from_radius(cls, radius, radial_frequency,
+                                  axicon_profile='continuous',
+                                  axicon_phase_depth=math.pi,
+                                  axicon_duty_cycle=0.5,
+                                  axicon_radial_offset=0.0):
+        """Return the physical axicon phase delay on a sampled radial grid.
+
+        ``continuous`` reproduces the original blazed/kinoform transmission
+        exp(-i 2 pi f_r r). ``binary`` uses two phase levels, 0 and
+        -axicon_phase_depth, with a configurable high-zone fraction and radial
+        offset (both expressed within one full grating period).
+        """
+        profile = cls._normalize_axicon_profile(axicon_profile)
+        if not math.isfinite(float(axicon_phase_depth)):
+            raise ValueError('axicon_phase_depth must be finite.')
+        if not 0.0 < float(axicon_duty_cycle) < 1.0:
+            raise ValueError('axicon_duty_cycle must be strictly between 0 and 1.')
+        if not math.isfinite(float(axicon_radial_offset)):
+            raise ValueError('axicon_radial_offset must be finite.')
+
+        radial_frequency = torch.as_tensor(
+            radial_frequency, device=radius.device, dtype=radius.dtype
+        )
+        if torch.any(radial_frequency <= 0):
+            raise ValueError('Axicon radial frequency must be positive.')
+
+        if profile == 'continuous':
+            return -(2 * torch.pi * radial_frequency) * radius
+
+        cycle_position = torch.remainder(
+            radial_frequency * radius + float(axicon_radial_offset), 1.0
+        )
+        low_phase = torch.zeros_like(radius)
+        high_phase = torch.full_like(radius, -float(axicon_phase_depth))
+        return torch.where(
+            cycle_position < float(axicon_duty_cycle), high_phase, low_phase
+        )
+
+    @classmethod
+    def _resolve_axicon_diffraction_orders(cls, axicon_profile,
+                                            radial_frequency,
+                                            max_radial_frequency,
+                                            axicon_phase_depth=math.pi,
+                                            axicon_duty_cycle=0.5,
+                                            axicon_diffraction_orders=None,
+                                            coefficient_threshold=1e-3):
+        """Choose radial diffraction-order bands retained by sparse ASM."""
+        profile = cls._normalize_axicon_profile(axicon_profile)
+        radial_frequency = float(radial_frequency)
+        max_radial_frequency = float(max_radial_frequency)
+        if not math.isfinite(radial_frequency) or radial_frequency <= 0:
+            raise ValueError('radial_frequency must be positive and finite.')
+        if not math.isfinite(max_radial_frequency) or max_radial_frequency < 0:
+            raise ValueError('max_radial_frequency must be non-negative and finite.')
+        if not math.isfinite(float(axicon_phase_depth)):
+            raise ValueError('axicon_phase_depth must be finite.')
+        if not 0.0 < float(axicon_duty_cycle) < 1.0:
+            raise ValueError('axicon_duty_cycle must be strictly between 0 and 1.')
+        if axicon_diffraction_orders is not None:
+            raw_orders = tuple(axicon_diffraction_orders)
+            if any(float(order) != int(order) for order in raw_orders):
+                raise ValueError('axicon_diffraction_orders must contain integers.')
+            orders = tuple(sorted(set(int(order) for order in raw_orders)))
+            if not orders or any(order < 0 for order in orders):
+                raise ValueError(
+                    'axicon_diffraction_orders must contain non-negative integers.'
+                )
+            return orders
+
+        if profile == 'continuous':
+            return (1,)
+
+        # A two-level phase grating has a DC term and integer harmonics. For an
+        # ideal 50%-duty pi grating, the DC/even coefficients vanish and only
+        # odd orders remain. Order 0 is retained anyway so finite-aperture,
+        # sampling, and fabrication-error leakage is not silently discarded.
+        max_order = int(max_radial_frequency // radial_frequency)
+        orders = [0]
+        phase_factor = abs(math.sin(0.5 * float(axicon_phase_depth)))
+        duty_cycle = float(axicon_duty_cycle)
+        for order in range(1, max_order + 1):
+            coefficient = (
+                2.0 * phase_factor * abs(math.sin(math.pi * order * duty_cycle))
+                / (math.pi * order)
+            )
+            if coefficient >= float(coefficient_threshold):
+                orders.append(order)
+        return tuple(orders)
+
     def _get_zernike_phase(self, shape):
         """
         return zernike phase from zernike coefficients
@@ -278,7 +386,11 @@ class HoloBeam(Beam):
     def build_axicon_ASM_TF(self, z_query: torch.Tensor, upsample_factor=8, n_medium=1.0,
                             axicon_angle=None, margin_factor=5,
                             axicon_angle_in_medium=False,
-                            axicon_transverse_frequency=None):
+                            axicon_transverse_frequency=None,
+                            axicon_profile='continuous',
+                            axicon_phase_depth=math.pi,
+                            axicon_duty_cycle=0.5,
+                            axicon_diffraction_orders=None):
         '''
         Real spatial frequency based ASM transfer function with Sparse Ring Masking.
 
@@ -314,15 +426,39 @@ class HoloBeam(Beam):
                 axicon_angle_in_medium=axicon_angle_in_medium,
                 axicon_transverse_frequency=axicon_transverse_frequency,
             )
+            k_ring_radius_value = float(k_ring_radius.detach().cpu().item())
+            max_grid_frequency = math.sqrt(2.0) / (2.0 * ps_up)
+            max_propagating_frequency = n_medium_value / lambda_
+            max_radial_frequency = min(max_grid_frequency, max_propagating_frequency)
+            diffraction_orders = self._resolve_axicon_diffraction_orders(
+                axicon_profile=axicon_profile,
+                radial_frequency=k_ring_radius_value,
+                max_radial_frequency=max_radial_frequency,
+                axicon_phase_depth=axicon_phase_depth,
+                axicon_duty_cycle=axicon_duty_cycle,
+                axicon_diffraction_orders=axicon_diffraction_orders,
+            )
             df = 1.0 / (Nx_orig * ps_orig)
-            ring_mask = torch.abs(KR - k_ring_radius) <= (df * margin_factor)
+            band_half_width = df * margin_factor
+            ring_mask = torch.zeros_like(KR, dtype=torch.bool)
+            for order in diffraction_orders:
+                order_radius = float(order) * k_ring_radius
+                if order == 0:
+                    order_mask = KR <= band_half_width
+                else:
+                    order_mask = torch.abs(KR - order_radius) <= band_half_width
+                ring_mask |= order_mask
+                del order_mask
             
             # visualize ring mask
             import matplotlib.pyplot as plt
             ring_mask_shift = torch.fft.fftshift(ring_mask)
             plt.figure(figsize=(6,6))
             plt.imshow(ring_mask_shift.cpu().numpy(), cmap='gray', origin='lower')
-            plt.title('Ring Mask in Frequency Domain')
+            plt.title(
+                f"Axicon Sparse Mask ({self._normalize_axicon_profile(axicon_profile)}, "
+                f"orders={diffraction_orders})"
+            )
             plt.xlabel('fy index')
             plt.ylabel('fx index')
             plt.colorbar(label='Mask (True=1, False=0)')
@@ -342,7 +478,12 @@ class HoloBeam(Beam):
             H_asm_sparse = H_asm_sparse * valid_mask_sparse
             
             retention = ring_mask.sum().item() / (Nx_up * Ny_up) * 100
-            print(f"[Method B] K-space Sparse Masking Active! Using only {retention:.3f}% of K-space memory. n_medium={n_medium_value:.4g}")
+            print(
+                f"[Method B] K-space Sparse Masking Active! "
+                f"profile={self._normalize_axicon_profile(axicon_profile)}, "
+                f"orders={diffraction_orders}, using {retention:.3f}% of K-space. "
+                f"n_medium={n_medium_value:.4g}"
+            )
             
             # Delete redundant files
             del FX2, FY2, KR, KR_sparse, gamma_sq_sparse, gamma_sparse
@@ -356,6 +497,10 @@ class HoloBeam(Beam):
                 'z_query': z_query.detach(),
                 'axicon_transverse_frequency': float(k_ring_radius.detach().cpu().item()),
                 'axicon_angle_in_medium': axicon_angle_in_medium,
+                'axicon_profile': self._normalize_axicon_profile(axicon_profile),
+                'axicon_diffraction_orders': diffraction_orders,
+                'axicon_phase_depth': float(axicon_phase_depth),
+                'axicon_duty_cycle': float(axicon_duty_cycle),
             }
         else:
             gamma_sq = 1 - (lambda_**2 * KR**2 / n_medium**2)
@@ -437,7 +582,11 @@ class HoloBeam(Beam):
     def propagateToVolume_Axicon(self, axicon_angle: float,  upsample_factor=int,  phase_mask=None, beam_mean_amplitude=None, 
                                  slm_amplitude_profile=None, H_asm=None, convert_to_intensity=False,
                                  n_medium=1.0, axicon_angle_in_medium=False,
-                                 axicon_transverse_frequency=None):
+                                 axicon_transverse_frequency=None,
+                                 axicon_profile='continuous',
+                                 axicon_phase_depth=math.pi,
+                                 axicon_duty_cycle=0.5,
+                                 axicon_radial_offset=0.0):
         '''
         Axicon lens forward propagation
         '''
@@ -487,8 +636,15 @@ class HoloBeam(Beam):
             axicon_transverse_frequency=axicon_transverse_frequency,
         )
 
-        # Axicon phase: exp(-i * 2*pi*f_r*R)
-        axicon_phase_mask = -(2 * torch.pi * radial_frequency) * R
+        # Continuous kinoform or discrete binary axicon phase.
+        axicon_phase_mask = self._axicon_phase_from_radius(
+            R,
+            radial_frequency,
+            axicon_profile=axicon_profile,
+            axicon_phase_depth=axicon_phase_depth,
+            axicon_duty_cycle=axicon_duty_cycle,
+            axicon_radial_offset=axicon_radial_offset,
+        )
         field_after_axicon = slm_field_up * torch.exp(1j * axicon_phase_mask)
 
         # 3. Space to Space True ASM propagation 
@@ -506,9 +662,18 @@ class HoloBeam(Beam):
                                  slm_amplitude_profile=None, H_asm=None, convert_to_intensity=False, roi_size=1000,
                                  apply_spatial_filter=False, n_medium=1.0,
                                  axicon_angle_in_medium=False,
-                                 axicon_transverse_frequency=None):
+                                 axicon_transverse_frequency=None,
+                                 axicon_profile='continuous',
+                                 axicon_phase_depth=math.pi,
+                                 axicon_duty_cycle=0.5,
+                                 axicon_radial_offset=0.0):
         '''
-        Axicon lens forward propagation (ULTIMATE FIX: ROI-only Storage & Slice-by-Slice IFFT)
+        Axicon forward propagation with ROI-only, slice-by-slice ASM storage.
+
+        axicon_profile='continuous' keeps the original blazed/kinoform phase.
+        axicon_profile='binary' applies a two-level radial phase grating and
+        therefore requires an H_asm that retains the desired diffraction
+        orders (build_axicon_ASM_TF handles this when given the same profile).
         '''
         if phase_mask is None: phase_mask = self.phase_mask_iter
         if beam_mean_amplitude is None: beam_mean_amplitude = self.beam_mean_amplitude_iter
@@ -571,15 +736,20 @@ class HoloBeam(Beam):
                 axicon_angle_in_medium=axicon_angle_in_medium,
                 axicon_transverse_frequency=axicon_transverse_frequency,
             )
-            k_sin_alpha = 2 * torch.pi * radial_frequency
-            
             chunk_size = 1024
             for i in range(0, Nx_up, chunk_size):
                 end_idx = min(i + chunk_size, Nx_up)
                 X2_chunk = x[i:end_idx].view(-1, 1) ** 2
                 
                 R_chunk = torch.sqrt(X2_chunk + Y2)
-                phase_chunk = -k_sin_alpha * R_chunk
+                phase_chunk = self._axicon_phase_from_radius(
+                    R_chunk,
+                    radial_frequency,
+                    axicon_profile=axicon_profile,
+                    axicon_phase_depth=axicon_phase_depth,
+                    axicon_duty_cycle=axicon_duty_cycle,
+                    axicon_radial_offset=axicon_radial_offset,
+                )
                 slm_field_up[i:end_idx] *= torch.exp(1j * phase_chunk)
             
             field_after_axicon = slm_field_up
@@ -958,7 +1128,11 @@ class HoloBeam(Beam):
     def forward_proxy_2D_Axicon(self, slm_phase, axicon_angle=0.0835, upsample_factor=20,
                                 source_profile=None, defocus=0, n_medium=1.0,
                                 axicon_angle_in_medium=False,
-                                axicon_transverse_frequency=None):
+                                axicon_transverse_frequency=None,
+                                axicon_profile='continuous',
+                                axicon_phase_depth=math.pi,
+                                axicon_duty_cycle=0.5,
+                                axicon_radial_offset=0.0):
         """
         Return intensity at a specific focal plane.
         
@@ -989,7 +1163,11 @@ class HoloBeam(Beam):
                                                 roi_size=1600,
                                                 n_medium=n_medium,
                                                 axicon_angle_in_medium=axicon_angle_in_medium,
-                                                axicon_transverse_frequency=axicon_transverse_frequency
+                                                axicon_transverse_frequency=axicon_transverse_frequency,
+                                                axicon_profile=axicon_profile,
+                                                axicon_phase_depth=axicon_phase_depth,
+                                                axicon_duty_cycle=axicon_duty_cycle,
+                                                axicon_radial_offset=axicon_radial_offset,
         )
 
         # get focal plane
