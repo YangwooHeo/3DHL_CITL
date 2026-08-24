@@ -73,6 +73,7 @@ class ReferenceGainTests(unittest.TestCase):
 
     def test_reference_metric_tracks_multiplicative_intensity(self):
         bp = self.bp
+        bp.REFERENCE_REGISTRATION_ENABLED = False
         bp.REFERENCE_SIGNAL_PERCENTILE = 90.0
         bp.REFERENCE_BACKGROUND_PERCENTILE = 20.0
         bp.REFERENCE_MIN_ROI_PIXELS = 100
@@ -96,6 +97,56 @@ class ReferenceGainTests(unittest.TestCase):
                 rows = list(bp.csv.DictReader(f))
             self.assertEqual(rows[0]['mask_name'], 'target.npy')
             self.assertEqual(rows[0]['target_status'], 'OK')
+            self.assertIn('registration_dx_px', rows[0])
+            self.assertIn('registration_dy_px', rows[0])
+
+    def test_translation_is_shift_applied_to_moving_image(self):
+        bp = self.bp
+        bp.REFERENCE_REGISTRATION_SATURATION_THRESHOLD = np.inf
+        bp.REFERENCE_REGISTRATION_DARK_THRESHOLD = -np.inf
+        bp.REFERENCE_REGISTRATION_MASK_DILATE_RADIUS = 0
+        bp.REFERENCE_REGISTRATION_BLUR_SIGMA = 0.0
+        bp.REFERENCE_REGISTRATION_HIGHPASS_SIGMA = 0.0
+        bp.REFERENCE_REGISTRATION_METHOD = 'phasecorr'
+        bp.REFERENCE_REGISTRATION_MAX_EXPECTED_SHIFT = 50.0
+
+        rng = np.random.default_rng(1234)
+        fixed = rng.normal(size=(128, 160))
+        moving = np.roll(fixed, shift=(3, -4), axis=(0, 1))
+        dx, dy = bp.estimate_reference_translation(fixed, moving)
+
+        self.assertAlmostEqual(dx, 4.0, delta=0.15)
+        self.assertAlmostEqual(dy, -3.0, delta=0.15)
+
+    def test_tracker_uses_first_reference_as_registration_anchor(self):
+        bp = self.bp
+        bp.REFERENCE_REGISTRATION_ENABLED = True
+        bp.REFERENCE_REGISTRATION_CHANNEL = 'raw_bayer'
+        bp.REFERENCE_REGISTRATION_SATURATION_THRESHOLD = np.inf
+        bp.REFERENCE_REGISTRATION_DARK_THRESHOLD = -np.inf
+        bp.REFERENCE_REGISTRATION_MASK_DILATE_RADIUS = 0
+        bp.REFERENCE_REGISTRATION_BLUR_SIGMA = 0.0
+        bp.REFERENCE_REGISTRATION_HIGHPASS_SIGMA = 0.0
+        bp.REFERENCE_REGISTRATION_METHOD = 'phasecorr'
+        bp.REFERENCE_REGISTRATION_MAX_EXPECTED_SHIFT = 50.0
+
+        rng = np.random.default_rng(4321)
+        y, x = np.mgrid[:96, :128]
+        envelope = 1200 * np.exp(-((x - 64) ** 2 + (y - 48) ** 2) / (2 * 18 ** 2))
+        anchor = (100 + envelope + rng.integers(0, 100, size=envelope.shape)).astype(
+            np.uint16)
+        moving = np.roll(anchor, shift=(-2, 3), axis=(0, 1))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracker = bp.ReferenceGainTracker(
+                os.path.join(temp_dir, 'registration.csv'), 'reference.npy')
+            first = tracker.measure(anchor)
+            second = tracker.measure(moving)
+
+        self.assertEqual(first['registration_dx_px'], 0.0)
+        self.assertEqual(first['registration_dy_px'], 0.0)
+        self.assertAlmostEqual(second['registration_dx_px'], -3.0, delta=0.2)
+        self.assertAlmostEqual(second['registration_dy_px'], 2.0, delta=0.2)
 
 
 if __name__ == '__main__':

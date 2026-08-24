@@ -188,6 +188,20 @@ REFERENCE_BACKGROUND_PERCENTILE = 20.0
 REFERENCE_MIN_ROI_PIXELS = 1024
 REFERENCE_MAX_SAT_PCT = 0.5
 
+# Anchor-relative translation registration for each captured reference.
+# The first reference is fixed at (0, 0). Later values are the [dx, dy] shift
+# that must be applied to the current reference to align it to that anchor.
+# dx > 0 moves right; dy > 0 moves down. Values are full-resolution pixels.
+REFERENCE_REGISTRATION_ENABLED = True
+REFERENCE_REGISTRATION_CHANNEL = 'blue'  # 'blue', 'gray', or 'raw_bayer'
+REFERENCE_REGISTRATION_SATURATION_THRESHOLD = None  # None -> automatic
+REFERENCE_REGISTRATION_DARK_THRESHOLD = None        # None -> automatic
+REFERENCE_REGISTRATION_MASK_DILATE_RADIUS = 0
+REFERENCE_REGISTRATION_BLUR_SIGMA = 1.0
+REFERENCE_REGISTRATION_HIGHPASS_SIGMA = 0.0
+REFERENCE_REGISTRATION_METHOD = 'gradcorr'  # 'gradcorr' or 'phasecorr'
+REFERENCE_REGISTRATION_MAX_EXPECTED_SHIFT = 50.0
+
 # Per-file exposure overrides. Key = mask basename, value = pc.pattern kwargs.
 PER_FILE_OVERRIDE = {
     # 'phase_mask_dot.npy': dict(pwm_1=130, duration_ms=3000),
@@ -274,6 +288,20 @@ def validate_reference_config():
             'reference percentiles must satisfy 0 <= background < signal <= 100')
     if REFERENCE_MIN_ROI_PIXELS < 1:
         raise ValueError('REFERENCE_MIN_ROI_PIXELS must be positive')
+    if REFERENCE_REGISTRATION_CHANNEL not in ('blue', 'gray', 'raw_bayer'):
+        raise ValueError(
+            "REFERENCE_REGISTRATION_CHANNEL must be 'blue', 'gray', or 'raw_bayer'")
+    if REFERENCE_REGISTRATION_METHOD not in ('gradcorr', 'phasecorr'):
+        raise ValueError(
+            "REFERENCE_REGISTRATION_METHOD must be 'gradcorr' or 'phasecorr'")
+    if REFERENCE_REGISTRATION_MASK_DILATE_RADIUS < 0:
+        raise ValueError('REFERENCE_REGISTRATION_MASK_DILATE_RADIUS cannot be negative')
+    if REFERENCE_REGISTRATION_BLUR_SIGMA < 0:
+        raise ValueError('REFERENCE_REGISTRATION_BLUR_SIGMA cannot be negative')
+    if REFERENCE_REGISTRATION_HIGHPASS_SIGMA < 0:
+        raise ValueError('REFERENCE_REGISTRATION_HIGHPASS_SIGMA cannot be negative')
+    if REFERENCE_REGISTRATION_MAX_EXPECTED_SHIFT <= 0:
+        raise ValueError('REFERENCE_REGISTRATION_MAX_EXPECTED_SHIFT must be positive')
 
 
 def slm_frames_per_target():
@@ -375,6 +403,206 @@ def raw_image_stats(img):
     return img, stats
 
 
+def reference_registration_image(raw):
+    """Convert a Bayer capture to the 2-D intensity image used for registration."""
+    raw = np.asarray(raw, dtype=np.uint16)
+    if REFERENCE_REGISTRATION_CHANNEL == 'raw_bayer':
+        return raw.astype(np.float32)
+
+    bgr = cv2.cvtColor(raw, DEBAYER_CODE)
+    if REFERENCE_REGISTRATION_CHANNEL == 'blue':
+        return bgr[:, :, 0].astype(np.float32)
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+
+def robust_intensity_normalize(image):
+    """MATLAB robustIntensityNormalize equivalent."""
+    image = np.asarray(image, dtype=np.float64).copy()
+    finite = np.isfinite(image)
+    if not np.any(finite):
+        raise RuntimeError('registration image contains no finite values')
+
+    values = image[finite]
+    image[~finite] = np.median(values)
+    image = np.maximum(image - np.percentile(values, 1), 0)
+    image = np.log1p(image)
+    values = image[np.isfinite(image)]
+    low = np.percentile(values, 1)
+    high = np.percentile(values, 99)
+    return np.clip((image - low) / max(high - low, np.finfo(float).eps), 0, 1)
+
+
+def robust_signed_normalize(image):
+    """MATLAB robustSignedNormalize equivalent."""
+    image = np.asarray(image, dtype=np.float64).copy()
+    finite = np.isfinite(image)
+    if not np.any(finite):
+        raise RuntimeError('no finite registration values remain after preprocessing')
+
+    image -= np.median(image[finite])
+    scale = np.percentile(np.abs(image[finite]), 99)
+    image /= max(scale, np.finfo(float).eps)
+    return (np.clip(image, -1, 1) + 1) / 2
+
+
+def cosine_window_2d(shape):
+    rows, cols = shape
+    y = (np.arange(rows, dtype=np.float64) + 0.5) / rows
+    x = (np.arange(cols, dtype=np.float64) + 0.5) / cols
+    return np.outer(np.sin(np.pi * y) ** 2, np.sin(np.pi * x) ** 2)
+
+
+def gaussian_blur(image, sigma):
+    if sigma <= 0:
+        return image
+    kernel_size = int(2 * np.ceil(3 * sigma) + 1)
+    kernel_size = max(3, kernel_size | 1)
+    return cv2.GaussianBlur(
+        np.asarray(image, dtype=np.float32),
+        (kernel_size, kernel_size), sigmaX=float(sigma),
+        borderType=cv2.BORDER_REPLICATE).astype(np.float64)
+
+
+def fill_invalid_regions(image, invalid_mask):
+    """Smoothly fill invalid regions, analogous to MATLAB regionfill."""
+    if not np.any(invalid_mask) or not np.any(~invalid_mask):
+        return image
+    if hasattr(cv2, 'inpaint'):
+        return cv2.inpaint(
+            np.asarray(image, dtype=np.float32),
+            invalid_mask.astype(np.uint8), 3.0, cv2.INPAINT_TELEA).astype(np.float64)
+
+    filled = np.asarray(image, dtype=np.float64).copy()
+    filled[invalid_mask] = np.median(filled[~invalid_mask])
+    return filled
+
+
+def dilate_invalid_mask(invalid_mask, radius):
+    radius = int(round(radius))
+    if radius <= 0:
+        return invalid_mask
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+    return cv2.dilate(invalid_mask.astype(np.uint8), kernel).astype(bool)
+
+
+def numpy_phase_correlation(moving, fixed):
+    """Fallback phase correlation; returns the shift applied to moving."""
+    moving = np.asarray(moving, dtype=np.float64)
+    fixed = np.asarray(fixed, dtype=np.float64)
+    moving = moving - np.mean(moving)
+    fixed = fixed - np.mean(fixed)
+
+    cross_power = np.fft.fft2(fixed) * np.conj(np.fft.fft2(moving))
+    magnitude = np.abs(cross_power)
+    valid = magnitude > np.finfo(float).eps
+    if not np.any(valid):
+        raise RuntimeError('registration correlation is undefined for constant images')
+    cross_power[valid] /= magnitude[valid]
+    cross_power[~valid] = 0
+    correlation = np.fft.ifft2(cross_power).real
+    peak_row, peak_col = np.unravel_index(np.argmax(correlation), correlation.shape)
+
+    def subpixel_peak(values, index):
+        previous = values[(index - 1) % values.size]
+        center = values[index]
+        following = values[(index + 1) % values.size]
+        denominator = previous - 2 * center + following
+        if abs(denominator) <= np.finfo(float).eps:
+            return 0.0
+        return 0.5 * (previous - following) / denominator
+
+    col_profile = correlation[peak_row, :]
+    row_profile = correlation[:, peak_col]
+    shift_x = float(peak_col) + subpixel_peak(col_profile, peak_col)
+    shift_y = float(peak_row) + subpixel_peak(row_profile, peak_row)
+    if shift_x > correlation.shape[1] / 2:
+        shift_x -= correlation.shape[1]
+    if shift_y > correlation.shape[0] / 2:
+        shift_y -= correlation.shape[0]
+    return shift_x, shift_y
+
+
+def phase_correlation_shift(moving, fixed):
+    """Return [dx, dy] that aligns moving to fixed."""
+    if hasattr(cv2, 'phaseCorrelate'):
+        # OpenCV reports the displacement from src1 to src2, so moving is src1.
+        shift, _ = cv2.phaseCorrelate(
+            np.ascontiguousarray(moving, dtype=np.float32),
+            np.ascontiguousarray(fixed, dtype=np.float32))
+        return float(shift[0]), float(shift[1])
+    return numpy_phase_correlation(moving, fixed)
+
+
+def estimate_reference_translation(fixed_image, moving_image):
+    """MATLAB-style robust translation registration of moving to fixed."""
+    fixed = np.asarray(fixed_image, dtype=np.float64)
+    moving = np.asarray(moving_image, dtype=np.float64)
+    if fixed.ndim != 2 or moving.ndim != 2 or fixed.shape != moving.shape:
+        raise ValueError('registration images must be same-sized 2-D arrays')
+
+    finite_fixed = np.isfinite(fixed)
+    finite_moving = np.isfinite(moving)
+    if not np.any(finite_fixed) or not np.any(finite_moving):
+        raise RuntimeError('one or both registration images contain no finite values')
+
+    fixed_values = fixed[finite_fixed]
+    moving_values = moving[finite_moving]
+    saturation_threshold = REFERENCE_REGISTRATION_SATURATION_THRESHOLD
+    if saturation_threshold is None:
+        fixed_range = float(np.max(fixed_values) - np.min(fixed_values))
+        saturation_threshold = float(np.max(fixed_values) - 0.005 * fixed_range)
+    dark_threshold = REFERENCE_REGISTRATION_DARK_THRESHOLD
+    if dark_threshold is None:
+        moving_range = float(np.max(moving_values) - np.min(moving_values))
+        dark_threshold = float(np.min(moving_values) + 0.01 * moving_range)
+
+    invalid = (~finite_fixed | (fixed >= saturation_threshold) |
+               ~finite_moving | (moving <= dark_threshold))
+    invalid = dilate_invalid_mask(
+        invalid, REFERENCE_REGISTRATION_MASK_DILATE_RADIUS)
+    valid_fraction = 1.0 - np.count_nonzero(invalid) / invalid.size
+    if valid_fraction < 0.1:
+        _log(
+            f'  !! WARNING only {100 * valid_fraction:.2f}% of reference pixels '
+            'remain valid for registration')
+
+    fixed_registration = robust_intensity_normalize(fixed)
+    moving_registration = robust_intensity_normalize(moving)
+    fixed_registration = fill_invalid_regions(fixed_registration, invalid)
+    moving_registration = fill_invalid_regions(moving_registration, invalid)
+
+    fixed_registration = gaussian_blur(
+        fixed_registration, REFERENCE_REGISTRATION_BLUR_SIGMA)
+    moving_registration = gaussian_blur(
+        moving_registration, REFERENCE_REGISTRATION_BLUR_SIGMA)
+    if REFERENCE_REGISTRATION_HIGHPASS_SIGMA > 0:
+        fixed_registration -= gaussian_blur(
+            fixed_registration, REFERENCE_REGISTRATION_HIGHPASS_SIGMA)
+        moving_registration -= gaussian_blur(
+            moving_registration, REFERENCE_REGISTRATION_HIGHPASS_SIGMA)
+
+    fixed_registration = robust_signed_normalize(fixed_registration)
+    moving_registration = robust_signed_normalize(moving_registration)
+    edge_window = cosine_window_2d(fixed.shape)
+    fixed_registration *= edge_window
+    moving_registration *= edge_window
+
+    if REFERENCE_REGISTRATION_METHOD == 'gradcorr':
+        fixed_gy, fixed_gx = np.gradient(fixed_registration)
+        moving_gy, moving_gx = np.gradient(moving_registration)
+        fixed_registration = np.hypot(fixed_gx, fixed_gy)
+        moving_registration = np.hypot(moving_gx, moving_gy)
+
+    dx, dy = phase_correlation_shift(moving_registration, fixed_registration)
+    if (abs(dx) > REFERENCE_REGISTRATION_MAX_EXPECTED_SHIFT or
+            abs(dy) > REFERENCE_REGISTRATION_MAX_EXPECTED_SHIFT):
+        _log(
+            f'  !! WARNING registration shift larger than expected: '
+            f'dx={dx:+.3f}, dy={dy:+.3f} px')
+    return dx, dy
+
+
 class ReferenceGainTracker:
     """Reduce reference frames to a stable scalar and append one CSV row per target."""
 
@@ -383,7 +611,8 @@ class ReferenceGainTracker:
         'elapsed_s', 'status', 'reference_metric', 'baseline_metric',
         'relative_intensity', 'correction_gain', 'background_level',
         'signal_mean', 'roi_pixels', 'reference_raw_min',
-        'reference_raw_max', 'reference_sat_pct', 'target_status'
+        'reference_raw_max', 'reference_sat_pct',
+        'registration_dx_px', 'registration_dy_px', 'target_status'
     ]
 
     def __init__(self, csv_path, reference_path):
@@ -393,6 +622,7 @@ class ReferenceGainTracker:
         self.signal_mask = None
         self.background_mask = None
         self.baseline_metric = None
+        self.anchor_registration_image = None
 
         with open(self.csv_path, 'w', newline='') as f:
             csv.DictWriter(f, fieldnames=self.CSV_FIELDS).writeheader()
@@ -444,6 +674,27 @@ class ReferenceGainTracker:
         relative_intensity = metric / self.baseline_metric
         correction_gain = self.baseline_metric / metric
         status = 'SATURATED' if stats['sat_pct'] > REFERENCE_MAX_SAT_PCT else 'OK'
+
+        registration_dx = ''
+        registration_dy = ''
+        if REFERENCE_REGISTRATION_ENABLED:
+            try:
+                registration_image = reference_registration_image(raw)
+                if self.anchor_registration_image is None:
+                    self.anchor_registration_image = registration_image.copy()
+                    registration_dx = 0.0
+                    registration_dy = 0.0
+                    _log('  reference registration anchor initialized: dx=0, dy=0')
+                else:
+                    registration_dx, registration_dy = estimate_reference_translation(
+                        self.anchor_registration_image, registration_image)
+            except Exception as e:
+                registration_dx = ''
+                registration_dy = ''
+                registration_error = f'REGISTRATION_FAIL: {e!r}'
+                status = registration_error if status == 'OK' else f'{status}; {registration_error}'
+                _log(f'  reference registration failed (gain remains valid): {e!r}')
+
         return {
             'captured_at': datetime.now().isoformat(timespec='milliseconds'),
             'elapsed_s': time.perf_counter() - self.started_at,
@@ -458,6 +709,8 @@ class ReferenceGainTracker:
             'reference_raw_min': stats['raw_min'],
             'reference_raw_max': stats['raw_max'],
             'reference_sat_pct': stats['sat_pct'],
+            'registration_dx_px': registration_dx,
+            'registration_dy_px': registration_dy,
         }
 
     def failed_measurement(self, error):
@@ -480,7 +733,8 @@ class ReferenceGainTracker:
         for key in (
                 'elapsed_s', 'reference_metric', 'baseline_metric',
                 'relative_intensity', 'correction_gain', 'background_level',
-                'signal_mean', 'reference_sat_pct'):
+                'signal_mean', 'reference_sat_pct', 'registration_dx_px',
+                'registration_dy_px'):
             if row.get(key) != '':
                 row[key] = f'{row[key]:.9g}'
 
@@ -492,13 +746,19 @@ def capture_reference_measurement(cam, tracker):
     """Capture and measure a reference without retaining or saving its image."""
     try:
         measurement = tracker.measure(grab_frame(cam))
+        dx = measurement['registration_dx_px']
+        dy = measurement['registration_dy_px']
+        shift_text = (
+            'registration=FAIL' if dx == '' or dy == ''
+            else f'dx={dx:+.4f}px  dy={dy:+.4f}px')
         _log(
             '  reference -> '
             f'metric={measurement["reference_metric"]:.6g}  '
             f'rel={measurement["relative_intensity"]:.6f}  '
             f'gain={measurement["correction_gain"]:.6f}  '
-            f'sat={measurement["reference_sat_pct"]:.7f}%')
-        if measurement['status'] == 'SATURATED':
+            f'sat={measurement["reference_sat_pct"]:.7f}%  '
+            f'{shift_text}')
+        if measurement['status'].startswith('SATURATED'):
             _log('  !! WARNING reference is saturated; correction gain may be biased')
         return measurement
     except Exception as e:
