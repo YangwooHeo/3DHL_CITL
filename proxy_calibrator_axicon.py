@@ -731,6 +731,18 @@ def evaluate_indices(beam, proxy, dataset, indices, base_profile,
     return {name: value / max(len(indices), 1) for name, value in totals.items()}
 
 
+def checkpoint_selection_score(train_metrics: dict[str, float],
+                               val_metrics: dict[str, float],
+                               has_validation: bool,
+                               should_validate: bool) -> float:
+    """Choose the available epoch metric used to update ``best.pt``."""
+    if not has_validation:
+        return float(train_metrics["loss"])
+    if should_validate:
+        return float(val_metrics["loss"])
+    return float("inf")
+
+
 def build_optimizer(proxy: AxiconProxyParameters, cfg: dict):
     groups = []
     specifications = [
@@ -1133,15 +1145,14 @@ def main() -> None:
         scale_sample_pixels=args.scale_sample_pixels,
         seed=args.seed,
     )
+    if len(dataset) < 1:
+        raise RuntimeError("At least one paired sample is required for calibration")
     first = dataset[0]
     print(f">>> First phase shape: {tuple(first['phase'].shape)}")
     print(f">>> First camera shape: {tuple(first['camera'].shape)}")
     if args.dry_run:
         print(">>> Dry run complete: pairing and preprocessing are valid.")
         return
-    if len(dataset) < 2:
-        raise RuntimeError("At least two paired samples are required for train/validation")
-
     _, _, train_indices, val_indices = split_dataset(
         dataset,
         real_train_ratio=args.real_train_ratio,
@@ -1150,13 +1161,16 @@ def main() -> None:
     )
     if not train_indices:
         raise RuntimeError("The configured split produced an empty training set")
-    eval_indices = evenly_spaced(
-        val_indices if val_indices else train_indices,
-        args.val_max_samples,
+    has_validation = bool(val_indices)
+    eval_indices = (
+        evenly_spaced(val_indices, args.val_max_samples)
+        if has_validation else []
     )
+    checkpoint_metric = "val_loss" if has_validation else "train_loss"
 
     cfg = config_from_args(args, device, beam_config)
     cfg["camera_scale_actual"] = dataset.camera_scale
+    cfg["checkpoint_selection_metric"] = checkpoint_metric
     normalized_weights, counts = normalize_group_loss_weights(
         dataset,
         train_indices,
@@ -1177,6 +1191,12 @@ def main() -> None:
             "val": [dataset.samples[i]["id"] for i in val_indices],
             "validation_evaluated": [dataset.samples[i]["id"] for i in eval_indices],
         }, handle, indent=2)
+
+    if not has_validation:
+        print(
+            ">>> Validation split is empty: best.pt and the learning-rate "
+            "scheduler will use epoch train_loss."
+        )
 
     na_air = cfg["axicon_na_air_equiv"]
     if not 0 < na_air < 1:
@@ -1269,15 +1289,20 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
-    best_val = min((row["val_loss"] for row in history
-                    if np.isfinite(row.get("val_loss", float("nan")))),
-                   default=float("inf"))
+    best_score = min(
+        (
+            row[checkpoint_metric]
+            for row in history
+            if np.isfinite(row.get(checkpoint_metric, float("nan")))
+        ),
+        default=float("inf"),
+    )
     for epoch in range(start_epoch, args.epochs + 1):
         train_metrics = train_epoch(
             beam, proxy, train_loader, optimizer, base_profile,
             physics, cfg, device,
         )
-        should_validate = (
+        should_validate = has_validation and (
             epoch == 1 or epoch == args.epochs or epoch % args.val_every == 0
         )
         if should_validate:
@@ -1288,6 +1313,8 @@ def main() -> None:
             scheduler.step(val_metrics["loss"])
         else:
             val_metrics = {"loss": float("nan"), "raw_mse": float("nan")}
+            if not has_validation:
+                scheduler.step(train_metrics["loss"])
 
         row = {
             "epoch": epoch,
@@ -1301,25 +1328,42 @@ def main() -> None:
         }
         history.append(row)
         write_history(history, run_dir)
+        if has_validation:
+            metric_text = f"val={row['val_loss']:.6g}"
+        else:
+            metric_text = "val=n/a, best_by=train"
         print(
             f"Epoch {epoch:03d}: train={row['train_loss']:.6g}, "
-            f"val={row['val_loss']:.6g}, scale={row['camera_scale']:.6g}"
+            f"{metric_text}, scale={row['camera_scale']:.6g}"
         )
 
+        score = checkpoint_selection_score(
+            train_metrics,
+            val_metrics,
+            has_validation,
+            should_validate,
+        )
         payload = checkpoint_payload(
             proxy, optimizer, epoch, history, cfg, dataset,
             train_indices, val_indices, tuple(base_profile.shape),
         )
+        payload["checkpoint_selection_metric"] = checkpoint_metric
+        payload["checkpoint_selection_score"] = (
+            float(score) if np.isfinite(score) else None
+        )
         torch.save(payload, run_dir / "last.pt")
-        score = val_metrics["loss"] if should_validate else float("inf")
-        if score < best_val:
-            best_val = score
+        if np.isfinite(score) and score < best_score:
+            best_score = score
             torch.save(payload, run_dir / "best.pt")
 
     best_path = run_dir / "best.pt"
     if best_path.exists():
         best = torch_load_checkpoint(best_path, device)
         proxy.load_state_dict(best["parameter_state_dict"])
+        print(
+            f">>> Loaded best.pt selected by {checkpoint_metric} "
+            "for final visualizations."
+        )
     save_parameter_plots(
         proxy,
         tuple(base_profile.shape),
