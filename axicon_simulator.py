@@ -134,6 +134,8 @@ def _with_fno_inference_defaults(cfg):
         'field_out_scale_mode': 'field_rms',
         'direct_field_activation': 'tanh',
         'direct_field_noise_std': 0.0,
+        'residual_field_alpha': 1.0,
+        'residual_field_zero_init': False,
         'use_slm_phase': False,
         'slm_phase_weight': 1.0,
         'slm_phase_lowpass_size': None,
@@ -164,7 +166,7 @@ def load_fno_proxy(checkpoint_path, device):
         use_axicon_phase_map=cfg['use_axicon_phase_map'],
         axicon_slope_rad_per_pixel=cfg['axicon_slope_rad_per_pixel'],
     )
-    out_ch = 2 if cfg['prediction_mode'] == 'direct_field' else 1
+    out_ch = 2 if cfg['prediction_mode'] in ('direct_field', 'residual_field') else 1
     model = AxiconFNO2d(
         in_ch=in_ch,
         out_ch=out_ch,

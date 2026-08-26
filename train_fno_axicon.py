@@ -23,7 +23,9 @@ Default model behavior is non-residual:
         -> predicted camera intensity
 
 Set PREDICTION_MODE = 'direct_field' if you want the FNO to generate a complex
-E_out and use |E_out|^2 as the final intensity.
+E_out and use |E_out|^2 as the final intensity. Use 'residual_field' if you
+want the FNO to predict a complex correction added to the simulated field before
+forming intensity.
 """
 
 import csv
@@ -643,6 +645,20 @@ def predict_camera(model, field, phase, cfg, train_noise=False):
         )
         pred = e_out[:, 0:1].pow(2) + e_out[:, 1:2].pow(2)
         field_like = e_out
+    elif cfg['prediction_mode'] == 'residual_field':
+        sim_real, sim_imag = field_to_real_imag(field)
+        delta_e = scale_direct_field(
+            raw, field,
+            field_out_scale=cfg['field_out_scale'],
+            field_out_scale_mode=cfg['field_out_scale_mode'],
+            activation=cfg['direct_field_activation'],
+            noise_std=cfg['direct_field_noise_std'] if train_noise else 0.0,
+        )
+        alpha = float(cfg.get('residual_field_alpha', 1.0))
+        e_real = sim_real + alpha * delta_e[:, 0:1]
+        e_imag = sim_imag + alpha * delta_e[:, 1:2]
+        pred = e_real.pow(2) + e_imag.pow(2)
+        field_like = torch.cat([e_real, e_imag], dim=1)
     else:
         raise ValueError(f"Unknown prediction_mode: {cfg['prediction_mode']}")
 
@@ -1642,7 +1658,7 @@ if __name__ == '__main__':
     CAMERA_BLACK_LEVEL = 0.0
 
     # FNO architecture
-    PREDICTION_MODE = 'intensity'  # 'intensity' or 'direct_field'
+    PREDICTION_MODE = 'intensity'  # 'intensity', 'direct_field', or 'residual_field'
     WIDTH = 12
     INTENSITY_ACTIVATION = 'softplus'
     DEPTH = 3
@@ -1662,11 +1678,14 @@ if __name__ == '__main__':
     USE_AXICON_PHASE_MAP = False
     AXICON_SLOPE_RAD_PER_PIXEL = None  # set if fixed NA/lambda/pixel slope is known
 
-    # Only used when PREDICTION_MODE == 'direct_field'
+    # Used when PREDICTION_MODE is 'direct_field' or 'residual_field'
     FIELD_OUT_SCALE = 4.0
     FIELD_OUT_SCALE_MODE = 'field_rms'
     DIRECT_FIELD_ACTIVATION = 'tanh'
     DIRECT_FIELD_NOISE_STD = 0.05
+    RESIDUAL_FIELD_ALPHA = 1.0
+    # Makes residual_field start as E_pred = E_sim without freezing learning.
+    RESIDUAL_FIELD_ZERO_INIT = True
 
     # Training
     REQUIRE_CUDA = False
@@ -1754,6 +1773,8 @@ if __name__ == '__main__':
         'field_out_scale_mode': FIELD_OUT_SCALE_MODE,
         'direct_field_activation': DIRECT_FIELD_ACTIVATION,
         'direct_field_noise_std': DIRECT_FIELD_NOISE_STD,
+        'residual_field_alpha': RESIDUAL_FIELD_ALPHA,
+        'residual_field_zero_init': RESIDUAL_FIELD_ZERO_INIT,
         'sys_train_ratio': SYS_TRAIN_RATIO,
         'real_train_ratio': REAL_TRAIN_RATIO,
         'batch_size': BATCH_SIZE,
@@ -1863,7 +1884,10 @@ if __name__ == '__main__':
         use_axicon_phase_map=USE_AXICON_PHASE_MAP,
         axicon_slope_rad_per_pixel=AXICON_SLOPE_RAD_PER_PIXEL,
     )
-    out_ch = 2 if PREDICTION_MODE == 'direct_field' else 1
+    field_output_modes = {'direct_field', 'residual_field'}
+    if PREDICTION_MODE not in {'intensity'} | field_output_modes:
+        raise ValueError(f"Unknown PREDICTION_MODE={PREDICTION_MODE!r}")
+    out_ch = 2 if PREDICTION_MODE in field_output_modes else 1
 
     model = AxiconFNO2d(
         in_ch=in_ch,
@@ -1877,6 +1901,9 @@ if __name__ == '__main__':
     if (PREDICTION_MODE == 'intensity' and INTENSITY_ACTIVATION == 'softplus' and
             OUTPUT_BIAS_INIT is not None):
         nn.init.constant_(model.project[-1].bias, float(OUTPUT_BIAS_INIT))
+    if PREDICTION_MODE == 'residual_field' and RESIDUAL_FIELD_ZERO_INIT:
+        nn.init.zeros_(model.project[-1].weight)
+        nn.init.zeros_(model.project[-1].bias)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Input channels: {in_ch}")
     print(f"Model parameters: {n_params / 1e6:.2f} M")
