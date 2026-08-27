@@ -3,8 +3,8 @@ Batch patterning + capture (473 nm only).
 
 For every phase_mask_*.npy in MASK_FOLDER:
     1. Randomize the exposure order to reduce systematic laser-intensity drift.
-    2. Load up to CHUNK_SIZE .npy files into one temporary MaskStack.
-    3. Upload that stack to SLM memory slots 1..N.
+    2. Prepare up to CHUNK_SIZE .npy files as contiguous SLM-ready frames.
+    3. Upload those frames to SLM memory slots 1..N.
     4. Start one long exposure/playback run for the chunk.
     5. Capture one Basler frame per SLM frame and save it as a PNG with the SAME
        basename as the phase mask (phase_mask_dot.npy -> phase_mask_dot.npy
@@ -12,7 +12,7 @@ For every phase_mask_*.npy in MASK_FOLDER:
     6. Upload the next chunk over the same SLM memory slots and continue.
 
 The on-disk training pool stays as individual .npy files. Only the in-memory
-stack is chunked. The Basler, SLM, and Arduino are opened once for the run.
+buffers are chunked. The Basler, SLM, and Arduino are opened once for the run.
 
 Optional reference-gain tracking inserts a fixed reference phase immediately
 before every target phase. Reference images are reduced to a robust scalar in
@@ -120,6 +120,9 @@ CAPTURE_AT_FRACTION = 0.5
 # conservative; raise toward 128 after the timing looks stable.
 CHUNK_SIZE = 60
 SLM_MEMORY_CAPACITY = 128
+SLM_FRAME_HEIGHT = 1200
+SLM_FRAME_WIDTH = 1920
+SLM_PHASE_LEVELS = 1024
 
 # Randomizing exposure order helps decorrelate captures from slow laser drift.
 # Filenames and output paths are unchanged. Set RANDOM_SEED to an int to replay
@@ -128,12 +131,23 @@ RANDOMIZE_ORDER = False
 RANDOM_SEED = None
 
 # The hololith defaults poll SLM readiness at 0.2 Hz, which can add 5 s after a
-# busy response. These patches only affect this script's process.
-FAST_SLM_READY_CHECK_HZ = 20.0
-FAST_SLM_UPLOAD_POLL_S = 0.05
+# busy response. These patches only affect this script's process. The upload
+# poll is intentionally finite: 5 ms removes most polling quantization without
+# hammering the SLM USB controller continuously.
+FAST_SLM_READY_CHECK_HZ = 200.0
+FAST_SLM_UPLOAD_POLL_S = 0.005
+
+# Build C-contiguous, SLM-ready 2-D frames directly. This caches the WFC map,
+# bypasses a mathematically identity tone map, and avoids the legacy 3-D stack
+# concatenation/repacking path. Set False to restore pc.updateDerivedVariables()
+# plus pc.upload() for hardware troubleshooting.
+OPTIMIZED_SLM_PIPELINE = True
+SLM_BYPASS_IDENTITY_TONEMAP = True
+SLM_CHAIN_UPLOADS_WITHOUT_PRECHECK = True
+PROFILE_SLM_UPLOAD_EACH_FRAME = True
 
 # Correctness-first mode: after a chunk is uploaded, each SLM memory slot is
-# displayed manually. The next phase is not displayed until the current PNG
+# displayed manually. The next phase is not displayed until the current output
 # write has succeeded.
 MANUAL_ADVANCE_AFTER_SAVE = True
 MANUAL_SLM_SETTLE_S = 0.30
@@ -233,33 +247,64 @@ def patch_hololith_timing():
         slmcontrol.SLMControl.waitTilReady = fast_wait_til_ready
 
     if FAST_SLM_UPLOAD_POLL_S and FAST_SLM_UPLOAD_POLL_S > 0:
-        def fast_upload_phase_mask(self, mask, memory_location, timeout_s=15):
+        def fast_upload_phase_mask(
+                self, mask, memory_location, timeout_s=15,
+                skip_ready_check=False):
             assert mask.dtype == np.uint16, 'Mask should be of type np.uint16'
             assert 1 <= memory_location <= SLM_MEMORY_CAPACITY, (
                 'memory_location must be within 1 and 128')
 
+            t_total = time.perf_counter()
+            t_pack = time.perf_counter()
             mask_view = np.ascontiguousarray(mask, dtype=np.uint16)
+            pack_s = time.perf_counter() - t_pack
+            expected_shape = (self.HEIGHT, self.WIDTH)
+            if mask_view.shape != expected_shape:
+                raise ValueError(
+                    f'SLM upload frame must have shape {expected_shape}, '
+                    f'got {mask_view.shape}')
             data_ptr = mask_view.ctypes.data_as(ctypes.POINTER(ctypes.c_ushort))
 
-            self.waitTilReady()
-            print(f'Starting the upload of image to memory location {memory_location}')
-            start = time.perf_counter()
+            t_ready = time.perf_counter()
+            if not skip_ready_check:
+                self.waitTilReady()
+            prewait_s = time.perf_counter() - t_ready
+            t_write = time.perf_counter()
             ret = SLMLib.SLM_Ctrl_WriteMI(
                 self.SLM_NUMBER, memory_location, self.WIDTH, self.HEIGHT,
                 ctypes.c_uint(0), data_ptr)
+            write_s = time.perf_counter() - t_write
             if ret != SLMLib.SLM_OK:
                 raise RuntimeError(f'SLM_Ctrl_WriteMI failed with status {ret}')
 
+            polls = 0
+            t_busy = time.perf_counter()
             while SLMLib.SLM_Ctrl_ReadSU(self.SLM_NUMBER) != SLMLib.SLM_OK:
+                polls += 1
                 time.sleep(float(FAST_SLM_UPLOAD_POLL_S))
-                if time.perf_counter() - start > timeout_s:
+                if time.perf_counter() - t_write > timeout_s:
                     raise TimeoutError(
                         f'Timed out after {timeout_s}s uploading memory {memory_location}')
+            busy_s = time.perf_counter() - t_busy
+            total_s = time.perf_counter() - t_total
 
-            print(f'Finished the upload of image to memory location {memory_location} '
-                  f'in time {time.perf_counter() - start :.2f}')
+            if PROFILE_SLM_UPLOAD_EACH_FRAME:
+                print(
+                    f'SLM upload memory={memory_location} total={total_s:.3f}s '
+                    f'pack={pack_s:.3f}s prewait={prewait_s:.3f}s '
+                    f'write={write_s:.3f}s ready_wait={busy_s:.3f}s '
+                    f'polls={polls}')
+            self._last_upload_timing = {
+                'total_s': total_s,
+                'pack_s': pack_s,
+                'prewait_s': prewait_s,
+                'write_s': write_s,
+                'ready_wait_s': busy_s,
+                'polls': polls,
+            }
             return True
 
+        fast_upload_phase_mask._supports_skip_ready_check = True
         slmcontrol.SLMControl.uploadPhaseMask = fast_upload_phase_mask
 
 
@@ -889,8 +934,226 @@ def iter_param_chunks(mask_files, chunk_size):
         yield chunk, chunk_params
 
 
+def load_wavefront_correction(path):
+    """Load one Hololith-format WFC CSV without constructing a MaskStack."""
+    return hololith.Mask.maskstack.MaskStack.readWavefrontCorrectionCSV(path)
+
+
+class SLMFramePreprocessor:
+    """Prepare reusable C-contiguous uint16 frames with one cached WFC map."""
+
+    def __init__(self, wfc_path, tonemapper, frame_shape=None):
+        self.frame_shape = frame_shape or (SLM_FRAME_HEIGHT, SLM_FRAME_WIDTH)
+        self.tonemapper = tonemapper
+        self.wfc_by_input_shape = {}
+        self.cached_frames = {}
+        self.identity_tonemap = self._is_identity_tonemap(tonemapper)
+        self.wfc = None
+
+        if wfc_path is not None:
+            t0 = time.perf_counter()
+            self.wfc = np.asarray(
+                load_wavefront_correction(wfc_path), dtype=np.uint16)
+            if self.wfc.shape != self.frame_shape:
+                raise ValueError(
+                    f'WFC shape must be {self.frame_shape}, got {self.wfc.shape}')
+            self.wfc = np.ascontiguousarray(self.wfc)
+            _log(
+                f'Loaded and cached WFC once: {os.path.basename(wfc_path)} '
+                f'({time.perf_counter() - t0:.3f}s)')
+
+        if self.identity_tonemap and SLM_BYPASS_IDENTITY_TONEMAP:
+            _log('SLM tone map is identity; bypassing full-frame tone mapping')
+
+    @staticmethod
+    def _is_identity_tonemap(tonemapper):
+        if tonemapper is None:
+            return True
+        return (
+            getattr(tonemapper, 'method', None) == 'power_curve' and
+            float(getattr(tonemapper, 'power_curve_max_value', -1)) == 1023.0 and
+            float(getattr(tonemapper, 'power_curve_gamma', -1)) == 1.0
+        )
+
+    @staticmethod
+    def _phase_to_uint16(mask):
+        mask = np.asarray(mask)
+        if mask.ndim == 3 and mask.shape[2] == 1:
+            mask = mask[:, :, 0]
+        if mask.ndim != 2:
+            raise ValueError(
+                f'each phase-mask file must contain one 2-D image, got {mask.shape}')
+
+        if np.issubdtype(mask.dtype, np.integer):
+            return mask.astype(np.uint16, copy=False)
+        if np.issubdtype(mask.dtype, np.floating):
+            normalized = np.mod(mask, 2 * np.pi) / (2 * np.pi)
+            return (normalized * (SLM_PHASE_LEVELS - 1)).astype(np.uint16)
+        raise TypeError(f'unsupported phase-mask dtype {mask.dtype}')
+
+    def _pad_to_slm(self, mask):
+        height, width = mask.shape
+        final_height, final_width = self.frame_shape
+        if height > final_height or width > final_width:
+            raise ValueError(
+                f'phase mask {mask.shape} is larger than SLM {self.frame_shape}')
+        if mask.shape == self.frame_shape:
+            return np.ascontiguousarray(mask, dtype=np.uint16)
+
+        frame = np.zeros(self.frame_shape, dtype=np.uint16)
+        y0 = (final_height - height) // 2
+        x0 = (final_width - width) // 2
+        frame[y0:y0 + height, x0:x0 + width] = mask
+        return frame
+
+    def _wfc_for_input_shape(self, input_shape):
+        if self.wfc is None:
+            return None
+        cached = self.wfc_by_input_shape.get(input_shape)
+        if cached is not None:
+            return cached
+
+        height, width = input_shape
+        final_height, final_width = self.frame_shape
+        y_slice = slice(
+            final_height // 2 - height // 2,
+            final_height // 2 + height // 2)
+        x_slice = slice(
+            final_width // 2 - width // 2,
+            final_width // 2 + width // 2)
+        effective_wfc = np.zeros(self.frame_shape, dtype=np.uint16)
+        effective_wfc[y_slice, x_slice] = self.wfc[y_slice, x_slice]
+        self.wfc_by_input_shape[input_shape] = effective_wfc
+        return effective_wfc
+
+    def prepare_frame(self, mask_path, cache=False):
+        cache_key = os.path.normcase(os.path.abspath(mask_path))
+        if cache and cache_key in self.cached_frames:
+            return self.cached_frames[cache_key], {
+                'load_s': 0.0, 'transform_s': 0.0, 'tonemap_s': 0.0,
+                'total_s': 0.0, 'cache_hit': True,
+            }
+
+        t_total = time.perf_counter()
+        t0 = time.perf_counter()
+        source = np.load(mask_path, allow_pickle=False)
+        load_s = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        phase = self._phase_to_uint16(source)
+        input_shape = phase.shape
+        frame = self._pad_to_slm(phase)
+        effective_wfc = self._wfc_for_input_shape(input_shape)
+        if effective_wfc is not None:
+            np.add(frame, effective_wfc, out=frame)
+            np.remainder(frame, SLM_PHASE_LEVELS, out=frame)
+        transform_s = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        if not (SLM_BYPASS_IDENTITY_TONEMAP and self.identity_tonemap):
+            frame = np.ascontiguousarray(self.tonemapper(frame), dtype=np.uint16)
+        elif not frame.flags.c_contiguous:
+            frame = np.ascontiguousarray(frame, dtype=np.uint16)
+        tonemap_s = time.perf_counter() - t0
+
+        timing = {
+            'load_s': load_s,
+            'transform_s': transform_s,
+            'tonemap_s': tonemap_s,
+            'total_s': time.perf_counter() - t_total,
+            'cache_hit': False,
+        }
+        if cache:
+            self.cached_frames[cache_key] = frame
+        return frame, timing
+
+
+def build_chunk_slm_frames(chunk_files, preprocessor):
+    """Build slot-ordered, individually contiguous SLM frames."""
+    t_total = time.perf_counter()
+    timings = []
+    frames = []
+
+    reference_frame = None
+    if REFERENCE_GAIN_ENABLED:
+        reference_frame, timing = preprocessor.prepare_frame(
+            REFERENCE_MASK_PATH, cache=True)
+        timings.append(timing)
+
+    if reference_frame is not None and MANUAL_ADVANCE_AFTER_SAVE:
+        frames.append(reference_frame)
+
+    for mask_path in chunk_files:
+        if reference_frame is not None and not MANUAL_ADVANCE_AFTER_SAVE:
+            frames.append(reference_frame)
+        frame, timing = preprocessor.prepare_frame(mask_path)
+        frames.append(frame)
+        timings.append(timing)
+
+    if len(frames) > SLM_MEMORY_CAPACITY:
+        raise ValueError(
+            f'prepared {len(frames)} SLM frames but capacity is '
+            f'{SLM_MEMORY_CAPACITY}')
+
+    _log(
+        f'  SLM prepare frames={len(frames)} total={time.perf_counter() - t_total:.3f}s '
+        f'file_load={sum(t["load_s"] for t in timings):.3f}s '
+        f'pad_wfc={sum(t["transform_s"] for t in timings):.3f}s '
+        f'tonemap={sum(t["tonemap_s"] for t in timings):.3f}s '
+        f'cache_hits={sum(bool(t["cache_hit"]) for t in timings)}')
+    return frames
+
+
+def upload_slm_frames(pc, frames):
+    """Upload prepared frames directly, avoiding 3-D slice repacking."""
+    for index, frame in enumerate(frames, start=1):
+        if frame.dtype != np.uint16 or not frame.flags.c_contiguous:
+            raise ValueError(
+                f'SLM frame {index} must be C-contiguous uint16 before upload')
+
+    t_total = time.perf_counter()
+    pc.slm_ctrl.displayConstantValue(phase_integer=0)
+    upload_timings = []
+    upload_method = pc.slm_ctrl.uploadPhaseMask
+    upload_function = getattr(upload_method, '__func__', upload_method)
+    supports_skip_ready = getattr(
+        upload_function, '_supports_skip_ready_check', False)
+    for memory_location, frame in enumerate(frames, start=1):
+        upload_kwargs = {}
+        if (FAST_SLM_UPLOAD_POLL_S and FAST_SLM_UPLOAD_POLL_S > 0 and
+                SLM_CHAIN_UPLOADS_WITHOUT_PRECHECK and memory_location > 1 and
+                supports_skip_ready):
+            upload_kwargs['skip_ready_check'] = True
+        upload_method(
+            mask=frame, memory_location=memory_location, **upload_kwargs)
+        timing = getattr(pc.slm_ctrl, '_last_upload_timing', None)
+        if timing is not None:
+            upload_timings.append(timing.copy())
+
+    t_setup = time.perf_counter()
+    pc.slm_ctrl.resetDisplayOrder(
+        from_idx=1, to_idx_include=len(frames))
+    pc.slm_ctrl.setMemoryPlaybackRange(
+        start_frame_idx=1, end_frame_idx_include=len(frames))
+    pc._resetStartFrame()
+    setup_s = time.perf_counter() - t_setup
+    total_s = time.perf_counter() - t_total
+
+    if upload_timings:
+        _log(
+            f'  SLM upload frames={len(frames)} total={total_s:.3f}s '
+            f'avg={sum(t["total_s"] for t in upload_timings) / len(upload_timings):.3f}s '
+            f'pack={sum(t["pack_s"] for t in upload_timings):.3f}s '
+            f'prewait={sum(t["prewait_s"] for t in upload_timings):.3f}s '
+            f'write={sum(t["write_s"] for t in upload_timings):.3f}s '
+            f'ready_wait={sum(t["ready_wait_s"] for t in upload_timings):.3f}s '
+            f'playback_setup={setup_s:.3f}s')
+    else:
+        _log(f'  SLM upload frames={len(frames)} total={total_s:.3f}s')
+
+
 def build_chunk_mask_stack(chunk_files):
-    """Build a stack, optionally ordered as reference,target pairs."""
+    """Legacy Hololith stack path retained for hardware troubleshooting."""
     masks = []
 
     def load_mask(mask_path):
@@ -1180,18 +1443,34 @@ tm_1 = hololith.Mask.tonemapper.ToneMapper(
 
 def run_one_chunk(
         pc, cam, chunk_files, frame_params, chunk_no, total_chunks, start_idx,
-        reference_tracker=None):
+        reference_tracker=None, slm_preprocessor=None):
     n_frames = len(chunk_files)
     _log(f'===== chunk [{chunk_no}/{total_chunks}] {n_frames} mask(s) =====')
 
     results = []
     try:
-        ms_1 = build_chunk_mask_stack(chunk_files)
-        pc.mask_stack_1 = ms_1
-        pc.mask_stack_2 = None
-        pc.updateDerivedVariables()
+        if OPTIMIZED_SLM_PIPELINE:
+            if slm_preprocessor is None:
+                raise RuntimeError('optimized SLM pipeline requires a preprocessor')
+            slm_frames = build_chunk_slm_frames(
+                chunk_files, slm_preprocessor)
+            upload_slm_frames(pc, slm_frames)
+            del slm_frames
+        else:
+            t_prepare = time.perf_counter()
+            ms_1 = build_chunk_mask_stack(chunk_files)
+            pc.mask_stack_1 = ms_1
+            pc.mask_stack_2 = None
+            pc.updateDerivedVariables()
+            _log(
+                f'  legacy SLM prepare total='
+                f'{time.perf_counter() - t_prepare:.3f}s')
 
-        pc.upload()
+            t_upload = time.perf_counter()
+            pc.upload()
+            _log(
+                f'  legacy SLM upload total='
+                f'{time.perf_counter() - t_upload:.3f}s')
 
         if MANUAL_ADVANCE_AFTER_SAVE:
             _log('  manual advance mode: next phase waits for capture save success')
@@ -1310,6 +1589,7 @@ def main():
     pc = None
     run_laser_on = False
     reference_tracker = None
+    slm_preprocessor = None
     t_start = time.time()
 
     try:
@@ -1333,6 +1613,9 @@ def main():
                 enable_camera_tuple=(),   # hololith's own camera stays off; we drive the Basler ourselves
             )
             pc.open()
+            if OPTIMIZED_SLM_PIPELINE:
+                slm_preprocessor = SLMFramePreprocessor(
+                    WFC_FILE_PATH, tm_1)
             if MANUAL_ADVANCE_AFTER_SAVE:
                 try:
                     _log('Manual mode: disarming Arduino trigger interrupts for direct laser control')
@@ -1360,7 +1643,8 @@ def main():
                 chunk_results = run_one_chunk(
                     pc, cam, chunk_files, frame_params=params,
                     chunk_no=chunk_no, total_chunks=len(chunks), start_idx=next_idx,
-                    reference_tracker=reference_tracker)
+                    reference_tracker=reference_tracker,
+                    slm_preprocessor=slm_preprocessor)
                 results.extend(chunk_results)
                 next_idx += len(chunk_files)
 
