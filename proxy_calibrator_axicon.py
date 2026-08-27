@@ -19,6 +19,8 @@ The learned proxy is deliberately low dimensional:
 * A bounded, coarse source map describes smooth illumination non-uniformity.
 * A polar complex transfer correction describes deterministic coherent
   camera-path aberrations with aggressive radial/azimuthal capacity.
+* A bounded propagation-distance refinement describes a small camera-plane
+  defocus around the simulator's fixed, full-resolution propagation distance.
 * A positive log-parameterized scalar describes camera/throughput gain.
 
 The visual data term and grouped train/validation split are shared with the FNO
@@ -275,6 +277,10 @@ class AxiconProxyParameters(nn.Module):
     def __init__(self, num_zernike: int = 20,
                  source_grid_shape: tuple[int, int] = (64, 48),
                  source_max_deviation: float = 0.30,
+                 z_enabled: bool = False,
+                 z_initial_m: float = DEFAULT_Z_TARGET_M,
+                 z_min_m: float | None = None,
+                 z_max_m: float | None = None,
                  transfer_enabled: bool = True,
                  transfer_radial_bins: int = 128,
                  transfer_azimuthal_order: int = 96,
@@ -300,12 +306,38 @@ class AxiconProxyParameters(nn.Module):
             )
         if transfer_max_log_amplitude <= 0 or transfer_max_phase_rad <= 0:
             raise ValueError("transfer amplitude/phase limits must be positive")
+        if z_min_m is None:
+            z_min_m = z_initial_m - 0.15e-3
+        if z_max_m is None:
+            z_max_m = z_initial_m + 0.15e-3
+        if not 0 < z_min_m < z_initial_m < z_max_m:
+            raise ValueError(
+                "z bounds must satisfy 0 < z_min_m < z_initial_m < z_max_m"
+            )
         self.zernike_coeffs = nn.Parameter(torch.zeros(num_zernike))
         self.source_latent = nn.Parameter(
             torch.zeros(1, 1, source_grid_shape[0], source_grid_shape[1])
         )
         self.log_camera_scale = nn.Parameter(torch.zeros(()))
         self.source_max_deviation = float(source_max_deviation)
+        self.z_enabled = bool(z_enabled)
+        self.register_buffer(
+            "z_initial_m", torch.tensor(float(z_initial_m)), persistent=True
+        )
+        self.register_buffer(
+            "z_min_m", torch.tensor(float(z_min_m)), persistent=True
+        )
+        self.register_buffer(
+            "z_max_m", torch.tensor(float(z_max_m)), persistent=True
+        )
+        normalized_z = (
+            2.0 * (float(z_initial_m) - float(z_min_m))
+            / (float(z_max_m) - float(z_min_m)) - 1.0
+        )
+        normalized_z = min(max(normalized_z, -1.0 + 1e-6), 1.0 - 1e-6)
+        self.z_latent = nn.Parameter(
+            torch.tensor(math.atanh(normalized_z), dtype=torch.float32)
+        )
         self.transfer_enabled = bool(transfer_enabled)
         self.transfer_radial_bins = int(transfer_radial_bins)
         self.transfer_azimuthal_order = int(transfer_azimuthal_order)
@@ -328,6 +360,8 @@ class AxiconProxyParameters(nn.Module):
         # cached without entering checkpoints/state_dict.
         self._transfer_basis_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
         self._transfer_grid_cache: dict[tuple, torch.Tensor] = {}
+        self._propagation_phase_cache: dict[tuple, torch.Tensor] = {}
+        self._detached_z_kernel_cache: dict[tuple, torch.Tensor] = {}
 
     def source_map(self, shape: tuple[int, int]) -> torch.Tensor:
         latent = F.interpolate(
@@ -340,6 +374,21 @@ class AxiconProxyParameters(nn.Module):
 
     def camera_scale(self) -> torch.Tensor:
         return torch.exp(self.log_camera_scale.clamp(-20.0, 20.0))
+
+    def z_position_m(self, use_gradient: bool = True) -> torch.Tensor:
+        """Return a smoothly bounded physical propagation distance in metres."""
+        latent = self.z_latent if use_gradient else self.z_latent.detach()
+        midpoint = 0.5 * (self.z_min_m + self.z_max_m)
+        half_range = 0.5 * (self.z_max_m - self.z_min_m)
+        return midpoint + half_range * torch.tanh(latent)
+
+    def delta_z_m(self, use_gradient: bool = True) -> torch.Tensor:
+        """Return the ROI refinement relative to the full simulator distance."""
+        return self.z_position_m(use_gradient=use_gradient) - self.z_initial_m
+
+    def invalidate_z_kernel_cache(self) -> None:
+        """Discard the detached ROI kernel after a z optimizer update."""
+        self._detached_z_kernel_cache.clear()
 
     def transfer_parameters(self) -> tuple[nn.Parameter, ...]:
         parameters = (
@@ -450,17 +499,108 @@ class AxiconProxyParameters(nn.Module):
         correction = torch.polar(log_amp.exp(), phase)
         return correction, log_amp, phase
 
-    def apply_transfer_correction(self, field: torch.Tensor) -> torch.Tensor:
-        """Apply a global coherent camera-domain transfer correction."""
-        if not self.transfer_enabled:
+    def _propagation_phase_slope(
+        self,
+        shape: tuple[int, int],
+        pixel_size_m: float,
+        wavelength_m: float,
+        propagation_medium_index: float,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[tuple, torch.Tensor]:
+        """Return d(ASM phase)/dz with the unobservable piston removed."""
+        key = (
+            tuple(shape), str(device), dtype, float(pixel_size_m),
+            float(wavelength_m), float(propagation_medium_index),
+        )
+        cached = self._propagation_phase_cache.get(key)
+        if cached is not None:
+            return key, cached
+        height, width = shape
+        fy = torch.fft.fftfreq(
+            height, d=pixel_size_m, device=device, dtype=dtype
+        )
+        fx = torch.fft.fftfreq(
+            width, d=pixel_size_m, device=device, dtype=dtype
+        )
+        scaled_fy = wavelength_m * fy[:, None] / propagation_medium_index
+        scaled_fx = wavelength_m * fx[None, :] / propagation_medium_index
+        gamma_sq = 1.0 - scaled_fy.square() - scaled_fx.square()
+        gamma = torch.sqrt(gamma_sq.clamp_min(0.0))
+        wave_number = (
+            2.0 * math.pi * propagation_medium_index / wavelength_m
+        )
+        phase_slope = wave_number * (gamma - 1.0)
+        # Cropping spreads a little spectral energy outside the physical band.
+        # Leaving that leakage unchanged preserves identity at delta_z=0.
+        phase_slope = torch.where(
+            gamma_sq >= 0.0, phase_slope, torch.zeros_like(phase_slope)
+        )
+        self._propagation_phase_cache[key] = phase_slope
+        return key, phase_slope
+
+    def _z_refinement_kernel(
+        self,
+        shape: tuple[int, int],
+        pixel_size_m: float,
+        wavelength_m: float,
+        propagation_medium_index: float,
+        device: torch.device,
+        dtype: torch.dtype,
+        enable_z_grad: bool,
+    ) -> torch.Tensor:
+        geometry_key, phase_slope = self._propagation_phase_slope(
+            shape,
+            pixel_size_m,
+            wavelength_m,
+            propagation_medium_index,
+            device,
+            dtype,
+        )
+        if enable_z_grad:
+            return torch.exp(1j * phase_slope * self.delta_z_m(True))
+        cached = self._detached_z_kernel_cache.get(geometry_key)
+        if cached is None:
+            cached = torch.exp(1j * phase_slope * self.delta_z_m(False)).detach()
+            self._detached_z_kernel_cache[geometry_key] = cached
+        return cached
+
+    def apply_transfer_correction(
+        self,
+        field: torch.Tensor,
+        *,
+        pixel_size_m: float | None = None,
+        wavelength_m: float | None = None,
+        propagation_medium_index: float = 1.0,
+        enable_z_grad: bool = False,
+    ) -> torch.Tensor:
+        """Apply the learned transfer map and bounded ROI delta-z in one FFT."""
+        if not self.transfer_enabled and not self.z_enabled:
             return field
         if field.ndim != 2:
             raise ValueError(f"transfer correction expects a 2D field; got {field.shape}")
-        correction, _, _ = self.transfer_correction_maps(
-            tuple(field.shape), dtype=field.real.dtype, device=field.device
-        )
+        multiplier = None
+        if self.transfer_enabled:
+            multiplier, _, _ = self.transfer_correction_maps(
+                tuple(field.shape), dtype=field.real.dtype, device=field.device
+            )
+        if self.z_enabled:
+            if pixel_size_m is None or wavelength_m is None:
+                raise ValueError(
+                    "pixel_size_m and wavelength_m are required when z refinement is enabled"
+                )
+            z_kernel = self._z_refinement_kernel(
+                tuple(field.shape),
+                pixel_size_m,
+                wavelength_m,
+                propagation_medium_index,
+                field.device,
+                field.real.dtype,
+                enable_z_grad,
+            )
+            multiplier = z_kernel if multiplier is None else multiplier * z_kernel
         spectrum = torch.fft.fft2(field, norm="ortho")
-        return torch.fft.ifft2(spectrum * correction, norm="ortho")
+        return torch.fft.ifft2(spectrum * multiplier, norm="ortho")
 
     def transfer_regularization_terms(self) -> dict[str, torch.Tensor]:
         parameters = self.transfer_parameters()
@@ -530,6 +670,7 @@ def axicon_forward_proxy(
     fov_crop_size: int | None,
     transpose_output: bool,
     require_grad: bool,
+    enable_z_grad: bool = False,
 ) -> torch.Tensor:
     """Return one camera-domain prediction with simulator-matched propagation."""
     beam.zernike_coeffs = (
@@ -553,7 +694,13 @@ def axicon_forward_proxy(
         axicon_angle_in_medium=axicon_angle_in_medium,
         axicon_transverse_frequency=axicon_transverse_frequency,
     )
-    field = proxy.apply_transfer_correction(volume[:, :, 0])
+    field = proxy.apply_transfer_correction(
+        volume[:, :, 0],
+        pixel_size_m=float(beam.beam_config.psSLM) / upsample_factor,
+        wavelength_m=float(beam.beam_config.lambda_),
+        propagation_medium_index=propagation_medium_index,
+        enable_z_grad=require_grad and enable_z_grad,
+    )
     intensity = field.abs().square()
     if transpose_output:
         intensity = intensity.transpose(0, 1)
@@ -579,7 +726,8 @@ def match_target_shape(prediction: torch.Tensor,
 
 
 def proxy_regularization(proxy: AxiconProxyParameters,
-                         source_shape: tuple[int, int], cfg: dict) -> tuple[torch.Tensor, dict]:
+                         source_shape: tuple[int, int], cfg: dict,
+                         enable_z_grad: bool = True) -> tuple[torch.Tensor, dict]:
     source = proxy.source_map(source_shape)
     source_prior = (source - 1.0).square().mean()
     source_smooth = (
@@ -587,11 +735,17 @@ def proxy_regularization(proxy: AxiconProxyParameters,
         + (source[:, 1:] - source[:, :-1]).square().mean()
     )
     zernike_l2 = proxy.zernike_coeffs.square().mean()
+    z_range = (proxy.z_max_m - proxy.z_min_m).clamp_min(1e-12)
+    z_prior = (
+        (proxy.z_position_m(use_gradient=enable_z_grad) - proxy.z_initial_m)
+        / z_range
+    ).square()
     transfer_terms = proxy.transfer_regularization_terms()
     total = (
         cfg["w_source_prior"] * source_prior
         + cfg["w_source_smooth"] * source_smooth
         + cfg["w_zernike_l2"] * zernike_l2
+        + cfg["w_z_prior"] * z_prior
         + cfg["w_transfer_l2"] * transfer_terms["transfer_l2"]
         + cfg["w_transfer_radial_smooth"] * transfer_terms["transfer_radial_smooth"]
         + cfg["w_transfer_angular_order"] * transfer_terms["transfer_angular_order"]
@@ -600,6 +754,7 @@ def proxy_regularization(proxy: AxiconProxyParameters,
         "source_prior": source_prior.detach(),
         "source_smooth": source_smooth.detach(),
         "zernike_l2": zernike_l2.detach(),
+        "z_prior": z_prior.detach(),
         **{name: value.detach() for name, value in transfer_terms.items()},
     }
 
@@ -625,7 +780,7 @@ def visual_loss(prediction: torch.Tensor, target: torch.Tensor,
 
 
 def make_prediction(beam, proxy, sample, base_profile, physics, cfg,
-                    device, require_grad):
+                    device, require_grad, enable_z_grad=False):
     phase = sample["phase"].to(device)
     target = sample["camera"].to(device)
     if target.ndim == 3:
@@ -650,6 +805,7 @@ def make_prediction(beam, proxy, sample, base_profile, physics, cfg,
         fov_crop_size=cfg["fov_crop_size"],
         transpose_output=cfg["transpose_output"],
         require_grad=require_grad,
+        enable_z_grad=enable_z_grad,
     )
     return match_target_shape(prediction, target), target
 
@@ -676,11 +832,16 @@ def initialize_camera_scale(beam, proxy, dataset, train_indices, base_profile,
 
 
 def train_epoch(beam, proxy, loader, optimizer, base_profile, physics,
-                cfg, device) -> dict[str, float]:
+                cfg, device, global_step: int) -> tuple[dict[str, float], int]:
     proxy.train()
     totals = {"loss": 0.0, "data": 0.0, "reg": 0.0, "raw_mse": 0.0}
     n_samples = 0
     for batch in tqdm(loader, desc="train", leave=False):
+        enable_z_grad = (
+            proxy.z_enabled
+            and proxy.z_latent.requires_grad
+            and global_step % cfg["z_update_every"] == 0
+        )
         optimizer.zero_grad(set_to_none=True)
         batch_size = len(batch["id"])
         batch_data = 0.0
@@ -693,7 +854,9 @@ def train_epoch(beam, proxy, loader, optimizer, base_profile, physics,
                 "camera": batch["camera"][i:i + 1],
             }
             prediction, target = make_prediction(
-                beam, proxy, sample, base_profile, physics, cfg, device, True)
+                beam, proxy, sample, base_profile, physics, cfg, device, True,
+                enable_z_grad,
+            )
             data_loss, components = visual_loss(prediction, target, cfg)
             group = sample_type_from_id(sample_id)
             weight = cfg["group_loss_weights_normalized"].get(group, 1.0)
@@ -701,12 +864,17 @@ def train_epoch(beam, proxy, loader, optimizer, base_profile, physics,
             batch_data += float((weight * data_loss).detach())
             batch_mse += float(components["raw_mse"].detach())
 
-        reg_loss, _ = proxy_regularization(proxy, tuple(base_profile.shape), cfg)
+        reg_loss, _ = proxy_regularization(
+            proxy, tuple(base_profile.shape), cfg, enable_z_grad=enable_z_grad
+        )
         if reg_loss.requires_grad:
             reg_loss.backward()
         if cfg["grad_clip"] is not None and cfg["grad_clip"] > 0:
             torch.nn.utils.clip_grad_norm_(proxy.parameters(), cfg["grad_clip"])
         optimizer.step()
+        if enable_z_grad:
+            proxy.invalidate_z_kernel_cache()
+        global_step += 1
 
         totals["data"] += batch_data
         totals["reg"] += float(reg_loss.detach()) * batch_size
@@ -714,7 +882,8 @@ def train_epoch(beam, proxy, loader, optimizer, base_profile, physics,
         totals["raw_mse"] += batch_mse
         n_samples += batch_size
 
-    return {name: value / max(n_samples, 1) for name, value in totals.items()}
+    metrics = {name: value / max(n_samples, 1) for name, value in totals.items()}
+    return metrics, global_step
 
 
 @torch.no_grad()
@@ -749,6 +918,8 @@ def build_optimizer(proxy: AxiconProxyParameters, cfg: dict):
         ([proxy.zernike_coeffs], cfg["lr_zernike"], "zernike"),
         ([proxy.source_latent], cfg["lr_source"], "source"),
         ([proxy.log_camera_scale], cfg["lr_scale"], "camera_scale"),
+        ([proxy.z_latent], cfg["lr_z"] if proxy.z_enabled else 0.0,
+         "propagation_z"),
         (list(proxy.transfer_parameters()),
          cfg["lr_transfer"] if proxy.transfer_enabled else 0.0,
          "polar_transfer"),
@@ -757,19 +928,29 @@ def build_optimizer(proxy: AxiconProxyParameters, cfg: dict):
         for parameter in parameters:
             parameter.requires_grad_(lr > 0)
         if lr > 0:
-            groups.append({"params": parameters, "lr": lr, "name": name})
+            group = {"params": parameters, "lr": lr, "name": name}
+            if name == "propagation_z":
+                group["weight_decay"] = 0.0
+            groups.append(group)
         else:
             print(f">>> Frozen parameter group: {name}")
     if not groups:
         raise ValueError("At least one proxy learning rate must be positive")
+    active_names = {group["name"] for group in groups}
+    if active_names == {"propagation_z"} and cfg["z_update_every"] != 1:
+        raise ValueError(
+            "--z-update-every must be 1 when propagation z is the only "
+            "trainable parameter group"
+        )
     return torch.optim.AdamW(groups, weight_decay=cfg["weight_decay"])
 
 
 def checkpoint_payload(proxy, optimizer, epoch, history, cfg, dataset,
-                       train_indices, val_indices, source_shape):
+                       train_indices, val_indices, source_shape, global_step):
     source_map = proxy.source_map(source_shape).detach().cpu()
     return {
         "epoch": int(epoch),
+        "global_step": int(global_step),
         "parameter_state_dict": proxy.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "history": history,
@@ -780,6 +961,11 @@ def checkpoint_payload(proxy, optimizer, epoch, history, cfg, dataset,
         "zernike_coeffs": proxy.zernike_coeffs.detach().cpu(),
         "source_modulation_map": source_map,
         "camera_scale_factor": proxy.camera_scale().detach().cpu(),
+        "z_position_m": proxy.z_position_m(False).detach().cpu(),
+        "delta_z_m": proxy.delta_z_m(False).detach().cpu(),
+        "z_initial_m": proxy.z_initial_m.detach().cpu(),
+        "z_min_m": proxy.z_min_m.detach().cpu(),
+        "z_max_m": proxy.z_max_m.detach().cpu(),
         "transfer_log_amp_cos": proxy.transfer_log_amp_cos.detach().cpu(),
         "transfer_log_amp_sin": proxy.transfer_log_amp_sin.detach().cpu(),
         "transfer_phase_cos": proxy.transfer_phase_cos.detach().cpu(),
@@ -790,8 +976,11 @@ def checkpoint_payload(proxy, optimizer, epoch, history, cfg, dataset,
 def write_history(history: list[dict], run_dir: Path) -> None:
     if not history:
         return
+    fieldnames = list(dict.fromkeys(
+        key for row in history for key in row
+    ))
     with (run_dir / "history.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(history[0]))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(history)
     with (run_dir / "history.json").open("w", encoding="utf-8") as handle:
@@ -810,6 +999,32 @@ def write_history(history: list[dict], run_dir: Path) -> None:
     fig.tight_layout()
     fig.savefig(run_dir / "loss_curve.png", dpi=150)
     plt.close(fig)
+
+    z_rows = [row for row in history if np.isfinite(row.get("delta_z_um", np.nan))]
+    if z_rows:
+        fig, axis = plt.subplots(figsize=(8, 5))
+        axis.plot(
+            [row["epoch"] for row in z_rows],
+            [row["delta_z_um"] for row in z_rows],
+            marker="o",
+        )
+        axis.axhline(0.0, color="black", linewidth=1.0, alpha=0.5)
+        lower = z_rows[-1].get("z_min_delta_um")
+        upper = z_rows[-1].get("z_max_delta_um")
+        if lower is not None and upper is not None:
+            axis.axhline(lower, color="tab:red", linestyle="--", alpha=0.6,
+                         label="bounds")
+            axis.axhline(upper, color="tab:red", linestyle="--", alpha=0.6)
+            axis.legend()
+        axis.set(
+            xlabel="Epoch",
+            ylabel="Learned delta z (um)",
+            title="Bounded propagation-distance refinement",
+        )
+        axis.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(run_dir / "z_trajectory.png", dpi=150)
+        plt.close(fig)
 
 
 @torch.no_grad()
@@ -849,9 +1064,14 @@ def save_parameter_plots(proxy: AxiconProxyParameters,
     fig.colorbar(image, ax=axes[0, 0], label="Amplitude multiplier")
 
     axes[0, 1].bar(np.arange(len(zernike)), zernike)
+    z_m = proxy.z_position_m(False).item()
+    delta_z_um = proxy.delta_z_m(False).item() * 1e6
     axes[0, 1].set(
         xlabel="Zernike index", ylabel="Coefficient (rad)",
-        title=f"Camera scale = {proxy.camera_scale().item():.4g}",
+        title=(
+            f"Camera scale = {proxy.camera_scale().item():.4g}\n"
+            f"z = {z_m * 1e3:.6f} mm (delta={delta_z_um:+.3f} um)"
+        ),
     )
     axes[0, 1].grid(True, axis="y", alpha=0.3)
 
@@ -905,6 +1125,11 @@ def save_parameter_plots(proxy: AxiconProxyParameters,
         log_amp_sin=proxy.transfer_log_amp_sin.detach().cpu().numpy(),
         phase_cos=proxy.transfer_phase_cos.detach().cpu().numpy(),
         phase_sin=proxy.transfer_phase_sin.detach().cpu().numpy(),
+        z_position_m=np.float64(z_m),
+        delta_z_m=np.float64(proxy.delta_z_m(False).item()),
+        z_initial_m=np.float64(proxy.z_initial_m.item()),
+        z_min_m=np.float64(proxy.z_min_m.item()),
+        z_max_m=np.float64(proxy.z_max_m.item()),
     )
 
 
@@ -998,6 +1223,25 @@ def build_parser() -> argparse.ArgumentParser:
                         default=DEFAULT_TRANSPOSE_OUTPUT_FIELD)
 
     parser.add_argument("--z-m", type=float, default=DEFAULT_Z_TARGET_M)
+    parser.add_argument(
+        "--optimize-z", action=argparse.BooleanOptionalAction, default=False,
+        help=(
+            "learn a bounded ROI-domain delta-z around --z-m; the expensive "
+            "full-resolution ASM remains fixed at --z-m"
+        ),
+    )
+    parser.add_argument(
+        "--z-min-m", type=float, default=None,
+        help="lower z bound in metres (default: --z-m minus 0.15 mm)",
+    )
+    parser.add_argument(
+        "--z-max-m", type=float, default=None,
+        help="upper z bound in metres (default: --z-m plus 0.15 mm)",
+    )
+    parser.add_argument(
+        "--z-update-every", type=int, default=1,
+        help="enable z gradients every K optimizer steps; other groups still update",
+    )
     parser.add_argument("--roi-size", type=int, default=DEFAULT_ROI_SIZE)
     parser.add_argument("--upsample-factor", type=int, default=DEFAULT_UPSAMPLE_FACTOR)
     parser.add_argument("--axicon-grating-pitch-m", type=float,
@@ -1035,12 +1279,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr-zernike", type=float, default=2e-2)
     parser.add_argument("--lr-source", type=float, default=1e-2)
     parser.add_argument("--lr-scale", type=float, default=2e-2)
+    parser.add_argument("--lr-z", type=float, default=1e-2)
     parser.add_argument("--lr-transfer", type=float, default=5e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--w-source-prior", type=float, default=1e-2)
     parser.add_argument("--w-source-smooth", type=float, default=1e-3)
     parser.add_argument("--w-zernike-l2", type=float, default=1e-4)
+    parser.add_argument(
+        "--w-z-prior", type=float, default=0.0,
+        help="optional normalized quadratic prior toward the initial --z-m",
+    )
     parser.add_argument("--w-transfer-l2", type=float, default=1e-5)
     parser.add_argument("--w-transfer-radial-smooth", type=float, default=1e-5)
     parser.add_argument("--w-transfer-angular-order", type=float, default=1e-6)
@@ -1087,6 +1336,7 @@ def config_from_args(args, device, beam_config) -> dict:
         "device": str(device),
         "wavelength_m": float(beam_config.lambda_),
         "slm_pixel_size_m": float(beam_config.psSLM),
+        "roi_pixel_size_m": float(beam_config.psSLM) / args.upsample_factor,
         "slm_shape": [int(beam_config.Nx), int(beam_config.Ny)],
         "gaussian_beam_waist_m": float(beam_config.gaussian_beam_waist),
         "axicon_transverse_frequency": transverse_frequency,
@@ -1103,12 +1353,22 @@ def config_from_args(args, device, beam_config) -> dict:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.z_min_m is None:
+        args.z_min_m = args.z_m - 0.15e-3
+    if args.z_max_m is None:
+        args.z_max_m = args.z_m + 0.15e-3
     if args.epochs <= 0 or args.batch_size <= 0:
         raise ValueError("--epochs and --batch-size must be positive")
     if args.val_every <= 0 or args.val_max_samples <= 0:
         raise ValueError("--val-every and --val-max-samples must be positive")
     if args.z_m <= 0 or args.roi_size <= 0 or args.upsample_factor <= 0:
         raise ValueError("z, ROI size, and upsample factor must be positive")
+    if not 0 < args.z_min_m < args.z_m < args.z_max_m:
+        raise ValueError(
+            "z bounds must satisfy 0 < --z-min-m < --z-m < --z-max-m"
+        )
+    if args.z_update_every <= 0:
+        raise ValueError("--z-update-every must be positive")
     if args.propagation_medium_index <= 0 or args.axicon_grating_pitch_m <= 0:
         raise ValueError("medium index and axicon grating pitch must be positive")
     if args.fov_crop_size is not None and args.fov_crop_size > args.roi_size:
@@ -1169,6 +1429,10 @@ def main() -> None:
     checkpoint_metric = "val_loss" if has_validation else "train_loss"
 
     cfg = config_from_args(args, device, beam_config)
+    cfg["z_refinement_model"] = (
+        "ROI angular-spectrum delta-z fused with polar transfer FFT; "
+        "full-resolution ASM fixed at z_m"
+    )
     cfg["camera_scale_actual"] = dataset.camera_scale
     cfg["checkpoint_selection_metric"] = checkpoint_metric
     normalized_weights, counts = normalize_group_loss_weights(
@@ -1209,6 +1473,11 @@ def main() -> None:
         f"FOV={args.fov_crop_size}, n={args.propagation_medium_index:.4g}"
     )
     print(
+        f">>> Bounded z refinement: enabled={args.optimize_z}, "
+        f"range=[{args.z_min_m * 1e3:.3f}, {args.z_max_m * 1e3:.3f}] mm, "
+        f"update_every={args.z_update_every} optimizer step(s), lr={args.lr_z:g}"
+    )
+    print(
         f">>> Polar transfer: enabled={args.transfer_correction}, "
         f"radial_bins={args.transfer_radial_bins}, "
         f"azimuthal_order={args.transfer_azimuthal_order}, "
@@ -1242,6 +1511,10 @@ def main() -> None:
         num_zernike=args.num_zernike,
         source_grid_shape=(args.source_grid_x, args.source_grid_y),
         source_max_deviation=args.source_max_deviation,
+        z_enabled=args.optimize_z,
+        z_initial_m=args.z_m,
+        z_min_m=args.z_min_m,
+        z_max_m=args.z_max_m,
         transfer_enabled=args.transfer_correction,
         transfer_radial_bins=args.transfer_radial_bins,
         transfer_azimuthal_order=args.transfer_azimuthal_order,
@@ -1255,6 +1528,7 @@ def main() -> None:
     )
     history: list[dict] = []
     start_epoch = 1
+    global_step = 0
     if args.resume is not None:
         checkpoint = torch_load_checkpoint(args.resume, device)
         incompatible = proxy.load_state_dict(
@@ -1275,8 +1549,10 @@ def main() -> None:
             )
         history = list(checkpoint.get("history", []))
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        global_step = int(checkpoint.get("global_step", 0))
+        proxy.invalidate_z_kernel_cache()
         print(f">>> Resumed from {args.resume} at epoch {start_epoch}")
-    elif args.initialize_camera_scale and args.lr_scale > 0:
+    elif args.initialize_camera_scale:
         initialize_camera_scale(
             beam, proxy, dataset, train_indices, base_profile,
             physics, cfg, device,
@@ -1298,9 +1574,9 @@ def main() -> None:
         default=float("inf"),
     )
     for epoch in range(start_epoch, args.epochs + 1):
-        train_metrics = train_epoch(
+        train_metrics, global_step = train_epoch(
             beam, proxy, train_loader, optimizer, base_profile,
-            physics, cfg, device,
+            physics, cfg, device, global_step,
         )
         should_validate = has_validation and (
             epoch == 1 or epoch == args.epochs or epoch % args.val_every == 0
@@ -1325,6 +1601,14 @@ def main() -> None:
             "val_loss": val_metrics["loss"],
             "val_raw_mse": val_metrics["raw_mse"],
             "camera_scale": proxy.camera_scale().item(),
+            "z_m": proxy.z_position_m(False).item(),
+            "delta_z_um": proxy.delta_z_m(False).item() * 1e6,
+            "z_min_delta_um": (
+                proxy.z_min_m - proxy.z_initial_m
+            ).item() * 1e6,
+            "z_max_delta_um": (
+                proxy.z_max_m - proxy.z_initial_m
+            ).item() * 1e6,
         }
         history.append(row)
         write_history(history, run_dir)
@@ -1334,7 +1618,9 @@ def main() -> None:
             metric_text = "val=n/a, best_by=train"
         print(
             f"Epoch {epoch:03d}: train={row['train_loss']:.6g}, "
-            f"{metric_text}, scale={row['camera_scale']:.6g}"
+            f"{metric_text}, scale={row['camera_scale']:.6g}, "
+            f"z={row['z_m'] * 1e3:.6f} mm "
+            f"(delta={row['delta_z_um']:+.3f} um)"
         )
 
         score = checkpoint_selection_score(
@@ -1345,7 +1631,7 @@ def main() -> None:
         )
         payload = checkpoint_payload(
             proxy, optimizer, epoch, history, cfg, dataset,
-            train_indices, val_indices, tuple(base_profile.shape),
+            train_indices, val_indices, tuple(base_profile.shape), global_step,
         )
         payload["checkpoint_selection_metric"] = checkpoint_metric
         payload["checkpoint_selection_score"] = (
@@ -1360,6 +1646,7 @@ def main() -> None:
     if best_path.exists():
         best = torch_load_checkpoint(best_path, device)
         proxy.load_state_dict(best["parameter_state_dict"])
+        proxy.invalidate_z_kernel_cache()
         print(
             f">>> Loaded best.pt selected by {checkpoint_metric} "
             "for final visualizations."
