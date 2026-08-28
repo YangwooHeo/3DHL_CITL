@@ -730,11 +730,29 @@ class HoloBeam(Beam):
                 slm_fft = torch.fft.fftshift(torch.fft.fft2(slm_field, norm="ortho"))
 
                 lam = self.beam_config.lambda_
+                # This Fourier plane is formed directly by f1 from the
+                # physical 8 um SLM.  beam_config.psSLM is 6.4 um because the
+                # later f2/f3/f4 relay is collapsed into a 0.8x-demagnified
+                # target-equivalent grid, so it must not set this aperture's
+                # frequency coordinates.  At sub-pixel resolution the sample
+                # pitch scales by P while the represented SLM extent stays
+                # fixed.
+                physical_slm_sample_pitch = (
+                    8e-6 / slm_input_subpixel_factor
+                )
 
                 f_limit = (filter_size_um * 1e-6 / 2.0) / (lam * f1)
 
-                fx = torch.fft.fftshift(torch.fft.fftfreq(Nx_orig, d=ps_orig, device=self.beam_config.device))
-                fy = torch.fft.fftshift(torch.fft.fftfreq(Ny_orig, d=ps_orig, device=self.beam_config.device))
+                fx = torch.fft.fftshift(torch.fft.fftfreq(
+                    Nx_orig,
+                    d=physical_slm_sample_pitch,
+                    device=self.beam_config.device,
+                ))
+                fy = torch.fft.fftshift(torch.fft.fftfreq(
+                    Ny_orig,
+                    d=physical_slm_sample_pitch,
+                    device=self.beam_config.device,
+                ))
                 FX, FY = torch.meshgrid(fx, fy, indexing='ij')
 
                 filter_mask = ~((torch.abs(FX) <= f_limit) & (torch.abs(FY) <= f_limit))
