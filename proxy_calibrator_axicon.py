@@ -15,6 +15,8 @@ between simulation and calibration.
 
 The learned proxy is deliberately low dimensional:
 
+* A normalized, non-negative N x N kernel describes SLM pixel cross talk on
+  the voltage-proportional drive values before they are converted to phase.
 * Zernike coefficients describe SLM-plane wavefront error.
 * A bounded, coarse source map describes smooth illumination non-uniformity.
 * A polar complex transfer correction describes deterministic coherent
@@ -240,23 +242,40 @@ class ProxyCalibrationDataset(Dataset):
         return max(float(np.percentile(np.concatenate(sampled),
                                        self.camera_percentile)), 1e-8)
 
-    def _load_phase(self, path: Path) -> torch.Tensor:
-        phase = np.load(path)
-        phase = np.squeeze(phase)
-        if phase.ndim != 2:
-            raise ValueError(f"{path} must contain a 2D phase map; got {phase.shape}")
+    def _load_slm_drive(self, path: Path) -> torch.Tensor:
+        """Load voltage-proportional SLM drive without phase wrapping."""
+        drive = np.load(path)
+        drive = np.squeeze(drive)
+        if drive.ndim != 2:
+            raise ValueError(f"{path} must contain a 2D phase map; got {drive.shape}")
         if self.phase_transpose:
-            phase = phase.T
+            drive = drive.T
         if self.phase_flip_first_axis:
-            phase = phase[::-1, :]
-        phase = np.ascontiguousarray(phase, dtype=np.float32)
-        if self.expected_phase_shape is not None and phase.shape != self.expected_phase_shape:
+            drive = drive[::-1, :]
+        drive = np.ascontiguousarray(drive, dtype=np.float32)
+        if self.expected_phase_shape is not None and drive.shape != self.expected_phase_shape:
             raise ValueError(
-                f"{path.name} has shape {phase.shape} after orientation correction; "
+                f"{path.name} has shape {drive.shape} after orientation correction; "
                 f"expected {self.expected_phase_shape}"
             )
-        phase *= 2.0 * np.pi / self.phase_level_max
-        return torch.from_numpy(phase)
+        if not np.isfinite(drive).all():
+            raise ValueError(f"{path.name} contains non-finite SLM command values")
+        tolerance = max(1e-6 * self.phase_level_max, 1e-6)
+        drive_min = float(drive.min())
+        drive_max = float(drive.max())
+        if drive_min < -tolerance or drive_max > self.phase_level_max + tolerance:
+            raise ValueError(
+                f"{path.name} has SLM command range [{drive_min}, {drive_max}], "
+                f"outside [0, {self.phase_level_max}]. The cross-talk model "
+                "expects voltage-proportional command levels, not wrapped radians."
+            )
+
+        # This is a linear change of units only.  In particular, do not use
+        # modulo/remainder or a complex phasor here: pixels at levels 0 and
+        # phase_level_max represent different drive voltages to the cross-talk
+        # filter even though their ideal complex phases are equivalent.
+        drive /= self.phase_level_max
+        return torch.from_numpy(drive)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -265,7 +284,7 @@ class ProxyCalibrationDataset(Dataset):
         sample = self.samples[index]
         camera = self._load_camera_raw(sample["camera"]) / self.camera_scale
         return {
-            "phase": self._load_phase(sample["phase"]).float(),
+            "slm_drive": self._load_slm_drive(sample["phase"]).float(),
             "camera": torch.from_numpy(camera).unsqueeze(0).float(),
             "id": sample["id"],
         }
@@ -277,6 +296,7 @@ class AxiconProxyParameters(nn.Module):
     def __init__(self, num_zernike: int = 20,
                  source_grid_shape: tuple[int, int] = (64, 48),
                  source_max_deviation: float = 0.30,
+                 crosstalk_kernel_size: int = 1,
                  z_enabled: bool = False,
                  z_initial_m: float = DEFAULT_Z_TARGET_M,
                  z_min_m: float | None = None,
@@ -294,6 +314,8 @@ class AxiconProxyParameters(nn.Module):
             raise ValueError("source_grid_shape values must be positive")
         if not 0 <= source_max_deviation < 1:
             raise ValueError("source_max_deviation must be in [0, 1)")
+        if crosstalk_kernel_size <= 0:
+            raise ValueError("crosstalk_kernel_size must be positive")
         if transfer_radial_bins < 2:
             raise ValueError("transfer_radial_bins must be at least 2")
         if transfer_azimuthal_order < 0:
@@ -320,6 +342,20 @@ class AxiconProxyParameters(nn.Module):
         )
         self.log_camera_scale = nn.Parameter(torch.zeros(()))
         self.source_max_deviation = float(source_max_deviation)
+        self.crosstalk_kernel_size = int(crosstalk_kernel_size)
+        if self.crosstalk_kernel_size == 1:
+            initial_kernel = torch.ones(1, 1)
+        else:
+            # Start near the old identity model while leaving every tap
+            # positive and learnable. Softmax below preserves DC response.
+            num_off_center = self.crosstalk_kernel_size ** 2 - 1
+            initial_kernel = torch.full(
+                (self.crosstalk_kernel_size, self.crosstalk_kernel_size),
+                0.10 / num_off_center,
+            )
+            anchor = (self.crosstalk_kernel_size - 1) // 2
+            initial_kernel[anchor, anchor] = 0.90
+        self.crosstalk_kernel_logits = nn.Parameter(initial_kernel.log())
         self.z_enabled = bool(z_enabled)
         self.register_buffer(
             "z_initial_m", torch.tensor(float(z_initial_m)), persistent=True
@@ -374,6 +410,37 @@ class AxiconProxyParameters(nn.Module):
 
     def camera_scale(self) -> torch.Tensor:
         return torch.exp(self.log_camera_scale.clamp(-20.0, 20.0))
+
+    def slm_crosstalk_kernel(self, use_gradient: bool = True) -> torch.Tensor:
+        """Return a non-negative, unit-sum N x N voltage-domain kernel."""
+        logits = (
+            self.crosstalk_kernel_logits
+            if use_gradient else self.crosstalk_kernel_logits.detach()
+        )
+        return torch.softmax(logits.reshape(-1), dim=0).reshape_as(logits)
+
+    def filter_slm_drive(self, slm_drive: torch.Tensor,
+                         use_gradient: bool = True) -> torch.Tensor:
+        """Apply pixel cross talk directly to unwrapped, voltage-like drive."""
+        if slm_drive.ndim != 2:
+            raise ValueError(f"Expected a 2D SLM drive map; got {slm_drive.shape}")
+        padding_before = (self.crosstalk_kernel_size - 1) // 2
+        padding_after = self.crosstalk_kernel_size - 1 - padding_before
+        drive_4d = slm_drive.unsqueeze(0).unsqueeze(0)
+        if padding_before or padding_after:
+            drive_4d = F.pad(
+                drive_4d,
+                (padding_before, padding_after, padding_before, padding_after),
+                mode="replicate",
+            )
+        kernel = self.slm_crosstalk_kernel(use_gradient).unsqueeze(0).unsqueeze(0)
+        return F.conv2d(drive_4d, kernel).squeeze(0).squeeze(0)
+
+    def slm_phase_from_drive(self, slm_drive: torch.Tensor,
+                             use_gradient: bool = True) -> torch.Tensor:
+        """Convert filtered drive to radians without modulo or phase wrapping."""
+        filtered_drive = self.filter_slm_drive(slm_drive, use_gradient)
+        return filtered_drive * (2.0 * math.pi)
 
     def z_position_m(self, use_gradient: bool = True) -> torch.Tensor:
         """Return a smoothly bounded physical propagation distance in metres."""
@@ -657,7 +724,7 @@ def combined_illumination(base_profile: torch.Tensor,
 def axicon_forward_proxy(
     beam: HoloBeam,
     proxy: AxiconProxyParameters,
-    slm_phase: torch.Tensor,
+    slm_drive: torch.Tensor,
     base_profile: torch.Tensor,
     h_asm,
     cone_angle: float,
@@ -679,6 +746,12 @@ def axicon_forward_proxy(
     profile = combined_illumination(base_profile, proxy)
     if not require_grad:
         profile = profile.detach()
+    # Pixel cross talk is linear in the voltage-proportional SLM drive.  Only
+    # after that spatial interaction do we convert to radians.  There is
+    # intentionally no phase wrapping anywhere in this path.
+    slm_phase = proxy.slm_phase_from_drive(
+        slm_drive, use_gradient=require_grad
+    )
     beam_amp = torch.ones((), device=slm_phase.device, dtype=slm_phase.dtype)
     volume = beam.propagateToVolume_Axicon2(
         axicon_angle=cone_angle,
@@ -781,18 +854,19 @@ def visual_loss(prediction: torch.Tensor, target: torch.Tensor,
 
 def make_prediction(beam, proxy, sample, base_profile, physics, cfg,
                     device, require_grad, enable_z_grad=False):
-    phase = sample["phase"].to(device)
+    slm_drive = sample["slm_drive"].to(device)
     target = sample["camera"].to(device)
     if target.ndim == 3:
         target = target.unsqueeze(0)
-    if phase.ndim != 2 or target.ndim != 4:
+    if slm_drive.ndim != 2 or target.ndim != 4:
         raise ValueError(
-            f"Expected one 2D phase and BCHW camera; got {phase.shape}, {target.shape}"
+            "Expected one 2D SLM drive and BCHW camera; got "
+            f"{slm_drive.shape}, {target.shape}"
         )
     prediction = axicon_forward_proxy(
         beam=beam,
         proxy=proxy,
-        slm_phase=phase,
+        slm_drive=slm_drive,
         base_profile=base_profile,
         h_asm=physics["h_asm"],
         cone_angle=physics["cone_angle"],
@@ -850,7 +924,7 @@ def train_epoch(beam, proxy, loader, optimizer, base_profile, physics,
         # Backward per sample so multiple upsampled FFT graphs are never retained.
         for i, sample_id in enumerate(batch["id"]):
             sample = {
-                "phase": batch["phase"][i],
+                "slm_drive": batch["slm_drive"][i],
                 "camera": batch["camera"][i:i + 1],
             }
             prediction, target = make_prediction(
@@ -915,6 +989,9 @@ def checkpoint_selection_score(train_metrics: dict[str, float],
 def build_optimizer(proxy: AxiconProxyParameters, cfg: dict):
     groups = []
     specifications = [
+        ([proxy.crosstalk_kernel_logits],
+         cfg["lr_crosstalk"] if proxy.crosstalk_kernel_size > 1 else 0.0,
+         "slm_crosstalk"),
         ([proxy.zernike_coeffs], cfg["lr_zernike"], "zernike"),
         ([proxy.source_latent], cfg["lr_source"], "source"),
         ([proxy.log_camera_scale], cfg["lr_scale"], "camera_scale"),
@@ -929,7 +1006,7 @@ def build_optimizer(proxy: AxiconProxyParameters, cfg: dict):
             parameter.requires_grad_(lr > 0)
         if lr > 0:
             group = {"params": parameters, "lr": lr, "name": name}
-            if name == "propagation_z":
+            if name in {"propagation_z", "slm_crosstalk"}:
                 group["weight_decay"] = 0.0
             groups.append(group)
         else:
@@ -960,6 +1037,9 @@ def checkpoint_payload(proxy, optimizer, epoch, history, cfg, dataset,
         # Compatibility-friendly exported physical values.
         "zernike_coeffs": proxy.zernike_coeffs.detach().cpu(),
         "source_modulation_map": source_map,
+        "slm_crosstalk_kernel": (
+            proxy.slm_crosstalk_kernel(False).detach().cpu()
+        ),
         "camera_scale_factor": proxy.camera_scale().detach().cpu(),
         "z_position_m": proxy.z_position_m(False).detach().cpu(),
         "delta_z_m": proxy.delta_z_m(False).detach().cpu(),
@@ -1055,6 +1135,9 @@ def save_parameter_plots(proxy: AxiconProxyParameters,
     else:
         coefficient_power = torch.sqrt(cos_power)
     coefficient_power_np = coefficient_power.cpu().numpy()
+    crosstalk_kernel = (
+        proxy.slm_crosstalk_kernel(False).detach().cpu().numpy()
+    )
 
     fig, axes = plt.subplots(2, 3, figsize=(19, 11))
     image = axes[0, 0].imshow(source.T, cmap="RdBu_r", aspect="auto")
@@ -1130,6 +1213,28 @@ def save_parameter_plots(proxy: AxiconProxyParameters,
         z_initial_m=np.float64(proxy.z_initial_m.item()),
         z_min_m=np.float64(proxy.z_min_m.item()),
         z_max_m=np.float64(proxy.z_max_m.item()),
+    )
+
+    fig, axis = plt.subplots(figsize=(6, 5))
+    image = axis.imshow(crosstalk_kernel, cmap="viridis", interpolation="nearest")
+    axis.set(
+        xlabel="SLM pixel offset",
+        ylabel="SLM pixel offset",
+        title=(
+            f"Learned {proxy.crosstalk_kernel_size}x"
+            f"{proxy.crosstalk_kernel_size} voltage-domain cross-talk kernel"
+        ),
+    )
+    fig.colorbar(image, ax=axis, label="Normalized coupling weight")
+    fig.tight_layout()
+    fig.savefig(run_dir / "learned_slm_crosstalk_kernel.png", dpi=180)
+    plt.close(fig)
+    np.savez_compressed(
+        run_dir / "learned_slm_crosstalk_kernel.npz",
+        kernel=crosstalk_kernel.astype(np.float32),
+        kernel_size=np.int64(proxy.crosstalk_kernel_size),
+        domain=np.array("normalized voltage-proportional SLM drive"),
+        phase_stroke_rad=np.float64(2.0 * np.pi),
     )
 
 
@@ -1260,6 +1365,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-grid-y", type=int, default=48)
     parser.add_argument("--source-max-deviation", type=float, default=0.30)
     parser.add_argument(
+        "--crosstalk-kernel-size",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "positive SLM pixel cross-talk kernel size; N=1 preserves the "
+            "previous identity model (odd N gives a symmetric support)"
+        ),
+    )
+    parser.add_argument(
         "--transfer-correction", action=argparse.BooleanOptionalAction,
         default=True,
         help="learn a coherent polar complex transfer correction on the propagated ROI",
@@ -1281,6 +1396,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr-scale", type=float, default=2e-2)
     parser.add_argument("--lr-z", type=float, default=1e-2)
     parser.add_argument("--lr-transfer", type=float, default=5e-3)
+    parser.add_argument("--lr-crosstalk", type=float, default=5e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--w-source-prior", type=float, default=1e-2)
@@ -1382,6 +1498,8 @@ def main() -> None:
         )
     if args.transfer_max_log_amplitude <= 0 or args.transfer_max_phase_rad <= 0:
         raise ValueError("transfer correction limits must be positive")
+    if args.crosstalk_kernel_size <= 0:
+        raise ValueError("--crosstalk-kernel-size must be positive")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1408,7 +1526,7 @@ def main() -> None:
     if len(dataset) < 1:
         raise RuntimeError("At least one paired sample is required for calibration")
     first = dataset[0]
-    print(f">>> First phase shape: {tuple(first['phase'].shape)}")
+    print(f">>> First SLM drive shape: {tuple(first['slm_drive'].shape)}")
     print(f">>> First camera shape: {tuple(first['camera'].shape)}")
     if args.dry_run:
         print(">>> Dry run complete: pairing and preprocessing are valid.")
@@ -1485,6 +1603,11 @@ def main() -> None:
         f"max_log_amp={args.transfer_max_log_amplitude:g}, "
         f"max_phase={args.transfer_max_phase_rad:g} rad"
     )
+    print(
+        f">>> SLM cross talk: kernel={args.crosstalk_kernel_size}x"
+        f"{args.crosstalk_kernel_size}, lr={args.lr_crosstalk:g}, "
+        "domain=unwrapped voltage-proportional drive"
+    )
 
     beam = HoloBeam(beam_config)
     z_query = torch.tensor([args.z_m], device=device, dtype=beam_config.fdtype)
@@ -1511,6 +1634,7 @@ def main() -> None:
         num_zernike=args.num_zernike,
         source_grid_shape=(args.source_grid_x, args.source_grid_y),
         source_max_deviation=args.source_max_deviation,
+        crosstalk_kernel_size=args.crosstalk_kernel_size,
         z_enabled=args.optimize_z,
         z_initial_m=args.z_m,
         z_min_m=args.z_min_m,
@@ -1603,6 +1727,10 @@ def main() -> None:
             "camera_scale": proxy.camera_scale().item(),
             "z_m": proxy.z_position_m(False).item(),
             "delta_z_um": proxy.delta_z_m(False).item() * 1e6,
+            "crosstalk_center_weight": proxy.slm_crosstalk_kernel(False)[
+                (proxy.crosstalk_kernel_size - 1) // 2,
+                (proxy.crosstalk_kernel_size - 1) // 2,
+            ].item(),
             "z_min_delta_um": (
                 proxy.z_min_m - proxy.z_initial_m
             ).item() * 1e6,
