@@ -666,7 +666,8 @@ class HoloBeam(Beam):
                                  axicon_profile='continuous',
                                  axicon_phase_depth=math.pi,
                                  axicon_duty_cycle=0.5,
-                                 axicon_radial_offset=0.0):
+                                 axicon_radial_offset=0.0,
+                                 slm_input_subpixel_factor=1):
         '''
         Axicon forward propagation with ROI-only, slice-by-slice ASM storage.
 
@@ -678,15 +679,50 @@ class HoloBeam(Beam):
         if phase_mask is None: phase_mask = self.phase_mask_iter
         if beam_mean_amplitude is None: beam_mean_amplitude = self.beam_mean_amplitude_iter
         if slm_amplitude_profile is None: slm_amplitude_profile = self.slm_amplitude_profile
+        slm_input_subpixel_factor = int(slm_input_subpixel_factor)
+        if slm_input_subpixel_factor <= 0:
+            raise ValueError('slm_input_subpixel_factor must be positive')
+        if phase_mask.dim() != 2 or slm_amplitude_profile.dim() != 2:
+            raise ValueError('phase_mask and slm_amplitude_profile must be 2D')
+        if phase_mask.shape != slm_amplitude_profile.shape:
+            raise ValueError(
+                'phase_mask and slm_amplitude_profile must have the same shape; '
+                f'got {phase_mask.shape} and {slm_amplitude_profile.shape}'
+            )
+        expected_shape = (
+            int(self.beam_config.Nx) * slm_input_subpixel_factor,
+            int(self.beam_config.Ny) * slm_input_subpixel_factor,
+        )
+        if tuple(phase_mask.shape) != expected_shape:
+            raise ValueError(
+                'sub-pixel SLM input shape does not match the beam configuration: '
+                f'got {tuple(phase_mask.shape)}, expected {expected_shape}'
+            )
 
         is_sparse = isinstance(H_asm, dict) and H_asm.get('type') == 'sparse'
         t0 = time.perf_counter()
 
         def forward_engine(p_mask, b_amp, s_prof):
             # 1. SLM plane phase
-            aberration_phase = self._get_zernike_phase(p_mask.shape[-2:])
+            native_shape = (
+                p_mask.shape[-2] // slm_input_subpixel_factor,
+                p_mask.shape[-1] // slm_input_subpixel_factor,
+            )
+            aberration_phase = self._get_zernike_phase(native_shape)
+            if (
+                slm_input_subpixel_factor > 1
+                and isinstance(aberration_phase, torch.Tensor)
+            ):
+                aberration_phase = aberration_phase.repeat_interleave(
+                    slm_input_subpixel_factor, dim=0
+                ).repeat_interleave(slm_input_subpixel_factor, dim=1)
             total_phase = p_mask + aberration_phase
             slm_field = b_amp[None,None] * s_prof * torch.exp(1j * total_phase)
+
+            Nx_orig, Ny_orig = p_mask.shape[-2:]
+            ps_orig = (
+                self.beam_config.psSLM / slm_input_subpixel_factor
+            )
 
             if apply_spatial_filter:
                 filter_size_um = 550
@@ -694,13 +730,11 @@ class HoloBeam(Beam):
                 slm_fft = torch.fft.fftshift(torch.fft.fft2(slm_field, norm="ortho"))
 
                 lam = self.beam_config.lambda_
-                physical_slm_pitch = 8e-6 
-                Nx_orig, Ny_orig = self.beam_config.Nx, self.beam_config.Ny
 
                 f_limit = (filter_size_um * 1e-6 / 2.0) / (lam * f1)
 
-                fx = torch.fft.fftshift(torch.fft.fftfreq(Nx_orig, d=physical_slm_pitch, device=self.beam_config.device))
-                fy = torch.fft.fftshift(torch.fft.fftfreq(Ny_orig, d=physical_slm_pitch, device=self.beam_config.device))
+                fx = torch.fft.fftshift(torch.fft.fftfreq(Nx_orig, d=ps_orig, device=self.beam_config.device))
+                fy = torch.fft.fftshift(torch.fft.fftfreq(Ny_orig, d=ps_orig, device=self.beam_config.device))
                 FX, FY = torch.meshgrid(fx, fy, indexing='ij')
 
                 filter_mask = ~((torch.abs(FX) <= f_limit) & (torch.abs(FY) <= f_limit))
@@ -712,9 +746,6 @@ class HoloBeam(Beam):
                 del slm_fft, slm_fft_filtered, FX, FY, filter_mask
             
             # 2. Upsampling
-            Nx_orig, Ny_orig = self.beam_config.Nx, self.beam_config.Ny
-            ps_orig = self.beam_config.psSLM
-            
             if upsample_factor > 1:
                 slm_field_up = slm_field.repeat_interleave(upsample_factor, dim=0).repeat_interleave(upsample_factor, dim=1)
                 Nx_up = Nx_orig * int(upsample_factor)

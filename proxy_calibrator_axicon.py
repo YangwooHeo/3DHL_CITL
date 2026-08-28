@@ -15,8 +15,9 @@ between simulation and calibration.
 
 The learned proxy is deliberately low dimensional:
 
-* A normalized, non-negative N x N kernel describes SLM pixel cross talk on
-  the voltage-proportional drive values before they are converted to phase.
+* A signed, DC-preserving (N*P) x (N*P) kernel describes sub-pixel SLM cross
+  talk on voltage-proportional drive values before conversion to phase. N is
+  the support in physical SLM pixels and P is the sub-pixel factor.
 * Zernike coefficients describe SLM-plane wavefront error.
 * A bounded, coarse source map describes smooth illumination non-uniformity.
 * A polar complex transfer correction describes deterministic coherent
@@ -297,6 +298,7 @@ class AxiconProxyParameters(nn.Module):
                  source_grid_shape: tuple[int, int] = (64, 48),
                  source_max_deviation: float = 0.30,
                  crosstalk_kernel_size: int = 1,
+                 crosstalk_subpixel_factor: int = 1,
                  z_enabled: bool = False,
                  z_initial_m: float = DEFAULT_Z_TARGET_M,
                  z_min_m: float | None = None,
@@ -316,6 +318,8 @@ class AxiconProxyParameters(nn.Module):
             raise ValueError("source_max_deviation must be in [0, 1)")
         if crosstalk_kernel_size <= 0:
             raise ValueError("crosstalk_kernel_size must be positive")
+        if crosstalk_subpixel_factor <= 0:
+            raise ValueError("crosstalk_subpixel_factor must be positive")
         if transfer_radial_bins < 2:
             raise ValueError("transfer_radial_bins must be at least 2")
         if transfer_azimuthal_order < 0:
@@ -343,19 +347,19 @@ class AxiconProxyParameters(nn.Module):
         self.log_camera_scale = nn.Parameter(torch.zeros(()))
         self.source_max_deviation = float(source_max_deviation)
         self.crosstalk_kernel_size = int(crosstalk_kernel_size)
-        if self.crosstalk_kernel_size == 1:
-            initial_kernel = torch.ones(1, 1)
-        else:
-            # Start near the old identity model while leaving every tap
-            # positive and learnable. Softmax below preserves DC response.
-            num_off_center = self.crosstalk_kernel_size ** 2 - 1
-            initial_kernel = torch.full(
-                (self.crosstalk_kernel_size, self.crosstalk_kernel_size),
-                0.10 / num_off_center,
-            )
-            anchor = (self.crosstalk_kernel_size - 1) // 2
-            initial_kernel[anchor, anchor] = 0.90
-        self.crosstalk_kernel_logits = nn.Parameter(initial_kernel.log())
+        self.crosstalk_subpixel_factor = int(crosstalk_subpixel_factor)
+        self.crosstalk_effective_kernel_size = (
+            self.crosstalk_kernel_size * self.crosstalk_subpixel_factor
+        )
+        # Model-III-like free taps at sub-pixel resolution.  The learned raw
+        # residual is mean-centered in slm_crosstalk_kernel(), so its sum is
+        # zero and adding it to the discrete delta kernel preserves uniform
+        # voltage exactly. Unlike the old softmax parameterization, signed
+        # asymmetric lobes are representable and initialization is identity.
+        self.crosstalk_kernel_residual = nn.Parameter(torch.zeros(
+            self.crosstalk_effective_kernel_size,
+            self.crosstalk_effective_kernel_size,
+        ))
         self.z_enabled = bool(z_enabled)
         self.register_buffer(
             "z_initial_m", torch.tensor(float(z_initial_m)), persistent=True
@@ -412,20 +416,39 @@ class AxiconProxyParameters(nn.Module):
         return torch.exp(self.log_camera_scale.clamp(-20.0, 20.0))
 
     def slm_crosstalk_kernel(self, use_gradient: bool = True) -> torch.Tensor:
-        """Return a non-negative, unit-sum N x N voltage-domain kernel."""
-        logits = (
-            self.crosstalk_kernel_logits
-            if use_gradient else self.crosstalk_kernel_logits.detach()
+        """Return a signed, unit-sum sub-pixel voltage-domain kernel."""
+        raw_residual = (
+            self.crosstalk_kernel_residual
+            if use_gradient else self.crosstalk_kernel_residual.detach()
         )
-        return torch.softmax(logits.reshape(-1), dim=0).reshape_as(logits)
+        residual = raw_residual - raw_residual.mean()
+        return self.slm_crosstalk_identity() + residual
+
+    def slm_crosstalk_identity(self) -> torch.Tensor:
+        """Return the discrete-delta kernel for the configured sub-pixel grid."""
+        identity = torch.zeros_like(self.crosstalk_kernel_residual)
+        anchor = (self.crosstalk_effective_kernel_size - 1) // 2
+        identity[anchor, anchor] = 1.0
+        return identity
+
+    def slm_crosstalk_residual(self, use_gradient: bool = True) -> torch.Tensor:
+        """Return the learned signed deviation from the identity kernel."""
+        return (
+            self.slm_crosstalk_kernel(use_gradient)
+            - self.slm_crosstalk_identity()
+        )
 
     def filter_slm_drive(self, slm_drive: torch.Tensor,
                          use_gradient: bool = True) -> torch.Tensor:
-        """Apply pixel cross talk directly to unwrapped, voltage-like drive."""
+        """Upsample drive, then apply sub-pixel cross talk without wrapping."""
         if slm_drive.ndim != 2:
             raise ValueError(f"Expected a 2D SLM drive map; got {slm_drive.shape}")
-        padding_before = (self.crosstalk_kernel_size - 1) // 2
-        padding_after = self.crosstalk_kernel_size - 1 - padding_before
+        if self.crosstalk_subpixel_factor > 1:
+            slm_drive = slm_drive.repeat_interleave(
+                self.crosstalk_subpixel_factor, dim=0
+            ).repeat_interleave(self.crosstalk_subpixel_factor, dim=1)
+        padding_before = (self.crosstalk_effective_kernel_size - 1) // 2
+        padding_after = self.crosstalk_effective_kernel_size - 1 - padding_before
         drive_4d = slm_drive.unsqueeze(0).unsqueeze(0)
         if padding_before or padding_after:
             drive_4d = F.pad(
@@ -752,10 +775,16 @@ def axicon_forward_proxy(
     slm_phase = proxy.slm_phase_from_drive(
         slm_drive, use_gradient=require_grad
     )
+    subpixel_factor = proxy.crosstalk_subpixel_factor
+    if subpixel_factor > 1:
+        profile = profile.repeat_interleave(
+            subpixel_factor, dim=0
+        ).repeat_interleave(subpixel_factor, dim=1)
+    remaining_upsample_factor = upsample_factor // subpixel_factor
     beam_amp = torch.ones((), device=slm_phase.device, dtype=slm_phase.dtype)
     volume = beam.propagateToVolume_Axicon2(
         axicon_angle=cone_angle,
-        upsample_factor=upsample_factor,
+        upsample_factor=remaining_upsample_factor,
         phase_mask=slm_phase,
         beam_mean_amplitude=beam_amp,
         slm_amplitude_profile=profile,
@@ -766,6 +795,7 @@ def axicon_forward_proxy(
         n_medium=propagation_medium_index,
         axicon_angle_in_medium=axicon_angle_in_medium,
         axicon_transverse_frequency=axicon_transverse_frequency,
+        slm_input_subpixel_factor=subpixel_factor,
     )
     field = proxy.apply_transfer_correction(
         volume[:, :, 0],
@@ -989,8 +1019,9 @@ def checkpoint_selection_score(train_metrics: dict[str, float],
 def build_optimizer(proxy: AxiconProxyParameters, cfg: dict):
     groups = []
     specifications = [
-        ([proxy.crosstalk_kernel_logits],
-         cfg["lr_crosstalk"] if proxy.crosstalk_kernel_size > 1 else 0.0,
+        ([proxy.crosstalk_kernel_residual],
+         cfg["lr_crosstalk"]
+         if proxy.crosstalk_effective_kernel_size > 1 else 0.0,
          "slm_crosstalk"),
         ([proxy.zernike_coeffs], cfg["lr_zernike"], "zernike"),
         ([proxy.source_latent], cfg["lr_source"], "source"),
@@ -1040,6 +1071,8 @@ def checkpoint_payload(proxy, optimizer, epoch, history, cfg, dataset,
         "slm_crosstalk_kernel": (
             proxy.slm_crosstalk_kernel(False).detach().cpu()
         ),
+        "slm_crosstalk_support_pixels": proxy.crosstalk_kernel_size,
+        "slm_crosstalk_subpixel_factor": proxy.crosstalk_subpixel_factor,
         "camera_scale_factor": proxy.camera_scale().detach().cpu(),
         "z_position_m": proxy.z_position_m(False).detach().cpu(),
         "delta_z_m": proxy.delta_z_m(False).detach().cpu(),
@@ -1215,24 +1248,53 @@ def save_parameter_plots(proxy: AxiconProxyParameters,
         z_max_m=np.float64(proxy.z_max_m.item()),
     )
 
-    fig, axis = plt.subplots(figsize=(6, 5))
-    image = axis.imshow(crosstalk_kernel, cmap="viridis", interpolation="nearest")
-    axis.set(
-        xlabel="SLM pixel offset",
-        ylabel="SLM pixel offset",
-        title=(
-            f"Learned {proxy.crosstalk_kernel_size}x"
-            f"{proxy.crosstalk_kernel_size} voltage-domain cross-talk kernel"
-        ),
+    identity_kernel = np.zeros_like(crosstalk_kernel)
+    kernel_anchor = (proxy.crosstalk_effective_kernel_size - 1) // 2
+    identity_kernel[kernel_anchor, kernel_anchor] = 1.0
+    crosstalk_delta = crosstalk_kernel - identity_kernel
+    kernel_limit = max(float(np.max(np.abs(crosstalk_kernel))), 1e-8)
+    delta_limit = max(float(np.max(np.abs(crosstalk_delta))), 1e-8)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    for axis, values, limit, title in [
+        (axes[0], crosstalk_kernel, kernel_limit, "Learned kernel K"),
+        (axes[1], crosstalk_delta, delta_limit, "Learned residual K - delta"),
+    ]:
+        image = axis.imshow(
+            values,
+            cmap="RdBu_r",
+            vmin=-limit,
+            vmax=limit,
+            interpolation="nearest",
+        )
+        factor = proxy.crosstalk_subpixel_factor
+        for boundary in range(factor, proxy.crosstalk_effective_kernel_size, factor):
+            axis.axhline(boundary - 0.5, color="black", linewidth=0.5, alpha=0.4)
+            axis.axvline(boundary - 0.5, color="black", linewidth=0.5, alpha=0.4)
+        axis.set(
+            xlabel="Sub-pixel tap",
+            ylabel="Sub-pixel tap",
+            title=title,
+        )
+        fig.colorbar(image, ax=axis, label="Coupling weight")
+    fig.suptitle(
+        f"SLM cross talk: {proxy.crosstalk_kernel_size}x"
+        f"{proxy.crosstalk_kernel_size} pixel support, "
+        f"P={proxy.crosstalk_subpixel_factor}, "
+        f"K={proxy.crosstalk_effective_kernel_size}x"
+        f"{proxy.crosstalk_effective_kernel_size}"
     )
-    fig.colorbar(image, ax=axis, label="Normalized coupling weight")
     fig.tight_layout()
     fig.savefig(run_dir / "learned_slm_crosstalk_kernel.png", dpi=180)
     plt.close(fig)
     np.savez_compressed(
         run_dir / "learned_slm_crosstalk_kernel.npz",
         kernel=crosstalk_kernel.astype(np.float32),
-        kernel_size=np.int64(proxy.crosstalk_kernel_size),
+        residual_from_identity=crosstalk_delta.astype(np.float32),
+        support_size_slm_pixels=np.int64(proxy.crosstalk_kernel_size),
+        subpixel_factor=np.int64(proxy.crosstalk_subpixel_factor),
+        effective_kernel_size=np.int64(proxy.crosstalk_effective_kernel_size),
+        parameterization=np.array("signed DC-preserving residual"),
         domain=np.array("normalized voltage-proportional SLM drive"),
         phase_stroke_rad=np.float64(2.0 * np.pi),
     )
@@ -1370,8 +1432,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         metavar="N",
         help=(
-            "positive SLM pixel cross-talk kernel size; N=1 preserves the "
-            "previous identity model (odd N gives a symmetric support)"
+            "cross-talk support in physical SLM pixels; the learned kernel "
+            "has size (N*P)x(N*P)"
+        ),
+    )
+    parser.add_argument(
+        "--crosstalk-subpixel-factor",
+        type=int,
+        default=1,
+        metavar="P",
+        help=(
+            "nearest-neighbor sub-pixels per SLM pixel before cross-talk "
+            "convolution; must divide --upsample-factor"
         ),
     )
     parser.add_argument(
@@ -1500,6 +1572,13 @@ def main() -> None:
         raise ValueError("transfer correction limits must be positive")
     if args.crosstalk_kernel_size <= 0:
         raise ValueError("--crosstalk-kernel-size must be positive")
+    if args.crosstalk_subpixel_factor <= 0:
+        raise ValueError("--crosstalk-subpixel-factor must be positive")
+    if args.upsample_factor % args.crosstalk_subpixel_factor != 0:
+        raise ValueError(
+            "--crosstalk-subpixel-factor must divide --upsample-factor so "
+            "the final optical sampling grid remains unchanged"
+        )
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -1604,8 +1683,14 @@ def main() -> None:
         f"max_phase={args.transfer_max_phase_rad:g} rad"
     )
     print(
-        f">>> SLM cross talk: kernel={args.crosstalk_kernel_size}x"
-        f"{args.crosstalk_kernel_size}, lr={args.lr_crosstalk:g}, "
+        f">>> SLM cross talk: support={args.crosstalk_kernel_size}x"
+        f"{args.crosstalk_kernel_size} physical pixels, "
+        f"P={args.crosstalk_subpixel_factor}, "
+        f"learned_kernel={args.crosstalk_kernel_size * args.crosstalk_subpixel_factor}x"
+        f"{args.crosstalk_kernel_size * args.crosstalk_subpixel_factor}, "
+        f"remaining_optical_upsample="
+        f"{args.upsample_factor // args.crosstalk_subpixel_factor}, "
+        f"lr={args.lr_crosstalk:g}, signed_DC_preserving=True, "
         "domain=unwrapped voltage-proportional drive"
     )
 
@@ -1635,6 +1720,7 @@ def main() -> None:
         source_grid_shape=(args.source_grid_x, args.source_grid_y),
         source_max_deviation=args.source_max_deviation,
         crosstalk_kernel_size=args.crosstalk_kernel_size,
+        crosstalk_subpixel_factor=args.crosstalk_subpixel_factor,
         z_enabled=args.optimize_z,
         z_initial_m=args.z_m,
         z_min_m=args.z_min_m,
@@ -1655,21 +1741,46 @@ def main() -> None:
     global_step = 0
     if args.resume is not None:
         checkpoint = torch_load_checkpoint(args.resume, device)
-        incompatible = proxy.load_state_dict(
-            checkpoint["parameter_state_dict"], strict=False
+        saved_state = checkpoint["parameter_state_dict"]
+        current_state = proxy.state_dict()
+        compatible_state = {}
+        unexpected_keys = []
+        shape_mismatches = {}
+        for key, value in saved_state.items():
+            if key not in current_state:
+                unexpected_keys.append(key)
+            elif current_state[key].shape != value.shape:
+                shape_mismatches[key] = (
+                    tuple(value.shape), tuple(current_state[key].shape)
+                )
+            else:
+                compatible_state[key] = value
+
+        incompatible = proxy.load_state_dict(compatible_state, strict=False)
+        exact_parameter_match = not (
+            incompatible.missing_keys
+            or unexpected_keys
+            or shape_mismatches
         )
-        if incompatible.missing_keys or incompatible.unexpected_keys:
+        if not exact_parameter_match:
             print(
                 ">>> Resume parameter compatibility: "
                 f"missing={incompatible.missing_keys}, "
-                f"unexpected={incompatible.unexpected_keys}"
+                f"unexpected={unexpected_keys}, "
+                f"shape_mismatches={shape_mismatches}"
             )
-        try:
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        except ValueError as error:
+        if exact_parameter_match and "optimizer_state_dict" in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            except (KeyError, ValueError) as error:
+                print(
+                    ">>> Optimizer state was not restored because parameter "
+                    f"groups changed: {error}"
+                )
+        elif "optimizer_state_dict" in checkpoint:
             print(
-                ">>> Optimizer state was not restored because parameter groups "
-                f"changed: {error}"
+                ">>> Optimizer state was not restored because the proxy "
+                "parameter architecture changed."
             )
         history = list(checkpoint.get("history", []))
         start_epoch = int(checkpoint.get("epoch", 0)) + 1
@@ -1728,9 +1839,14 @@ def main() -> None:
             "z_m": proxy.z_position_m(False).item(),
             "delta_z_um": proxy.delta_z_m(False).item() * 1e6,
             "crosstalk_center_weight": proxy.slm_crosstalk_kernel(False)[
-                (proxy.crosstalk_kernel_size - 1) // 2,
-                (proxy.crosstalk_kernel_size - 1) // 2,
+                (proxy.crosstalk_effective_kernel_size - 1) // 2,
+                (proxy.crosstalk_effective_kernel_size - 1) // 2,
             ].item(),
+            "crosstalk_kernel_min": proxy.slm_crosstalk_kernel(False).min().item(),
+            "crosstalk_kernel_max": proxy.slm_crosstalk_kernel(False).max().item(),
+            "crosstalk_residual_l1": proxy.slm_crosstalk_residual(
+                False
+            ).abs().mean().item(),
             "z_min_delta_um": (
                 proxy.z_min_m - proxy.z_initial_m
             ).item() * 1e6,
