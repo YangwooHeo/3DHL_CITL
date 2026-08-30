@@ -1308,9 +1308,9 @@ def quantile_display(array: np.ndarray) -> np.ndarray:
 
 @torch.no_grad()
 def save_previews(beam, proxy, dataset, indices, base_profile,
-                  physics, cfg, device, run_dir) -> None:
-    preview_dir = run_dir / "samples"
-    preview_dir.mkdir(exist_ok=True)
+                  physics, cfg, device, run_dir, split_name: str) -> None:
+    preview_dir = run_dir / "samples" / split_name
+    preview_dir.mkdir(parents=True, exist_ok=True)
     for index in indices:
         sample = dataset[index]
         prediction, target = make_prediction(
@@ -1328,7 +1328,7 @@ def save_previews(beam, proxy, dataset, indices, base_profile,
             axis.imshow(image, cmap=cmap, vmin=0, vmax=1)
             axis.set_title(title)
             axis.axis("off")
-        fig.suptitle(str(sample["id"]))
+        fig.suptitle(f"{split_name}: {sample['id']}")
         fig.tight_layout()
         safe_id = "".join(c if c.isalnum() or c in "-_." else "_"
                           for c in str(sample["id"]))
@@ -1505,7 +1505,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-other", type=float, default=1.0)
     parser.add_argument("--val-every", type=int, default=5)
     parser.add_argument("--val-max-samples", type=int, default=16)
-    parser.add_argument("--n-vis", type=int, default=4)
+    parser.add_argument(
+        "--n-vis",
+        type=int,
+        default=4,
+        help=(
+            "legacy fallback preview count used when --n-vis-train or "
+            "--n-vis-val is omitted"
+        ),
+    )
+    parser.add_argument(
+        "--n-vis-train",
+        type=int,
+        default=None,
+        help="maximum number of final train previews; 0 disables them",
+    )
+    parser.add_argument(
+        "--n-vis-val",
+        type=int,
+        default=None,
+        help="maximum number of final validation previews; 0 disables them",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--require-cuda", action="store_true")
@@ -1549,6 +1569,14 @@ def main() -> None:
         raise ValueError("--epochs and --batch-size must be positive")
     if args.val_every <= 0 or args.val_max_samples <= 0:
         raise ValueError("--val-every and --val-max-samples must be positive")
+    if args.n_vis < 0:
+        raise ValueError("--n-vis must be non-negative")
+    if args.n_vis_train is None:
+        args.n_vis_train = args.n_vis
+    if args.n_vis_val is None:
+        args.n_vis_val = args.n_vis
+    if args.n_vis_train < 0 or args.n_vis_val < 0:
+        raise ValueError("--n-vis-train and --n-vis-val must be non-negative")
     if args.z_m <= 0 or args.roi_size <= 0 or args.upsample_factor <= 0:
         raise ValueError("z, ROI size, and upsample factor must be positive")
     if not 0 < args.z_min_m < args.z_m < args.z_max_m:
@@ -1623,6 +1651,8 @@ def main() -> None:
         evenly_spaced(val_indices, args.val_max_samples)
         if has_validation else []
     )
+    train_preview_indices = evenly_spaced(train_indices, args.n_vis_train)
+    val_preview_indices = evenly_spaced(val_indices, args.n_vis_val)
     checkpoint_metric = "val_loss" if has_validation else "train_loss"
 
     cfg = config_from_args(args, device, beam_config)
@@ -1651,7 +1681,21 @@ def main() -> None:
             "train": [dataset.samples[i]["id"] for i in train_indices],
             "val": [dataset.samples[i]["id"] for i in val_indices],
             "validation_evaluated": [dataset.samples[i]["id"] for i in eval_indices],
+            "visualization": {
+                "train": [
+                    dataset.samples[i]["id"] for i in train_preview_indices
+                ],
+                "val": [
+                    dataset.samples[i]["id"] for i in val_preview_indices
+                ],
+            },
         }, handle, indent=2)
+
+    print(
+        ">>> Final previews: "
+        f"train={len(train_preview_indices)}/{len(train_indices)}, "
+        f"val={len(val_preview_indices)}/{len(val_indices)}"
+    )
 
     if not has_validation:
         print(
@@ -1901,11 +1945,13 @@ def main() -> None:
         (args.roi_size, args.roi_size),
         run_dir,
     )
-    preview_indices = evenly_spaced(val_indices if val_indices else train_indices,
-                                    args.n_vis)
     save_previews(
-        beam, proxy, dataset, preview_indices, base_profile,
-        physics, cfg, device, run_dir,
+        beam, proxy, dataset, train_preview_indices, base_profile,
+        physics, cfg, device, run_dir, "train",
+    )
+    save_previews(
+        beam, proxy, dataset, val_preview_indices, base_profile,
+        physics, cfg, device, run_dir, "val",
     )
     print(f">>> Done. Outputs: {run_dir.resolve()}")
 
