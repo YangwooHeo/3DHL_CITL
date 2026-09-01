@@ -48,32 +48,21 @@ class ReferenceGainTests(unittest.TestCase):
     def setUpClass(cls):
         cls.bp = load_batch_pattern()
 
-    def test_manual_and_automatic_slot_layouts(self):
+    def test_run_static_slot_layout(self):
         bp = self.bp
 
         bp.REFERENCE_GAIN_ENABLED = False
-        bp.MANUAL_ADVANCE_AFTER_SAVE = True
         self.assertEqual(bp.target_memory_location(0), 1)
         self.assertEqual(bp.max_target_chunk_size(), 128)
 
         bp.REFERENCE_GAIN_ENABLED = True
-        bp.MANUAL_ADVANCE_AFTER_SAVE = True
         self.assertEqual(bp.reference_memory_location(5), 1)
         self.assertEqual(bp.target_memory_location(0), 2)
         self.assertEqual(bp.target_memory_location(5), 7)
         self.assertEqual(bp.max_target_chunk_size(), 127)
 
-        bp.MANUAL_ADVANCE_AFTER_SAVE = False
-        self.assertEqual(bp.reference_memory_location(0), 1)
-        self.assertEqual(bp.reference_memory_location(1), 3)
-        self.assertEqual(bp.target_memory_location(0), 2)
-        self.assertEqual(bp.target_memory_location(1), 4)
-        self.assertEqual(bp.slm_frames_per_target(), 2)
-        self.assertEqual(bp.max_target_chunk_size(), 64)
-
     def test_reference_metric_tracks_multiplicative_intensity(self):
         bp = self.bp
-        bp.REFERENCE_REGISTRATION_ENABLED = False
         bp.REFERENCE_SIGNAL_PERCENTILE = 90.0
         bp.REFERENCE_BACKGROUND_PERCENTILE = 20.0
         bp.REFERENCE_MIN_ROI_PIXELS = 100
@@ -97,56 +86,8 @@ class ReferenceGainTests(unittest.TestCase):
                 rows = list(bp.csv.DictReader(f))
             self.assertEqual(rows[0]['mask_name'], 'target.npy')
             self.assertEqual(rows[0]['target_status'], 'OK')
-            self.assertIn('registration_dx_px', rows[0])
-            self.assertIn('registration_dy_px', rows[0])
-
-    def test_translation_is_shift_applied_to_moving_image(self):
-        bp = self.bp
-        bp.REFERENCE_REGISTRATION_SATURATION_THRESHOLD = np.inf
-        bp.REFERENCE_REGISTRATION_DARK_THRESHOLD = -np.inf
-        bp.REFERENCE_REGISTRATION_MASK_DILATE_RADIUS = 0
-        bp.REFERENCE_REGISTRATION_BLUR_SIGMA = 0.0
-        bp.REFERENCE_REGISTRATION_HIGHPASS_SIGMA = 0.0
-        bp.REFERENCE_REGISTRATION_METHOD = 'phasecorr'
-        bp.REFERENCE_REGISTRATION_MAX_EXPECTED_SHIFT = 50.0
-
-        rng = np.random.default_rng(1234)
-        fixed = rng.normal(size=(128, 160))
-        moving = np.roll(fixed, shift=(3, -4), axis=(0, 1))
-        dx, dy = bp.estimate_reference_translation(fixed, moving)
-
-        self.assertAlmostEqual(dx, 4.0, delta=0.15)
-        self.assertAlmostEqual(dy, -3.0, delta=0.15)
-
-    def test_tracker_uses_first_reference_as_registration_anchor(self):
-        bp = self.bp
-        bp.REFERENCE_REGISTRATION_ENABLED = True
-        bp.REFERENCE_REGISTRATION_CHANNEL = 'raw_bayer'
-        bp.REFERENCE_REGISTRATION_SATURATION_THRESHOLD = np.inf
-        bp.REFERENCE_REGISTRATION_DARK_THRESHOLD = -np.inf
-        bp.REFERENCE_REGISTRATION_MASK_DILATE_RADIUS = 0
-        bp.REFERENCE_REGISTRATION_BLUR_SIGMA = 0.0
-        bp.REFERENCE_REGISTRATION_HIGHPASS_SIGMA = 0.0
-        bp.REFERENCE_REGISTRATION_METHOD = 'phasecorr'
-        bp.REFERENCE_REGISTRATION_MAX_EXPECTED_SHIFT = 50.0
-
-        rng = np.random.default_rng(4321)
-        y, x = np.mgrid[:96, :128]
-        envelope = 1200 * np.exp(-((x - 64) ** 2 + (y - 48) ** 2) / (2 * 18 ** 2))
-        anchor = (100 + envelope + rng.integers(0, 100, size=envelope.shape)).astype(
-            np.uint16)
-        moving = np.roll(anchor, shift=(-2, 3), axis=(0, 1))
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            tracker = bp.ReferenceGainTracker(
-                os.path.join(temp_dir, 'registration.csv'), 'reference.npy')
-            first = tracker.measure(anchor)
-            second = tracker.measure(moving)
-
-        self.assertEqual(first['registration_dx_px'], 0.0)
-        self.assertEqual(first['registration_dy_px'], 0.0)
-        self.assertAlmostEqual(second['registration_dx_px'], -3.0, delta=0.2)
-        self.assertAlmostEqual(second['registration_dy_px'], 2.0, delta=0.2)
+            self.assertNotIn('registration_dx_px', rows[0])
+            self.assertNotIn('registration_dy_px', rows[0])
 
     def test_optimized_preprocessor_caches_wfc_and_bypasses_identity_tonemap(self):
         bp = self.bp
@@ -192,7 +133,7 @@ class ReferenceGainTests(unittest.TestCase):
         self.assertTrue(second.flags.c_contiguous)
         np.testing.assert_array_equal(first, expected_first)
 
-    def test_optimized_slot_order_matches_reference_modes(self):
+    def test_optimized_slot_order_matches_run_static(self):
         bp = self.bp
 
         class IdentityToneMapper:
@@ -213,16 +154,9 @@ class ReferenceGainTests(unittest.TestCase):
             preprocessor = bp.SLMFramePreprocessor(
                 None, IdentityToneMapper(), frame_shape=(2, 2))
 
-            bp.MANUAL_ADVANCE_AFTER_SAVE = True
-            manual = bp.build_chunk_slm_frames(
+            frames = bp.build_chunk_slm_frames(
                 [first_path, second_path], preprocessor)
-            self.assertEqual([int(frame[0, 0]) for frame in manual], [9, 1, 2])
-
-            bp.MANUAL_ADVANCE_AFTER_SAVE = False
-            automatic = bp.build_chunk_slm_frames(
-                [first_path, second_path], preprocessor)
-            self.assertEqual(
-                [int(frame[0, 0]) for frame in automatic], [9, 1, 9, 2])
+            self.assertEqual([int(frame[0, 0]) for frame in frames], [9, 1, 2])
 
     def test_direct_upload_preserves_frame_and_slot_order(self):
         bp = self.bp

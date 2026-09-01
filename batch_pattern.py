@@ -5,8 +5,8 @@ For every phase_mask_*.npy in MASK_FOLDER:
     1. Randomize the exposure order to reduce systematic laser-intensity drift.
     2. Prepare up to CHUNK_SIZE .npy files as contiguous SLM-ready frames.
     3. Upload those frames to SLM memory slots 1..N.
-    4. Start one long exposure/playback run for the chunk.
-    5. Capture one Basler frame per SLM frame and save it as a PNG with the SAME
+    4. Keep the laser on while manually displaying each SLM memory slot.
+    5. Capture one Basler frame per target and save it with the SAME
        basename as the phase mask (phase_mask_dot.npy -> phase_mask_dot.npy
        in npy_raw16 mode, or phase_mask_dot.png in png mode).
     6. Upload the next chunk over the same SLM memory slots and continue.
@@ -74,9 +74,7 @@ WFC_FILE_PATH = r'G:\Shared drives\taylorlab\3DHL\Phase masks\wavefront correcti
 EXPOSURE_PARAMS = dict(
     pwm_1=255,          # 473 nm laser PWM (0-255)
     pwm_2=0,            # ignored in single-wavelength mode
-    fps=4,              # legacy single-mask fps; chunk playback derives fps from duration_ms
-    duration_ms=2500,   # per-mask hold time; chunk exposure uses duration_ms * N
-    suppress_ms=50,
+    duration_ms=2500,   # used only when MANUAL_CAPTURE_DELAY_S is None
 )
 
 # ---- Camera ----
@@ -146,10 +144,9 @@ SLM_BYPASS_IDENTITY_TONEMAP = True
 SLM_CHAIN_UPLOADS_WITHOUT_PRECHECK = True
 PROFILE_SLM_UPLOAD_EACH_FRAME = True
 
-# Correctness-first mode: after a chunk is uploaded, each SLM memory slot is
-# displayed manually. The next phase is not displayed until the current output
-# write has succeeded.
-MANUAL_ADVANCE_AFTER_SAVE = True
+# Each SLM memory slot is displayed manually while the laser remains on for the
+# entire run. The next phase is not displayed until the current output write
+# has succeeded.
 MANUAL_SLM_SETTLE_S = 0.30
 MANUAL_LASER_SETTLE_S = 0.10
 MANUAL_CAPTURE_DELAY_S = None  # None -> duration_ms * CAPTURE_AT_FRACTION
@@ -157,8 +154,7 @@ CAMERA_STALE_FRAMES_TO_FLUSH = 2
 
 # The Arduino command parser is most reliable through ArduinoController.writeCommand,
 # even though it blocks on the serial read timeout. Use this correctness-first path
-# for manual laser on/off.
-MANUAL_LASER_TIMING_MODE = 'run_static'  # 'per_frame', 'chunk_static', or 'run_static'
+# for run-start/run-end laser control.
 MANUAL_LASER_USE_BLOCKING_COMMAND = None  # legacy override: True -> blocking, False -> nonblocking
 MANUAL_LASER_COMMAND_MODE = 'blocking'  # 'blocking', 'short_timeout', or 'nonblocking'
 MANUAL_LASER_SHORT_TIMEOUT_S = 0.10
@@ -169,7 +165,6 @@ PROFILE_TIMING = True
 
 # ---- Loop pacing ----
 INTER_CHUNK_PAUSE_S    = 2.0   # now applied between uploaded chunks
-POST_PATTERN_BUFFER_S = 0.5
 OVERWRITE_EXISTING    = True   # if False, skip masks whose PNG already exists
 VERBOSE               = True
 
@@ -201,20 +196,6 @@ REFERENCE_SIGNAL_PERCENTILE = 90.0
 REFERENCE_BACKGROUND_PERCENTILE = 20.0
 REFERENCE_MIN_ROI_PIXELS = 1024
 REFERENCE_MAX_SAT_PCT = 0.5
-
-# Anchor-relative translation registration for each captured reference.
-# The first reference is fixed at (0, 0). Later values are the [dx, dy] shift
-# that must be applied to the current reference to align it to that anchor.
-# dx > 0 moves right; dy > 0 moves down. Values are full-resolution pixels.
-REFERENCE_REGISTRATION_ENABLED = True
-REFERENCE_REGISTRATION_CHANNEL = 'blue'  # 'blue', 'gray', or 'raw_bayer'
-REFERENCE_REGISTRATION_SATURATION_THRESHOLD = None  # None -> automatic
-REFERENCE_REGISTRATION_DARK_THRESHOLD = None        # None -> automatic
-REFERENCE_REGISTRATION_MASK_DILATE_RADIUS = 0
-REFERENCE_REGISTRATION_BLUR_SIGMA = 1.0
-REFERENCE_REGISTRATION_HIGHPASS_SIGMA = 0.0
-REFERENCE_REGISTRATION_METHOD = 'gradcorr'  # 'gradcorr' or 'phasecorr'
-REFERENCE_REGISTRATION_MAX_EXPECTED_SHIFT = 50.0
 
 # Per-file exposure overrides. Key = mask basename, value = pc.pattern kwargs.
 PER_FILE_OVERRIDE = {
@@ -333,49 +314,21 @@ def validate_reference_config():
             'reference percentiles must satisfy 0 <= background < signal <= 100')
     if REFERENCE_MIN_ROI_PIXELS < 1:
         raise ValueError('REFERENCE_MIN_ROI_PIXELS must be positive')
-    if REFERENCE_REGISTRATION_CHANNEL not in ('blue', 'gray', 'raw_bayer'):
-        raise ValueError(
-            "REFERENCE_REGISTRATION_CHANNEL must be 'blue', 'gray', or 'raw_bayer'")
-    if REFERENCE_REGISTRATION_METHOD not in ('gradcorr', 'phasecorr'):
-        raise ValueError(
-            "REFERENCE_REGISTRATION_METHOD must be 'gradcorr' or 'phasecorr'")
-    if REFERENCE_REGISTRATION_MASK_DILATE_RADIUS < 0:
-        raise ValueError('REFERENCE_REGISTRATION_MASK_DILATE_RADIUS cannot be negative')
-    if REFERENCE_REGISTRATION_BLUR_SIGMA < 0:
-        raise ValueError('REFERENCE_REGISTRATION_BLUR_SIGMA cannot be negative')
-    if REFERENCE_REGISTRATION_HIGHPASS_SIGMA < 0:
-        raise ValueError('REFERENCE_REGISTRATION_HIGHPASS_SIGMA cannot be negative')
-    if REFERENCE_REGISTRATION_MAX_EXPECTED_SHIFT <= 0:
-        raise ValueError('REFERENCE_REGISTRATION_MAX_EXPECTED_SHIFT must be positive')
-
-
-def slm_frames_per_target():
-    if REFERENCE_GAIN_ENABLED and not MANUAL_ADVANCE_AFTER_SAVE:
-        return 2
-    return 1
 
 
 def max_target_chunk_size():
-    if not REFERENCE_GAIN_ENABLED:
-        return SLM_MEMORY_CAPACITY
-    if MANUAL_ADVANCE_AFTER_SAVE:
-        return SLM_MEMORY_CAPACITY - 1
-    return SLM_MEMORY_CAPACITY // 2
+    return SLM_MEMORY_CAPACITY - 1 if REFERENCE_GAIN_ENABLED else SLM_MEMORY_CAPACITY
 
 
 def reference_memory_location(target_offset):
     if not REFERENCE_GAIN_ENABLED:
         return None
-    if MANUAL_ADVANCE_AFTER_SAVE:
-        return 1
-    return target_offset * 2 + 1
+    return 1
 
 
 def target_memory_location(target_offset):
     if REFERENCE_GAIN_ENABLED:
-        if MANUAL_ADVANCE_AFTER_SAVE:
-            return target_offset + 2
-        return target_offset * 2 + 2
+        return target_offset + 2
     return target_offset + 1
 
 
@@ -448,206 +401,6 @@ def raw_image_stats(img):
     return img, stats
 
 
-def reference_registration_image(raw):
-    """Convert a Bayer capture to the 2-D intensity image used for registration."""
-    raw = np.asarray(raw, dtype=np.uint16)
-    if REFERENCE_REGISTRATION_CHANNEL == 'raw_bayer':
-        return raw.astype(np.float32)
-
-    bgr = cv2.cvtColor(raw, DEBAYER_CODE)
-    if REFERENCE_REGISTRATION_CHANNEL == 'blue':
-        return bgr[:, :, 0].astype(np.float32)
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
-
-
-def robust_intensity_normalize(image):
-    """MATLAB robustIntensityNormalize equivalent."""
-    image = np.asarray(image, dtype=np.float64).copy()
-    finite = np.isfinite(image)
-    if not np.any(finite):
-        raise RuntimeError('registration image contains no finite values')
-
-    values = image[finite]
-    image[~finite] = np.median(values)
-    image = np.maximum(image - np.percentile(values, 1), 0)
-    image = np.log1p(image)
-    values = image[np.isfinite(image)]
-    low = np.percentile(values, 1)
-    high = np.percentile(values, 99)
-    return np.clip((image - low) / max(high - low, np.finfo(float).eps), 0, 1)
-
-
-def robust_signed_normalize(image):
-    """MATLAB robustSignedNormalize equivalent."""
-    image = np.asarray(image, dtype=np.float64).copy()
-    finite = np.isfinite(image)
-    if not np.any(finite):
-        raise RuntimeError('no finite registration values remain after preprocessing')
-
-    image -= np.median(image[finite])
-    scale = np.percentile(np.abs(image[finite]), 99)
-    image /= max(scale, np.finfo(float).eps)
-    return (np.clip(image, -1, 1) + 1) / 2
-
-
-def cosine_window_2d(shape):
-    rows, cols = shape
-    y = (np.arange(rows, dtype=np.float64) + 0.5) / rows
-    x = (np.arange(cols, dtype=np.float64) + 0.5) / cols
-    return np.outer(np.sin(np.pi * y) ** 2, np.sin(np.pi * x) ** 2)
-
-
-def gaussian_blur(image, sigma):
-    if sigma <= 0:
-        return image
-    kernel_size = int(2 * np.ceil(3 * sigma) + 1)
-    kernel_size = max(3, kernel_size | 1)
-    return cv2.GaussianBlur(
-        np.asarray(image, dtype=np.float32),
-        (kernel_size, kernel_size), sigmaX=float(sigma),
-        borderType=cv2.BORDER_REPLICATE).astype(np.float64)
-
-
-def fill_invalid_regions(image, invalid_mask):
-    """Smoothly fill invalid regions, analogous to MATLAB regionfill."""
-    if not np.any(invalid_mask) or not np.any(~invalid_mask):
-        return image
-    if hasattr(cv2, 'inpaint'):
-        return cv2.inpaint(
-            np.asarray(image, dtype=np.float32),
-            invalid_mask.astype(np.uint8), 3.0, cv2.INPAINT_TELEA).astype(np.float64)
-
-    filled = np.asarray(image, dtype=np.float64).copy()
-    filled[invalid_mask] = np.median(filled[~invalid_mask])
-    return filled
-
-
-def dilate_invalid_mask(invalid_mask, radius):
-    radius = int(round(radius))
-    if radius <= 0:
-        return invalid_mask
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
-    return cv2.dilate(invalid_mask.astype(np.uint8), kernel).astype(bool)
-
-
-def numpy_phase_correlation(moving, fixed):
-    """Fallback phase correlation; returns the shift applied to moving."""
-    moving = np.asarray(moving, dtype=np.float64)
-    fixed = np.asarray(fixed, dtype=np.float64)
-    moving = moving - np.mean(moving)
-    fixed = fixed - np.mean(fixed)
-
-    cross_power = np.fft.fft2(fixed) * np.conj(np.fft.fft2(moving))
-    magnitude = np.abs(cross_power)
-    valid = magnitude > np.finfo(float).eps
-    if not np.any(valid):
-        raise RuntimeError('registration correlation is undefined for constant images')
-    cross_power[valid] /= magnitude[valid]
-    cross_power[~valid] = 0
-    correlation = np.fft.ifft2(cross_power).real
-    peak_row, peak_col = np.unravel_index(np.argmax(correlation), correlation.shape)
-
-    def subpixel_peak(values, index):
-        previous = values[(index - 1) % values.size]
-        center = values[index]
-        following = values[(index + 1) % values.size]
-        denominator = previous - 2 * center + following
-        if abs(denominator) <= np.finfo(float).eps:
-            return 0.0
-        return 0.5 * (previous - following) / denominator
-
-    col_profile = correlation[peak_row, :]
-    row_profile = correlation[:, peak_col]
-    shift_x = float(peak_col) + subpixel_peak(col_profile, peak_col)
-    shift_y = float(peak_row) + subpixel_peak(row_profile, peak_row)
-    if shift_x > correlation.shape[1] / 2:
-        shift_x -= correlation.shape[1]
-    if shift_y > correlation.shape[0] / 2:
-        shift_y -= correlation.shape[0]
-    return shift_x, shift_y
-
-
-def phase_correlation_shift(moving, fixed):
-    """Return [dx, dy] that aligns moving to fixed."""
-    if hasattr(cv2, 'phaseCorrelate'):
-        # OpenCV reports the displacement from src1 to src2, so moving is src1.
-        shift, _ = cv2.phaseCorrelate(
-            np.ascontiguousarray(moving, dtype=np.float32),
-            np.ascontiguousarray(fixed, dtype=np.float32))
-        return float(shift[0]), float(shift[1])
-    return numpy_phase_correlation(moving, fixed)
-
-
-def estimate_reference_translation(fixed_image, moving_image):
-    """MATLAB-style robust translation registration of moving to fixed."""
-    fixed = np.asarray(fixed_image, dtype=np.float64)
-    moving = np.asarray(moving_image, dtype=np.float64)
-    if fixed.ndim != 2 or moving.ndim != 2 or fixed.shape != moving.shape:
-        raise ValueError('registration images must be same-sized 2-D arrays')
-
-    finite_fixed = np.isfinite(fixed)
-    finite_moving = np.isfinite(moving)
-    if not np.any(finite_fixed) or not np.any(finite_moving):
-        raise RuntimeError('one or both registration images contain no finite values')
-
-    fixed_values = fixed[finite_fixed]
-    moving_values = moving[finite_moving]
-    saturation_threshold = REFERENCE_REGISTRATION_SATURATION_THRESHOLD
-    if saturation_threshold is None:
-        fixed_range = float(np.max(fixed_values) - np.min(fixed_values))
-        saturation_threshold = float(np.max(fixed_values) - 0.005 * fixed_range)
-    dark_threshold = REFERENCE_REGISTRATION_DARK_THRESHOLD
-    if dark_threshold is None:
-        moving_range = float(np.max(moving_values) - np.min(moving_values))
-        dark_threshold = float(np.min(moving_values) + 0.01 * moving_range)
-
-    invalid = (~finite_fixed | (fixed >= saturation_threshold) |
-               ~finite_moving | (moving <= dark_threshold))
-    invalid = dilate_invalid_mask(
-        invalid, REFERENCE_REGISTRATION_MASK_DILATE_RADIUS)
-    valid_fraction = 1.0 - np.count_nonzero(invalid) / invalid.size
-    if valid_fraction < 0.1:
-        _log(
-            f'  !! WARNING only {100 * valid_fraction:.2f}% of reference pixels '
-            'remain valid for registration')
-
-    fixed_registration = robust_intensity_normalize(fixed)
-    moving_registration = robust_intensity_normalize(moving)
-    fixed_registration = fill_invalid_regions(fixed_registration, invalid)
-    moving_registration = fill_invalid_regions(moving_registration, invalid)
-
-    fixed_registration = gaussian_blur(
-        fixed_registration, REFERENCE_REGISTRATION_BLUR_SIGMA)
-    moving_registration = gaussian_blur(
-        moving_registration, REFERENCE_REGISTRATION_BLUR_SIGMA)
-    if REFERENCE_REGISTRATION_HIGHPASS_SIGMA > 0:
-        fixed_registration -= gaussian_blur(
-            fixed_registration, REFERENCE_REGISTRATION_HIGHPASS_SIGMA)
-        moving_registration -= gaussian_blur(
-            moving_registration, REFERENCE_REGISTRATION_HIGHPASS_SIGMA)
-
-    fixed_registration = robust_signed_normalize(fixed_registration)
-    moving_registration = robust_signed_normalize(moving_registration)
-    edge_window = cosine_window_2d(fixed.shape)
-    fixed_registration *= edge_window
-    moving_registration *= edge_window
-
-    if REFERENCE_REGISTRATION_METHOD == 'gradcorr':
-        fixed_gy, fixed_gx = np.gradient(fixed_registration)
-        moving_gy, moving_gx = np.gradient(moving_registration)
-        fixed_registration = np.hypot(fixed_gx, fixed_gy)
-        moving_registration = np.hypot(moving_gx, moving_gy)
-
-    dx, dy = phase_correlation_shift(moving_registration, fixed_registration)
-    if (abs(dx) > REFERENCE_REGISTRATION_MAX_EXPECTED_SHIFT or
-            abs(dy) > REFERENCE_REGISTRATION_MAX_EXPECTED_SHIFT):
-        _log(
-            f'  !! WARNING registration shift larger than expected: '
-            f'dx={dx:+.3f}, dy={dy:+.3f} px')
-    return dx, dy
-
-
 class ReferenceGainTracker:
     """Reduce reference frames to a stable scalar and append one CSV row per target."""
 
@@ -656,8 +409,7 @@ class ReferenceGainTracker:
         'elapsed_s', 'status', 'reference_metric', 'baseline_metric',
         'relative_intensity', 'correction_gain', 'background_level',
         'signal_mean', 'roi_pixels', 'reference_raw_min',
-        'reference_raw_max', 'reference_sat_pct',
-        'registration_dx_px', 'registration_dy_px', 'target_status'
+        'reference_raw_max', 'reference_sat_pct', 'target_status'
     ]
 
     def __init__(self, csv_path, reference_path):
@@ -667,7 +419,6 @@ class ReferenceGainTracker:
         self.signal_mask = None
         self.background_mask = None
         self.baseline_metric = None
-        self.anchor_registration_image = None
 
         with open(self.csv_path, 'w', newline='') as f:
             csv.DictWriter(f, fieldnames=self.CSV_FIELDS).writeheader()
@@ -720,26 +471,6 @@ class ReferenceGainTracker:
         correction_gain = self.baseline_metric / metric
         status = 'SATURATED' if stats['sat_pct'] > REFERENCE_MAX_SAT_PCT else 'OK'
 
-        registration_dx = ''
-        registration_dy = ''
-        if REFERENCE_REGISTRATION_ENABLED:
-            try:
-                registration_image = reference_registration_image(raw)
-                if self.anchor_registration_image is None:
-                    self.anchor_registration_image = registration_image.copy()
-                    registration_dx = 0.0
-                    registration_dy = 0.0
-                    _log('  reference registration anchor initialized: dx=0, dy=0')
-                else:
-                    registration_dx, registration_dy = estimate_reference_translation(
-                        self.anchor_registration_image, registration_image)
-            except Exception as e:
-                registration_dx = ''
-                registration_dy = ''
-                registration_error = f'REGISTRATION_FAIL: {e!r}'
-                status = registration_error if status == 'OK' else f'{status}; {registration_error}'
-                _log(f'  reference registration failed (gain remains valid): {e!r}')
-
         return {
             'captured_at': datetime.now().isoformat(timespec='milliseconds'),
             'elapsed_s': time.perf_counter() - self.started_at,
@@ -754,8 +485,6 @@ class ReferenceGainTracker:
             'reference_raw_min': stats['raw_min'],
             'reference_raw_max': stats['raw_max'],
             'reference_sat_pct': stats['sat_pct'],
-            'registration_dx_px': registration_dx,
-            'registration_dy_px': registration_dy,
         }
 
     def failed_measurement(self, error):
@@ -778,8 +507,7 @@ class ReferenceGainTracker:
         for key in (
                 'elapsed_s', 'reference_metric', 'baseline_metric',
                 'relative_intensity', 'correction_gain', 'background_level',
-                'signal_mean', 'reference_sat_pct', 'registration_dx_px',
-                'registration_dy_px'):
+                'signal_mean', 'reference_sat_pct'):
             if row.get(key) != '':
                 row[key] = f'{row[key]:.9g}'
 
@@ -791,18 +519,12 @@ def capture_reference_measurement(cam, tracker):
     """Capture and measure a reference without retaining or saving its image."""
     try:
         measurement = tracker.measure(grab_frame(cam))
-        dx = measurement['registration_dx_px']
-        dy = measurement['registration_dy_px']
-        shift_text = (
-            'registration=FAIL' if dx == '' or dy == ''
-            else f'dx={dx:+.4f}px  dy={dy:+.4f}px')
         _log(
             '  reference -> '
             f'metric={measurement["reference_metric"]:.6g}  '
             f'rel={measurement["relative_intensity"]:.6f}  '
             f'gain={measurement["correction_gain"]:.6f}  '
-            f'sat={measurement["reference_sat_pct"]:.7f}%  '
-            f'{shift_text}')
+            f'sat={measurement["reference_sat_pct"]:.7f}%')
         if measurement['status'].startswith('SATURATED'):
             _log('  !! WARNING reference is saturated; correction gain may be biased')
         return measurement
@@ -1080,12 +802,10 @@ def build_chunk_slm_frames(chunk_files, preprocessor):
             REFERENCE_MASK_PATH, cache=True)
         timings.append(timing)
 
-    if reference_frame is not None and MANUAL_ADVANCE_AFTER_SAVE:
+    if reference_frame is not None:
         frames.append(reference_frame)
 
     for mask_path in chunk_files:
-        if reference_frame is not None and not MANUAL_ADVANCE_AFTER_SAVE:
-            frames.append(reference_frame)
         frame, timing = preprocessor.prepare_frame(mask_path)
         frames.append(frame)
         timings.append(timing)
@@ -1165,59 +885,15 @@ def build_chunk_mask_stack(chunk_files):
 
     reference_mask = load_mask(REFERENCE_MASK_PATH) if REFERENCE_GAIN_ENABLED else None
 
-    if reference_mask is not None and MANUAL_ADVANCE_AFTER_SAVE:
+    if reference_mask is not None:
         masks.append(reference_mask)
 
     for mask_path in chunk_files:
-        if reference_mask is not None and not MANUAL_ADVANCE_AFTER_SAVE:
-            masks.append(reference_mask)
         masks.append(load_mask(mask_path))
 
     chunk_array = np.concatenate(masks, axis=2).astype(np.uint16, copy=False)
     return hololith.Mask.maskstack.MaskStack(
         chunk_array, wavefront_correction=None, pad_mode='constant')
-
-
-def format_arduino_number(value):
-    value = float(value)
-    if abs(value - round(value)) < 1e-9:
-        return str(int(round(value)))
-    return f'{value:.6g}'
-
-
-def chunk_pattern_params(frame_params, n_frames):
-    """Convert per-mask exposure params to one chunk playback command."""
-    per_frame_ms = int(frame_params['duration_ms'])
-    if per_frame_ms <= 0:
-        raise ValueError('duration_ms must be positive')
-
-    fps = 1000.0 / float(per_frame_ms)
-    fps_for_command = int(round(fps)) if abs(fps - round(fps)) < 1e-9 else fps
-
-    params = dict(frame_params)
-    params['duration_ms'] = int(round(per_frame_ms * n_frames))
-    params['fps'] = fps_for_command
-    return params, per_frame_ms / 1000.0
-
-
-def start_chunk_pattern_nonblocking(pc, pattern_params, wl_first=1):
-    """Start Arduino exposure without waiting for serial read timeout."""
-    pc._resetStartFrame()
-    pwm = pattern_params['pwm_1'] if wl_first == 1 else pattern_params['pwm_2']
-    cmd = (
-        f's_exp -wl_select {wl_first} '
-        f'-d {int(pattern_params["duration_ms"])} '
-        f'-pwm {int(pwm)} '
-        f'-fps {format_arduino_number(pattern_params["fps"])} '
-        f'-suppress_ms {int(pattern_params["suppress_ms"])} -y'
-    )
-
-    try:
-        pc.ard_ctrl.serial_port.reset_input_buffer()
-    except Exception:
-        pass
-    pc.ard_ctrl.serial_port.write(cmd.encode('utf-8'))
-    return cmd
 
 
 def send_arduino_nonblocking(pc, cmd):
@@ -1293,137 +969,78 @@ def save_captured_mask(img, mask_path, idx):
     return stats
 
 
-def capture_and_save_mask(cam, mask_path, idx):
-    img = grab_frame(cam)
-    return save_captured_mask(img, mask_path, idx)
-
-
-def run_manual_chunk_capture(
+def run_static_chunk_capture(
         pc, cam, chunk_files, frame_params, start_idx,
         chunk_no, reference_tracker=None):
-    """Capture targets manually, optionally measuring a reference before each one."""
-    if MANUAL_LASER_TIMING_MODE not in ('per_frame', 'chunk_static', 'run_static'):
-        raise ValueError(
-            "MANUAL_LASER_TIMING_MODE must be 'per_frame', 'chunk_static', or 'run_static'")
-
+    """Capture manually while the laser remains on for the entire run."""
     results = []
-    per_frame_s = frame_params['duration_ms'] / 1000.0
+    duration_s = frame_params['duration_ms'] / 1000.0
     if MANUAL_CAPTURE_DELAY_S is None:
-        capture_delay_s = max(MANUAL_LASER_SETTLE_S, per_frame_s * CAPTURE_AT_FRACTION)
+        capture_delay_s = max(MANUAL_LASER_SETTLE_S, duration_s * CAPTURE_AT_FRACTION)
     else:
         capture_delay_s = float(MANUAL_CAPTURE_DELAY_S)
 
-    chunk_laser_on = False
-    try:
-        if MANUAL_LASER_TIMING_MODE == 'chunk_static':
-            _log('  laser timing mode: chunk_static (laser stays on across this chunk)')
-            t0 = time.perf_counter()
-            set_laser(pc, pwm_1=frame_params['pwm_1'], pwm_2=0)
-            chunk_laser_on = True
-            t_chunk_laser_on = time.perf_counter() - t0
-            if MANUAL_LASER_SETTLE_S > 0:
-                time.sleep(MANUAL_LASER_SETTLE_S)
-            if PROFILE_TIMING:
-                _log(f'  chunk laser_on_s={t_chunk_laser_on:.3f}')
-
-        for j, mask_path in enumerate(chunk_files):
-            idx = start_idx + j
-            name = os.path.basename(mask_path)
-            t_frame = time.perf_counter()
-            laser_on = False
-            t_laser_on = 0.0
-            t_laser_off = 0.0
-            t_reference = 0.0
-            measurement = None
-            try:
-                if REFERENCE_GAIN_ENABLED:
-                    ref_location = reference_memory_location(j)
-                    _log(
-                        f'  display memory {ref_location} -> reference for {name}')
-                    t0 = time.perf_counter()
-                    pc.slm_ctrl.displayPatternAtMemory(ref_location)
-                    if MANUAL_SLM_SETTLE_S > 0:
-                        time.sleep(MANUAL_SLM_SETTLE_S)
-
-                    if MANUAL_LASER_TIMING_MODE == 'per_frame':
-                        t_laser_start = time.perf_counter()
-                        set_laser(pc, pwm_1=frame_params['pwm_1'], pwm_2=0)
-                        t_laser_on = time.perf_counter() - t_laser_start
-                        laser_on = True
-
-                    time.sleep(capture_delay_s)
-                    measurement = capture_reference_measurement(cam, reference_tracker)
-                    t_reference = time.perf_counter() - t0
-
-                memory_location = target_memory_location(j)
-                _log(f'  display memory {memory_location} -> {name}')
+    for j, mask_path in enumerate(chunk_files):
+        idx = start_idx + j
+        name = os.path.basename(mask_path)
+        t_frame = time.perf_counter()
+        t_reference = 0.0
+        measurement = None
+        try:
+            if REFERENCE_GAIN_ENABLED:
+                ref_location = reference_memory_location(j)
+                _log(
+                    f'  display memory {ref_location} -> reference for {name}')
                 t0 = time.perf_counter()
-                pc.slm_ctrl.displayPatternAtMemory(memory_location)
-                t_display = time.perf_counter() - t0
-                t0 = time.perf_counter()
+                pc.slm_ctrl.displayPatternAtMemory(ref_location)
                 if MANUAL_SLM_SETTLE_S > 0:
                     time.sleep(MANUAL_SLM_SETTLE_S)
-                t_slm_settle = time.perf_counter() - t0
-
-                if MANUAL_LASER_TIMING_MODE == 'per_frame':
-                    if not laser_on:
-                        t0 = time.perf_counter()
-                        set_laser(pc, pwm_1=frame_params['pwm_1'], pwm_2=0)
-                        t_laser_on = time.perf_counter() - t0
-                        laser_on = True
-
-                t0 = time.perf_counter()
                 time.sleep(capture_delay_s)
-                t_capture_delay = time.perf_counter() - t0
-                t0 = time.perf_counter()
-                img = grab_frame(cam)
-                t_grab = time.perf_counter() - t0
+                measurement = capture_reference_measurement(cam, reference_tracker)
+                t_reference = time.perf_counter() - t0
 
-                if MANUAL_LASER_TIMING_MODE == 'per_frame':
-                    t0 = time.perf_counter()
-                    set_laser(pc, pwm_1=0, pwm_2=0)
-                    t_laser_off = time.perf_counter() - t0
-                    laser_on = False
-
-                t0 = time.perf_counter()
-                stats = save_captured_mask(img, mask_path, idx=idx)
-                t_save = time.perf_counter() - t0
-                results.append((idx, name, True, stats))
-                if reference_tracker is not None:
-                    reference_tracker.record(
-                        idx, chunk_no, mask_path, measurement, target_status='OK')
-                if PROFILE_TIMING:
-                    t_total = time.perf_counter() - t_frame
-                    _log(
-                        '  timing_s '
-                        f'mode={MANUAL_LASER_TIMING_MODE} total={t_total:.3f} '
-                        f'display={t_display:.3f} slm_settle={t_slm_settle:.3f} '
-                        f'laser_on={t_laser_on:.3f} capture_wait={t_capture_delay:.3f} '
-                        f'grab={t_grab:.3f} laser_off={t_laser_off:.3f} '
-                        f'reference={t_reference:.3f} save={t_save:.3f}'
-                    )
-            except Exception as e:
-                if reference_tracker is not None:
-                    if measurement is None:
-                        measurement = reference_tracker.failed_measurement(repr(e))
-                    reference_tracker.record(
-                        idx, chunk_no, mask_path, measurement, target_status='FAIL')
-                # Keep the current phase from advancing to the next target if saving failed.
-                if laser_on:
-                    set_laser(pc, pwm_1=0, pwm_2=0)
-                    laser_on = False
-                raise
-            finally:
-                if laser_on:
-                    set_laser(pc, pwm_1=0, pwm_2=0)
-                drain_arduino_lines(pc)
-    finally:
-        if chunk_laser_on:
+            memory_location = target_memory_location(j)
+            _log(f'  display memory {memory_location} -> {name}')
             t0 = time.perf_counter()
-            set_laser(pc, pwm_1=0, pwm_2=0)
-            t_chunk_laser_off = time.perf_counter() - t0
+            pc.slm_ctrl.displayPatternAtMemory(memory_location)
+            t_display = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            if MANUAL_SLM_SETTLE_S > 0:
+                time.sleep(MANUAL_SLM_SETTLE_S)
+            t_slm_settle = time.perf_counter() - t0
+
+            t0 = time.perf_counter()
+            time.sleep(capture_delay_s)
+            t_capture_delay = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            img = grab_frame(cam)
+            t_grab = time.perf_counter() - t0
+
+            t0 = time.perf_counter()
+            stats = save_captured_mask(img, mask_path, idx=idx)
+            t_save = time.perf_counter() - t0
+            results.append((idx, name, True, stats))
+            if reference_tracker is not None:
+                reference_tracker.record(
+                    idx, chunk_no, mask_path, measurement, target_status='OK')
             if PROFILE_TIMING:
-                _log(f'  chunk laser_off_s={t_chunk_laser_off:.3f}')
+                t_total = time.perf_counter() - t_frame
+                _log(
+                    '  timing_s '
+                    f'mode=run_static total={t_total:.3f} '
+                    f'display={t_display:.3f} slm_settle={t_slm_settle:.3f} '
+                    f'capture_wait={t_capture_delay:.3f} grab={t_grab:.3f} '
+                    f'reference={t_reference:.3f} save={t_save:.3f}'
+                )
+        except Exception as e:
+            if reference_tracker is not None:
+                if measurement is None:
+                    measurement = reference_tracker.failed_measurement(repr(e))
+                reference_tracker.record(
+                    idx, chunk_no, mask_path, measurement, target_status='FAIL')
+            raise
+        finally:
+            drain_arduino_lines(pc)
 
     return results
 
@@ -1472,63 +1089,10 @@ def run_one_chunk(
                 f'  legacy SLM upload total='
                 f'{time.perf_counter() - t_upload:.3f}s')
 
-        if MANUAL_ADVANCE_AFTER_SAVE:
-            _log('  manual advance mode: next phase waits for capture save success')
-            return run_manual_chunk_capture(
-                pc, cam, chunk_files, frame_params, start_idx,
-                chunk_no, reference_tracker=reference_tracker)
-
-        n_slm_frames = n_frames * slm_frames_per_target()
-        pattern_params, frame_s = chunk_pattern_params(frame_params, n_slm_frames)
-        _log(f'  chunk exposure -> pwm_1={pattern_params["pwm_1"]}, '
-             f'fps={format_arduino_number(pattern_params["fps"])}, '
-             f'total_duration_ms={pattern_params["duration_ms"]}, '
-             f'per_slm_frame_ms={frame_params["duration_ms"]}')
-
-        cmd = start_chunk_pattern_nonblocking(pc, pattern_params, wl_first=1)
-        t0 = time.perf_counter()
-        _log(f'  Arduino command sent: {cmd}')
-
-        for j, mask_path in enumerate(chunk_files):
-            idx = start_idx + j
-            name = os.path.basename(mask_path)
-            measurement = None
-
-            if REFERENCE_GAIN_ENABLED:
-                reference_t = t0 + (2 * j + CAPTURE_AT_FRACTION) * frame_s
-                wait_s = reference_t - time.perf_counter()
-                if wait_s > 0:
-                    time.sleep(wait_s)
-                measurement = capture_reference_measurement(cam, reference_tracker)
-
-            target_frame_offset = j * slm_frames_per_target()
-            if REFERENCE_GAIN_ENABLED:
-                target_frame_offset += 1
-            target_t = t0 + (target_frame_offset + CAPTURE_AT_FRACTION) * frame_s
-            wait_s = target_t - time.perf_counter()
-            if wait_s > 0:
-                time.sleep(wait_s)
-
-            try:
-                stats = capture_and_save_mask(cam, mask_path, idx=idx)
-                results.append((idx, name, True, stats))
-                if reference_tracker is not None:
-                    reference_tracker.record(
-                        idx, chunk_no, mask_path, measurement, target_status='OK')
-            except Exception as e:
-                _log(f'  ERROR on {name}: {e!r}')
-                results.append((idx, name, False, None))
-                if reference_tracker is not None:
-                    if measurement is None:
-                        measurement = reference_tracker.failed_measurement(repr(e))
-                    reference_tracker.record(
-                        idx, chunk_no, mask_path, measurement, target_status='FAIL')
-
-        end_t = t0 + n_slm_frames * frame_s + POST_PATTERN_BUFFER_S
-        wait_s = end_t - time.perf_counter()
-        if wait_s > 0:
-            time.sleep(wait_s)
-        drain_arduino_lines(pc)
+        _log('  run_static manual advance: next phase waits for save success')
+        return run_static_chunk_capture(
+            pc, cam, chunk_files, frame_params, start_idx,
+            chunk_no, reference_tracker=reference_tracker)
 
     except Exception as e:
         _log(f'  ERROR on chunk {chunk_no}: {e!r}')
@@ -1575,13 +1139,9 @@ def main():
     _log(f'{len(pending_files)} mask(s) pending in {len(chunks)} chunk(s), '
          f'CHUNK_SIZE={CHUNK_SIZE}')
     if REFERENCE_GAIN_ENABLED:
-        slot_layout = (
-            'one reusable reference slot plus one slot per target'
-            if MANUAL_ADVANCE_AFTER_SAVE else
-            'interleaved reference,target slots')
         _log(
             f'Reference gain enabled: {REFERENCE_MASK_PATH} '
-            f'({slot_layout}; reference images are not saved)')
+            f'(one reusable reference slot; reference images are not saved)')
     if not pending_files:
         _log('Nothing pending after skip check.')
 
@@ -1616,27 +1176,25 @@ def main():
             if OPTIMIZED_SLM_PIPELINE:
                 slm_preprocessor = SLMFramePreprocessor(
                     WFC_FILE_PATH, tm_1)
-            if MANUAL_ADVANCE_AFTER_SAVE:
-                try:
-                    _log('Manual mode: disarming Arduino trigger interrupts for direct laser control')
-                    pc._disarmArduinoTriggers()
-                except Exception as e:
-                    _log(f'  Arduino trigger disarm failed (ignored): {e!r}')
+            try:
+                _log('Run-static mode: disarming Arduino trigger interrupts')
+                pc._disarmArduinoTriggers()
+            except Exception as e:
+                _log(f'  Arduino trigger disarm failed (ignored): {e!r}')
 
-                if MANUAL_LASER_TIMING_MODE == 'run_static':
-                    _log('Manual mode: run_static laser on for the entire pending capture run')
-                    static_pwm_1 = chunks[0][1]['pwm_1']
-                    static_pwm_values = {params['pwm_1'] for _, params in chunks}
-                    if len(static_pwm_values) > 1:
-                        _log(f'  !! WARNING run_static ignores varying pwm_1 values: '
-                             f'{sorted(static_pwm_values)}; using {static_pwm_1}')
-                    t0 = time.perf_counter()
-                    set_laser(pc, pwm_1=static_pwm_1, pwm_2=0)
-                    run_laser_on = True
-                    if MANUAL_LASER_SETTLE_S > 0:
-                        time.sleep(MANUAL_LASER_SETTLE_S)
-                    if PROFILE_TIMING:
-                        _log(f'  run laser_on_s={time.perf_counter() - t0:.3f}')
+            _log('Run-static mode: laser on for the entire pending capture run')
+            static_pwm_1 = chunks[0][1]['pwm_1']
+            static_pwm_values = {params['pwm_1'] for _, params in chunks}
+            if len(static_pwm_values) > 1:
+                _log(f'  !! WARNING run_static ignores varying pwm_1 values: '
+                     f'{sorted(static_pwm_values)}; using {static_pwm_1}')
+            t0 = time.perf_counter()
+            set_laser(pc, pwm_1=static_pwm_1, pwm_2=0)
+            run_laser_on = True
+            if MANUAL_LASER_SETTLE_S > 0:
+                time.sleep(MANUAL_LASER_SETTLE_S)
+            if PROFILE_TIMING:
+                _log(f'  run laser_on_s={time.perf_counter() - t0:.3f}')
 
             next_idx = len(results) + 1
             for chunk_no, (chunk_files, params) in enumerate(chunks, start=1):
