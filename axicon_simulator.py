@@ -25,6 +25,10 @@ DEFAULT_AXICON_PROFILE = "binary"
 DEFAULT_AXICON_PHASE_DEPTH_RAD = math.pi
 DEFAULT_AXICON_DUTY_CYCLE = 0.5
 DEFAULT_AXICON_RADIAL_OFFSET = 0.0
+# Physical displacement of the axicon centre relative to the optical axis [um].
+# x is tensor axis 0 and y is tensor axis 1 in the propagation grid.
+DEFAULT_AXICON_LATERAL_SHIFT_X_UM = 0.0
+DEFAULT_AXICON_LATERAL_SHIFT_Y_UM = 0.0
 # None selects all theoretically non-negligible propagating/sampled orders.
 DEFAULT_AXICON_DIFFRACTION_ORDERS = None
 DEFAULT_ROI_SIZE = 1024
@@ -96,7 +100,9 @@ def propagate_axicon_field(beam, phase_tensor, cone_angle, upsample_factor, h_as
                            axicon_profile=DEFAULT_AXICON_PROFILE,
                            axicon_phase_depth=DEFAULT_AXICON_PHASE_DEPTH_RAD,
                            axicon_duty_cycle=DEFAULT_AXICON_DUTY_CYCLE,
-                           axicon_radial_offset=DEFAULT_AXICON_RADIAL_OFFSET):
+                           axicon_radial_offset=DEFAULT_AXICON_RADIAL_OFFSET,
+                           axicon_lateral_shift_x_m=0.0,
+                           axicon_lateral_shift_y_m=0.0):
     with torch.no_grad():
         return beam.propagateToVolume_Axicon2(
             axicon_angle=cone_angle,
@@ -112,6 +118,8 @@ def propagate_axicon_field(beam, phase_tensor, cone_angle, upsample_factor, h_as
             axicon_phase_depth=axicon_phase_depth,
             axicon_duty_cycle=axicon_duty_cycle,
             axicon_radial_offset=axicon_radial_offset,
+            axicon_lateral_shift_x=axicon_lateral_shift_x_m,
+            axicon_lateral_shift_y=axicon_lateral_shift_y_m,
         )
 
 
@@ -302,7 +310,9 @@ def run_fno_proxy_inference(beam, beam_config, phase_path, fno_model, fno_cfg,
                             axicon_profile=DEFAULT_AXICON_PROFILE,
                             axicon_phase_depth=DEFAULT_AXICON_PHASE_DEPTH_RAD,
                             axicon_duty_cycle=DEFAULT_AXICON_DUTY_CYCLE,
-                            axicon_radial_offset=DEFAULT_AXICON_RADIAL_OFFSET):
+                            axicon_radial_offset=DEFAULT_AXICON_RADIAL_OFFSET,
+                            axicon_lateral_shift_x_m=0.0,
+                            axicon_lateral_shift_y_m=0.0):
     from train_fno_axicon import predict_camera, resize_batch
 
     output_directory = Path(output_directory)
@@ -330,6 +340,8 @@ def run_fno_proxy_inference(beam, beam_config, phase_path, fno_model, fno_cfg,
         axicon_phase_depth=axicon_phase_depth,
         axicon_duty_cycle=axicon_duty_cycle,
         axicon_radial_offset=axicon_radial_offset,
+        axicon_lateral_shift_x_m=axicon_lateral_shift_x_m,
+        axicon_lateral_shift_y_m=axicon_lateral_shift_y_m,
     )
     field_channels_raw = field_to_amp_cos_sin(recon_field, transpose_xy=transpose_output_field)
     field_channels = scale_field_channels_for_fno(field_channels_raw, fno_cfg)
@@ -490,7 +502,9 @@ def export_electric_fields(beam, beam_config, phase_paths, save_directory,
                            axicon_profile=DEFAULT_AXICON_PROFILE,
                            axicon_phase_depth=DEFAULT_AXICON_PHASE_DEPTH_RAD,
                            axicon_duty_cycle=DEFAULT_AXICON_DUTY_CYCLE,
-                           axicon_radial_offset=DEFAULT_AXICON_RADIAL_OFFSET):
+                           axicon_radial_offset=DEFAULT_AXICON_RADIAL_OFFSET,
+                           axicon_lateral_shift_x_m=0.0,
+                           axicon_lateral_shift_y_m=0.0):
     save_directory = Path(save_directory)
     save_directory.mkdir(parents=True, exist_ok=True)
 
@@ -525,6 +539,8 @@ def export_electric_fields(beam, beam_config, phase_paths, save_directory,
             axicon_phase_depth=axicon_phase_depth,
             axicon_duty_cycle=axicon_duty_cycle,
             axicon_radial_offset=axicon_radial_offset,
+            axicon_lateral_shift_x_m=axicon_lateral_shift_x_m,
+            axicon_lateral_shift_y_m=axicon_lateral_shift_y_m,
         )
         field_channels = field_to_amp_cos_sin(recon_field, transpose_xy=transpose_output_field)
         np.save(output_path, field_channels.astype(np.float32, copy=False))
@@ -541,7 +557,9 @@ def visualize_kspace_distortion(beam, phase_tensor, cone_angle, upsample_factor,
                                 axicon_profile=DEFAULT_AXICON_PROFILE,
                                 axicon_phase_depth=DEFAULT_AXICON_PHASE_DEPTH_RAD,
                                 axicon_duty_cycle=DEFAULT_AXICON_DUTY_CYCLE,
-                                axicon_radial_offset=DEFAULT_AXICON_RADIAL_OFFSET):
+                                axicon_radial_offset=DEFAULT_AXICON_RADIAL_OFFSET,
+                                axicon_lateral_shift_x_m=0.0,
+                                axicon_lateral_shift_y_m=0.0):
     print("\n--- [K-space Visualization Started] ---")
 
     slm_field = torch.exp(1j * phase_tensor)
@@ -555,7 +573,10 @@ def visualize_kspace_distortion(beam, phase_tensor, cone_angle, upsample_factor,
 
     x = torch.linspace(-(nx_up - 1) / 2, (nx_up - 1) / 2, nx_up, device=beam.beam_config.device) * ps_up
     y = torch.linspace(-(ny_up - 1) / 2, (ny_up - 1) / 2, ny_up, device=beam.beam_config.device) * ps_up
-    y2 = y.view(1, -1) ** 2
+    shift_x, shift_y = beam._validate_axicon_lateral_shift(
+        axicon_lateral_shift_x_m, axicon_lateral_shift_y_m
+    )
+    y2 = (y - shift_y).view(1, -1) ** 2
 
     radial_frequency = beam._resolve_axicon_radial_frequency(
         axicon_angle=cone_angle,
@@ -569,7 +590,7 @@ def visualize_kspace_distortion(beam, phase_tensor, cone_angle, upsample_factor,
     chunk_size = 1024
     for i in range(0, nx_up, chunk_size):
         end_idx = min(i + chunk_size, nx_up)
-        x2_chunk = x[i:end_idx].view(-1, 1) ** 2
+        x2_chunk = (x[i:end_idx] - shift_x).view(-1, 1) ** 2
         r_chunk = torch.sqrt(x2_chunk + y2)
         phase_chunk = beam._axicon_phase_from_radius(
             r_chunk,
@@ -722,6 +743,8 @@ if __name__ == "__main__":
     axicon_phase_depth = DEFAULT_AXICON_PHASE_DEPTH_RAD
     axicon_duty_cycle = DEFAULT_AXICON_DUTY_CYCLE
     axicon_radial_offset = DEFAULT_AXICON_RADIAL_OFFSET
+    axicon_lateral_shift_x_m = DEFAULT_AXICON_LATERAL_SHIFT_X_UM * 1e-6
+    axicon_lateral_shift_y_m = DEFAULT_AXICON_LATERAL_SHIFT_Y_UM * 1e-6
     axicon_diffraction_orders = DEFAULT_AXICON_DIFFRACTION_ORDERS
     axicon_transverse_frequency = 1.0 / axicon_grating_pitch
     axicon_na_air_equiv = beam_config.lambda_ * axicon_transverse_frequency
@@ -733,6 +756,8 @@ if __name__ == "__main__":
           f"theta_air={cone_angle:.4f} rad, "
           f"theta_medium={cone_angle_in_medium:.4f} rad at n={propagation_medium_index:.3f}")
     print(f"Single physical z target: {Z_TARGET * 1000:.3f} mm")
+    print(f"Axicon lateral shift: x={axicon_lateral_shift_x_m * 1e6:.3f} um, "
+          f"y={axicon_lateral_shift_y_m * 1e6:.3f} um")
 
     print('1. Initializing beam')
     beam = HoloBeam(beam_config)
@@ -794,6 +819,8 @@ if __name__ == "__main__":
             axicon_phase_depth=axicon_phase_depth,
             axicon_duty_cycle=axicon_duty_cycle,
             axicon_radial_offset=axicon_radial_offset,
+            axicon_lateral_shift_x_m=axicon_lateral_shift_x_m,
+            axicon_lateral_shift_y_m=axicon_lateral_shift_y_m,
         )
     elif run_mode == "viewer":
         phase_tensor, phase_data = load_slm_phase_tensor(
@@ -813,7 +840,9 @@ if __name__ == "__main__":
         #visualize_kspace_distortion(beam, phase_tensor, cone_angle, upsample_factor,
         #                            n_medium=propagation_medium_index,
         #                            axicon_angle_in_medium=axicon_angle_in_medium,
-        #                            axicon_transverse_frequency=axicon_transverse_frequency)
+        #                            axicon_transverse_frequency=axicon_transverse_frequency,
+        #                            axicon_lateral_shift_x_m=axicon_lateral_shift_x_m,
+        #                            axicon_lateral_shift_y_m=axicon_lateral_shift_y_m)
         recon = propagate_axicon_field(
             beam,
             phase_tensor,
@@ -828,6 +857,8 @@ if __name__ == "__main__":
             axicon_phase_depth=axicon_phase_depth,
             axicon_duty_cycle=axicon_duty_cycle,
             axicon_radial_offset=axicon_radial_offset,
+            axicon_lateral_shift_x_m=axicon_lateral_shift_x_m,
+            axicon_lateral_shift_y_m=axicon_lateral_shift_y_m,
         )
         print('3. Axicon propagation is successfully computed')
         recon_np = recon.detach().cpu().numpy()
@@ -888,6 +919,8 @@ if __name__ == "__main__":
                 axicon_phase_depth=axicon_phase_depth,
                 axicon_duty_cycle=axicon_duty_cycle,
                 axicon_radial_offset=axicon_radial_offset,
+                axicon_lateral_shift_x_m=axicon_lateral_shift_x_m,
+                axicon_lateral_shift_y_m=axicon_lateral_shift_y_m,
             )
     else:
         raise ValueError(f"Unsupported RUN_MODE={RUN_MODE!r}. "

@@ -83,6 +83,16 @@ class HoloBeam(Beam):
                 "'blazed') or 'binary' (alias: 'binary_phase')."
             ) from exc
 
+    @staticmethod
+    def _validate_axicon_lateral_shift(axicon_lateral_shift_x,
+                                       axicon_lateral_shift_y):
+        """Return finite physical axicon-center shifts in metres."""
+        shift_x = float(axicon_lateral_shift_x)
+        shift_y = float(axicon_lateral_shift_y)
+        if not math.isfinite(shift_x) or not math.isfinite(shift_y):
+            raise ValueError('Axicon lateral shifts must be finite.')
+        return shift_x, shift_y
+
     @classmethod
     def _axicon_phase_from_radius(cls, radius, radial_frequency,
                                   axicon_profile='continuous',
@@ -586,7 +596,9 @@ class HoloBeam(Beam):
                                  axicon_profile='continuous',
                                  axicon_phase_depth=math.pi,
                                  axicon_duty_cycle=0.5,
-                                 axicon_radial_offset=0.0):
+                                 axicon_radial_offset=0.0,
+                                 axicon_lateral_shift_x=0.0,
+                                 axicon_lateral_shift_y=0.0):
         '''
         Axicon lens forward propagation
         '''
@@ -627,7 +639,10 @@ class HoloBeam(Beam):
         x = torch.linspace(-(Nx_up-1)/2, (Nx_up-1)/2, Nx_up, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps_up
         y = torch.linspace(-(Ny_up-1)/2, (Ny_up-1)/2, Ny_up, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps_up
         X, Y = torch.meshgrid(x, y, indexing='ij')
-        R = torch.sqrt(X**2 + Y**2)
+        shift_x, shift_y = self._validate_axicon_lateral_shift(
+            axicon_lateral_shift_x, axicon_lateral_shift_y
+        )
+        R = torch.sqrt((X - shift_x)**2 + (Y - shift_y)**2)
         
         radial_frequency = self._resolve_axicon_radial_frequency(
             axicon_angle=axicon_angle,
@@ -667,7 +682,9 @@ class HoloBeam(Beam):
                                  axicon_phase_depth=math.pi,
                                  axicon_duty_cycle=0.5,
                                  axicon_radial_offset=0.0,
-                                 slm_input_subpixel_factor=1):
+                                 slm_input_subpixel_factor=1,
+                                 axicon_lateral_shift_x=0.0,
+                                 axicon_lateral_shift_y=0.0):
         '''
         Axicon forward propagation with ROI-only, slice-by-slice ASM storage.
 
@@ -675,6 +692,8 @@ class HoloBeam(Beam):
         axicon_profile='binary' applies a two-level radial phase grating and
         therefore requires an H_asm that retains the desired diffraction
         orders (build_axicon_ASM_TF handles this when given the same profile).
+        axicon_lateral_shift_x/y move the physical axicon centre relative to
+        the optical grid origin along tensor axes 0/1, respectively, in metres.
         '''
         if phase_mask is None: phase_mask = self.phase_mask_iter
         if beam_mean_amplitude is None: beam_mean_amplitude = self.beam_mean_amplitude_iter
@@ -698,6 +717,10 @@ class HoloBeam(Beam):
                 'sub-pixel SLM input shape does not match the beam configuration: '
                 f'got {tuple(phase_mask.shape)}, expected {expected_shape}'
             )
+
+        shift_x, shift_y = self._validate_axicon_lateral_shift(
+            axicon_lateral_shift_x, axicon_lateral_shift_y
+        )
 
         is_sparse = isinstance(H_asm, dict) and H_asm.get('type') == 'sparse'
         t0 = time.perf_counter()
@@ -778,7 +801,7 @@ class HoloBeam(Beam):
             x = torch.linspace(-(Nx_up-1)/2, (Nx_up-1)/2, Nx_up, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps_up
             y = torch.linspace(-(Ny_up-1)/2, (Ny_up-1)/2, Ny_up, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps_up
             
-            Y2 = y.view(1, -1) ** 2  
+            Y2 = (y - shift_y).view(1, -1) ** 2
             radial_frequency = self._resolve_axicon_radial_frequency(
                 axicon_angle=axicon_angle,
                 n_medium=n_medium,
@@ -788,7 +811,7 @@ class HoloBeam(Beam):
             chunk_size = 1024
             for i in range(0, Nx_up, chunk_size):
                 end_idx = min(i + chunk_size, Nx_up)
-                X2_chunk = x[i:end_idx].view(-1, 1) ** 2
+                X2_chunk = (x[i:end_idx] - shift_x).view(-1, 1) ** 2
                 
                 R_chunk = torch.sqrt(X2_chunk + Y2)
                 phase_chunk = self._axicon_phase_from_radius(
@@ -1181,7 +1204,9 @@ class HoloBeam(Beam):
                                 axicon_profile='continuous',
                                 axicon_phase_depth=math.pi,
                                 axicon_duty_cycle=0.5,
-                                axicon_radial_offset=0.0):
+                                axicon_radial_offset=0.0,
+                                axicon_lateral_shift_x=0.0,
+                                axicon_lateral_shift_y=0.0):
         """
         Return intensity at a specific focal plane.
         
@@ -1217,6 +1242,8 @@ class HoloBeam(Beam):
                                                 axicon_phase_depth=axicon_phase_depth,
                                                 axicon_duty_cycle=axicon_duty_cycle,
                                                 axicon_radial_offset=axicon_radial_offset,
+                                                axicon_lateral_shift_x=axicon_lateral_shift_x,
+                                                axicon_lateral_shift_y=axicon_lateral_shift_y,
         )
 
         # get focal plane
