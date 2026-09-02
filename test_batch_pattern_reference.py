@@ -89,6 +89,45 @@ class ReferenceGainTests(unittest.TestCase):
             self.assertNotIn('registration_dx_px', rows[0])
             self.assertNotIn('registration_dy_px', rows[0])
 
+    def test_reference_output_matches_target_basename_and_format(self):
+        bp = self.bp
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch.multiple(
+                    bp, OUTPUT_FOLDER=temp_dir,
+                    REFERENCE_IMAGE_SUBFOLDER='reference_captures',
+                    CAPTURE_SAVE_FORMAT='raw16'):
+                target_path = os.path.join(temp_dir, 'phase_mask_001.npy')
+                expected = os.path.join(
+                    temp_dir, 'reference_captures', 'phase_mask_001.raw')
+                self.assertEqual(bp.output_path_for_reference(target_path), expected)
+
+    def test_reference_save_rejects_output_folder_collision(self):
+        bp = self.bp
+        with mock.patch.multiple(
+                bp, REFERENCE_GAIN_ENABLED=True, REFERENCE_SAVE_IMAGES=True,
+                REFERENCE_IMAGE_SUBFOLDER='.'):
+            with self.assertRaisesRegex(ValueError, 'relative subfolder'):
+                bp.validate_reference_config()
+
+    def test_saved_reference_reuses_gain_measurement_frame(self):
+        bp = self.bp
+        frame = np.linspace(100, 3000, 10000, dtype=np.uint16).reshape(100, 100)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracker = bp.ReferenceGainTracker(
+                os.path.join(temp_dir, 'gain.csv'), 'reference.npy')
+            bp.REFERENCE_SAVE_IMAGES = True
+            try:
+                with mock.patch.object(bp, 'grab_frame', return_value=frame), \
+                        mock.patch.object(bp, 'save_captured_reference') as saver:
+                    measurement, _ = bp.capture_reference_measurement(
+                        object(), tracker, mask_path='target.npy', idx=7)
+            finally:
+                bp.REFERENCE_SAVE_IMAGES = False
+
+            self.assertEqual(measurement['status'], 'OK')
+            saver.assert_called_once_with(frame, 'target.npy', 7)
+
     def test_optimized_preprocessor_caches_wfc_and_bypasses_identity_tonemap(self):
         bp = self.bp
 

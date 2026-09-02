@@ -16,8 +16,9 @@ buffers are chunked. The Basler, SLM, and Arduino are opened once for the run.
 
 Optional reference-gain tracking inserts a fixed reference phase immediately
 before every target phase. Reference images are reduced to a robust scalar in
-memory and are not saved. The resulting temporal correction factors are written
-to reference_gain_log.csv.
+memory, and can optionally be saved beside the target dataset in the same
+capture format. The resulting temporal correction factors are written to
+reference_gain_log.csv.
 """
 
 import os
@@ -183,11 +184,16 @@ WRITE_CSV_LOG = True
 
 # ---- Optional temporal intensity reference ----
 # When enabled, display and capture this fixed phase mask immediately before
-# every target. The reference frame itself is not saved; only robust intensity
-# metrics and correction gains are appended to REFERENCE_GAIN_CSV_NAME.
+# every target. Robust intensity metrics and correction gains are appended to
+# REFERENCE_GAIN_CSV_NAME. Set REFERENCE_SAVE_IMAGES=True to also save the same
+# camera frame used for gain calculation in the current CAPTURE_SAVE_FORMAT.
 REFERENCE_GAIN_ENABLED = False
 REFERENCE_MASK_PATH = None  # e.g. r'C:\CITL\reference_phase.npy'
 REFERENCE_GAIN_CSV_NAME = 'reference_gain_log.csv'
+REFERENCE_SAVE_IMAGES = False
+# Reference files use each target's basename inside this OUTPUT_FOLDER subfolder,
+# e.g. target.raw and reference_captures\target.raw form one capture pair.
+REFERENCE_IMAGE_SUBFOLDER = 'reference_captures'
 
 # The first reference frame defines fixed signal/background pixel regions.
 # Every later frame is measured over those same pixels, avoiding the instability
@@ -303,6 +309,16 @@ def build_mask_file_list():
 
 
 def validate_reference_config():
+    if REFERENCE_SAVE_IMAGES and not REFERENCE_GAIN_ENABLED:
+        raise ValueError(
+            'REFERENCE_SAVE_IMAGES requires REFERENCE_GAIN_ENABLED=True')
+    if REFERENCE_SAVE_IMAGES:
+        subfolder = os.path.normpath(str(REFERENCE_IMAGE_SUBFOLDER))
+        if (not REFERENCE_IMAGE_SUBFOLDER or os.path.isabs(subfolder) or
+                subfolder in ('.', '..') or subfolder.startswith(f'..{os.sep}')):
+            raise ValueError(
+                'REFERENCE_IMAGE_SUBFOLDER must be a relative subfolder '
+                'inside OUTPUT_FOLDER')
     if not REFERENCE_GAIN_ENABLED:
         return
     if not REFERENCE_MASK_PATH:
@@ -515,10 +531,18 @@ class ReferenceGainTracker:
             csv.DictWriter(f, fieldnames=self.CSV_FIELDS).writerow(row)
 
 
-def capture_reference_measurement(cam, tracker):
-    """Capture and measure a reference without retaining or saving its image."""
+def capture_reference_measurement(cam, tracker, mask_path=None, idx=None):
+    """Capture one reference frame, measure it, and optionally save that frame."""
     try:
-        measurement = tracker.measure(grab_frame(cam))
+        img = grab_frame(cam)
+    except Exception as e:
+        _log(f'  reference capture failed (target capture will continue): {e!r}')
+        if REFERENCE_SAVE_IMAGES:
+            raise RuntimeError('reference image capture failed while saving is enabled') from e
+        return tracker.failed_measurement(repr(e)), 0.0
+
+    try:
+        measurement = tracker.measure(img)
         _log(
             '  reference -> '
             f'metric={measurement["reference_metric"]:.6g}  '
@@ -527,10 +551,19 @@ def capture_reference_measurement(cam, tracker):
             f'sat={measurement["reference_sat_pct"]:.7f}%')
         if measurement['status'].startswith('SATURATED'):
             _log('  !! WARNING reference is saturated; correction gain may be biased')
-        return measurement
     except Exception as e:
-        _log(f'  reference measurement failed (target capture will continue): {e!r}')
-        return tracker.failed_measurement(repr(e))
+        _log(f'  reference gain measurement failed (image capture will continue): {e!r}')
+        measurement = tracker.failed_measurement(repr(e))
+
+    save_s = 0.0
+    if REFERENCE_SAVE_IMAGES:
+        if mask_path is None:
+            raise ValueError('mask_path is required when saving reference images')
+        t0 = time.perf_counter()
+        save_captured_reference(img, mask_path, idx)
+        save_s = time.perf_counter() - t0
+
+    return measurement, save_s
 
 
 def save_png(img, out_path, label=None):
@@ -612,6 +645,16 @@ def save_capture_file(img, out_path, label=None):
 def output_path_for_mask(mask_path):
     name = os.path.basename(mask_path)
     return os.path.join(OUTPUT_FOLDER, os.path.splitext(name)[0] + output_extension())
+
+
+def reference_output_folder():
+    return os.path.join(OUTPUT_FOLDER, REFERENCE_IMAGE_SUBFOLDER)
+
+
+def output_path_for_reference(mask_path):
+    name = os.path.basename(mask_path)
+    return os.path.join(
+        reference_output_folder(), os.path.splitext(name)[0] + output_extension())
 
 
 def maybe_randomize_mask_order(mask_files):
@@ -969,6 +1012,19 @@ def save_captured_mask(img, mask_path, idx):
     return stats
 
 
+def save_captured_reference(img, mask_path, idx):
+    name = os.path.basename(mask_path)
+    out_path = output_path_for_reference(mask_path)
+    label = f'[REF {idx}] {name}' if idx is not None else f'[REF] {name}'
+    stats = save_capture_file(img, out_path, label=label)
+    _log(
+        f'  reference captured -> '
+        f'{REFERENCE_IMAGE_SUBFOLDER}\\{os.path.basename(out_path)} '
+        f'({CAPTURE_SAVE_FORMAT})  max={stats["raw_max"]}/4091  '
+        f'min={stats["raw_min"]}  sat={stats["sat_pct"]:.7f}%')
+    return stats
+
+
 def run_static_chunk_capture(
         pc, cam, chunk_files, frame_params, start_idx,
         chunk_no, reference_tracker=None):
@@ -985,6 +1041,7 @@ def run_static_chunk_capture(
         name = os.path.basename(mask_path)
         t_frame = time.perf_counter()
         t_reference = 0.0
+        t_reference_save = 0.0
         measurement = None
         try:
             if REFERENCE_GAIN_ENABLED:
@@ -996,7 +1053,8 @@ def run_static_chunk_capture(
                 if MANUAL_SLM_SETTLE_S > 0:
                     time.sleep(MANUAL_SLM_SETTLE_S)
                 time.sleep(capture_delay_s)
-                measurement = capture_reference_measurement(cam, reference_tracker)
+                measurement, t_reference_save = capture_reference_measurement(
+                    cam, reference_tracker, mask_path=mask_path, idx=idx)
                 t_reference = time.perf_counter() - t0
 
             memory_location = target_memory_location(j)
@@ -1030,7 +1088,8 @@ def run_static_chunk_capture(
                     f'mode=run_static total={t_total:.3f} '
                     f'display={t_display:.3f} slm_settle={t_slm_settle:.3f} '
                     f'capture_wait={t_capture_delay:.3f} grab={t_grab:.3f} '
-                    f'reference={t_reference:.3f} save={t_save:.3f}'
+                    f'reference={t_reference:.3f} '
+                    f'reference_save={t_reference_save:.3f} save={t_save:.3f}'
                 )
         except Exception as e:
             if reference_tracker is not None:
@@ -1139,9 +1198,13 @@ def main():
     _log(f'{len(pending_files)} mask(s) pending in {len(chunks)} chunk(s), '
          f'CHUNK_SIZE={CHUNK_SIZE}')
     if REFERENCE_GAIN_ENABLED:
+        save_note = (
+            f'saved as {CAPTURE_SAVE_FORMAT} under '
+            f'{REFERENCE_IMAGE_SUBFOLDER}\\' if REFERENCE_SAVE_IMAGES else
+            'reference images are not saved')
         _log(
             f'Reference gain enabled: {REFERENCE_MASK_PATH} '
-            f'(one reusable reference slot; reference images are not saved)')
+            f'(one reusable reference slot; {save_note})')
     if not pending_files:
         _log('Nothing pending after skip check.')
 
@@ -1160,6 +1223,11 @@ def main():
                 reference_tracker = ReferenceGainTracker(
                     reference_csv_path, REFERENCE_MASK_PATH)
                 _log(f'Reference gains will be appended to {reference_csv_path}')
+                if REFERENCE_SAVE_IMAGES:
+                    os.makedirs(reference_output_folder(), exist_ok=True)
+                    _log(
+                        f'Reference images will be written to '
+                        f'{reference_output_folder()} as {CAPTURE_SAVE_FORMAT}')
 
             cam = open_camera()
             pc = hololith.main.PatterningControl(
