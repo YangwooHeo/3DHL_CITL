@@ -93,6 +93,47 @@ class HoloBeam(Beam):
             raise ValueError('Axicon lateral shifts must be finite.')
         return shift_x, shift_y
 
+    @staticmethod
+    def _translate_complex_field_fourier(field, offset_axis0,
+                                         offset_axis1, pixel_size):
+        """Return ``field(x + offset)`` via a differentiable Fourier shift."""
+        if field.ndim != 2:
+            raise ValueError(f'Expected a 2D complex field; got {field.shape}')
+        if not torch.is_complex(field):
+            raise ValueError('Fourier field translation expects a complex tensor.')
+        if float(pixel_size) <= 0:
+            raise ValueError('Field pixel size must be positive.')
+
+        real_dtype = field.real.dtype
+        device = field.device
+        offset_axis0 = torch.as_tensor(
+            offset_axis0, device=device, dtype=real_dtype
+        )
+        offset_axis1 = torch.as_tensor(
+            offset_axis1, device=device, dtype=real_dtype
+        )
+        if offset_axis0.numel() != 1 or offset_axis1.numel() != 1:
+            raise ValueError('Field offsets must be scalar values.')
+        if not bool(torch.isfinite(offset_axis0.detach()).item()) or not bool(
+            torch.isfinite(offset_axis1.detach()).item()
+        ):
+            raise ValueError('Field offsets must be finite.')
+
+        frequency_axis0 = torch.fft.fftfreq(
+            field.shape[0], d=float(pixel_size), device=device, dtype=real_dtype
+        )[:, None]
+        frequency_axis1 = torch.fft.fftfreq(
+            field.shape[1], d=float(pixel_size), device=device, dtype=real_dtype
+        )[None, :]
+        phase = 2.0 * math.pi * (
+            frequency_axis0 * offset_axis0
+            + frequency_axis1 * offset_axis1
+        )
+        translated_spectrum = torch.fft.fft2(field, norm='ortho') * torch.exp(
+            1j * phase
+        )
+        return torch.fft.ifft2(translated_spectrum, norm='ortho')
+
     @classmethod
     def _axicon_phase_from_radius(cls, radius, radial_frequency,
                                   axicon_profile='continuous',
@@ -683,6 +724,9 @@ class HoloBeam(Beam):
                                  axicon_duty_cycle=0.5,
                                  axicon_radial_offset=0.0,
                                  slm_input_subpixel_factor=1,
+                                 slm_field_sample_offset_x=0.0,
+                                 slm_field_sample_offset_y=0.0,
+                                 apply_slm_field_sample_offset=False,
                                  axicon_lateral_shift_x=0.0,
                                  axicon_lateral_shift_y=0.0):
         '''
@@ -694,6 +738,10 @@ class HoloBeam(Beam):
         orders (build_axicon_ASM_TF handles this when given the same profile).
         axicon_lateral_shift_x/y move the physical axicon centre relative to
         the optical grid origin along tensor axes 0/1, respectively, in metres.
+        slm_field_sample_offset_x/y provide the equivalent differentiable
+        coordinate transform used by proxy calibration: sample U(x + offset)
+        before a centred axicon, then translate the propagated field outside
+        this routine by the same offset.
         '''
         if phase_mask is None: phase_mask = self.phase_mask_iter
         if beam_mean_amplitude is None: beam_mean_amplitude = self.beam_mean_amplitude_iter
@@ -781,10 +829,43 @@ class HoloBeam(Beam):
                 filter_mask = ~((torch.abs(FX) <= f_limit) & (torch.abs(FY) <= f_limit))
                 filter_mask = filter_mask.to(slm_fft.dtype)
 
+                if apply_slm_field_sample_offset:
+                    offset_x = torch.as_tensor(
+                        slm_field_sample_offset_x,
+                        device=slm_field.device,
+                        dtype=slm_field.real.dtype,
+                    )
+                    offset_y = torch.as_tensor(
+                        slm_field_sample_offset_y,
+                        device=slm_field.device,
+                        dtype=slm_field.real.dtype,
+                    )
+                    # FX/FY above use the physical 8 um pitch solely to size
+                    # the 4f aperture.  Lateral axicon displacement lives on
+                    # the post-relay target-equivalent grid (ps_orig =
+                    # 6.4 um/P), so rescale the DFT frequency coordinates for
+                    # the translation ramp without allocating another mesh.
+                    translation_frequency_scale = (
+                        physical_slm_sample_pitch / ps_orig
+                    )
+                    shift_phase = 2.0 * math.pi * (
+                        translation_frequency_scale
+                        * (FX * offset_x + FY * offset_y)
+                    )
+                    filter_mask = filter_mask * torch.exp(1j * shift_phase)
+
                 slm_fft_filtered = slm_fft * filter_mask
                 slm_field = torch.fft.ifft2(torch.fft.ifftshift(slm_fft_filtered), norm="ortho")
 
                 del slm_fft, slm_fft_filtered, FX, FY, filter_mask
+
+            if apply_slm_field_sample_offset and not apply_spatial_filter:
+                slm_field = self._translate_complex_field_fourier(
+                    slm_field,
+                    slm_field_sample_offset_x,
+                    slm_field_sample_offset_y,
+                    ps_orig,
+                )
             
             # 2. Upsampling
             if upsample_factor > 1:
