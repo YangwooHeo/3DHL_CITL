@@ -160,6 +160,20 @@ MANUAL_LASER_USE_BLOCKING_COMMAND = None  # legacy override: True -> blocking, F
 MANUAL_LASER_COMMAND_MODE = 'blocking'  # 'blocking', 'short_timeout', or 'nonblocking'
 MANUAL_LASER_SHORT_TIMEOUT_S = 0.10
 
+# Re-enable the laser drivers after every fresh Arduino connection. The PWM
+# command alone does not restore this enable state on consecutive script runs.
+# This startup command is always blocking and reply-verified, independent of
+# MANUAL_LASER_COMMAND_MODE, so capture cannot begin after a silently lost command.
+LASER_ENABLE_ON_RUN_START = True
+LASER_ENABLE_COMMAND = 'laser_en'
+LASER_ENABLE_REPLY_TOKENS = (
+    'laser 1 is enabled',
+    'laser 2 is enabled',
+)
+LASER_ENABLE_MAX_ATTEMPTS = 2
+LASER_ENABLE_RETRY_DELAY_S = 0.25
+LASER_ENABLE_SETTLE_S = 0.10
+
 # Print per-image timing so we can see whether the bottleneck is Arduino, camera,
 # saving, or SLM display.
 PROFILE_TIMING = True
@@ -948,6 +962,68 @@ def send_arduino_nonblocking(pc, cmd):
     return cmd
 
 
+def send_arduino_blocking_with_reply(pc, cmd):
+    """Send one Arduino command and return its decoded blocking reply."""
+    ser = pc.ard_ctrl.serial_port
+    try:
+        ser.reset_input_buffer()
+    except Exception:
+        pass
+    ser.write(cmd.encode('utf-8'))
+    try:
+        ser.flush()
+    except Exception:
+        pass
+    lines = ser.readlines()
+    reply = ''.join(
+        line.decode('utf-8', errors='replace') for line in lines)
+    if reply.strip():
+        print(reply.rstrip())
+    return reply
+
+
+def enable_lasers_for_run(pc):
+    """Restore and verify the driver-enable state after pc.open()."""
+    if not LASER_ENABLE_ON_RUN_START:
+        _log('Laser driver enable preflight disabled by configuration')
+        return
+    if LASER_ENABLE_MAX_ATTEMPTS < 1:
+        raise ValueError('LASER_ENABLE_MAX_ATTEMPTS must be at least 1')
+
+    last_reply = ''
+    last_error = None
+    for attempt in range(1, LASER_ENABLE_MAX_ATTEMPTS + 1):
+        _log(
+            f'Laser driver enable preflight '
+            f'[{attempt}/{LASER_ENABLE_MAX_ATTEMPTS}]')
+        try:
+            last_reply = send_arduino_blocking_with_reply(
+                pc, LASER_ENABLE_COMMAND)
+            last_error = None
+        except Exception as e:
+            last_error = e
+            _log(f'  laser enable command failed: {e!r}')
+
+        normalized_reply = last_reply.lower()
+        if last_error is None and all(
+                token.lower() in normalized_reply
+                for token in LASER_ENABLE_REPLY_TOKENS):
+            if LASER_ENABLE_SETTLE_S > 0:
+                time.sleep(LASER_ENABLE_SETTLE_S)
+            _log('Laser driver enable acknowledged')
+            return
+        if attempt < LASER_ENABLE_MAX_ATTEMPTS and LASER_ENABLE_RETRY_DELAY_S > 0:
+            time.sleep(LASER_ENABLE_RETRY_DELAY_S)
+
+    compact_reply = ' '.join(last_reply.split()) or '<no reply>'
+    error = RuntimeError(
+        f'Laser enable was not acknowledged after '
+        f'{LASER_ENABLE_MAX_ATTEMPTS} attempt(s): {compact_reply}')
+    if last_error is not None:
+        raise error from last_error
+    raise error
+
+
 def set_laser(pc, pwm_1=0, pwm_2=0):
     cmd = f'laser {int(pwm_1)} {int(pwm_2)}'
     if MANUAL_LASER_USE_BLOCKING_COMMAND is True:
@@ -1241,6 +1317,7 @@ def main():
                 enable_camera_tuple=(),   # hololith's own camera stays off; we drive the Basler ourselves
             )
             pc.open()
+            enable_lasers_for_run(pc)
             if OPTIMIZED_SLM_PIPELINE:
                 slm_preprocessor = SLMFramePreprocessor(
                     WFC_FILE_PATH, tm_1)

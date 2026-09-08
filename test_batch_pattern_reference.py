@@ -234,6 +234,56 @@ class ReferenceGainTests(unittest.TestCase):
         self.assertEqual(slm.calls, [
             ('constant', 0), ('order', 1, 3), ('range', 1, 3), ('start',)])
 
+    def test_laser_enable_preflight_retries_until_acknowledged(self):
+        bp = self.bp
+
+        class FakeSerial:
+            def __init__(self):
+                self.commands = []
+                self.replies = [
+                    [b'Controller ready.\n'],
+                    [b'Laser 1 is enabled.Laser 2 is enabled.\n'],
+                ]
+
+            def reset_input_buffer(self):
+                pass
+
+            def write(self, command):
+                self.commands.append(command)
+
+            def flush(self):
+                pass
+
+            def readlines(self):
+                return self.replies.pop(0)
+
+        serial_port = FakeSerial()
+        pc = types.SimpleNamespace(
+            ard_ctrl=types.SimpleNamespace(serial_port=serial_port))
+        with mock.patch.multiple(
+                bp, LASER_ENABLE_ON_RUN_START=True,
+                LASER_ENABLE_MAX_ATTEMPTS=2,
+                LASER_ENABLE_RETRY_DELAY_S=0,
+                LASER_ENABLE_SETTLE_S=0):
+            bp.enable_lasers_for_run(pc)
+
+        self.assertEqual(serial_port.commands, [b'laser_en', b'laser_en'])
+
+    def test_laser_enable_preflight_fails_without_acknowledgement(self):
+        bp = self.bp
+        serial_port = mock.Mock()
+        serial_port.readlines.return_value = [b'Controller ready.\n']
+        pc = types.SimpleNamespace(
+            ard_ctrl=types.SimpleNamespace(serial_port=serial_port))
+
+        with mock.patch.multiple(
+                bp, LASER_ENABLE_ON_RUN_START=True,
+                LASER_ENABLE_MAX_ATTEMPTS=1,
+                LASER_ENABLE_RETRY_DELAY_S=0,
+                LASER_ENABLE_SETTLE_S=0):
+            with self.assertRaisesRegex(RuntimeError, 'not acknowledged'):
+                bp.enable_lasers_for_run(pc)
+
 
 if __name__ == '__main__':
     unittest.main()
