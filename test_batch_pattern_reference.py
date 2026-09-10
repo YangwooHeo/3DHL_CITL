@@ -111,22 +111,53 @@ class ReferenceGainTests(unittest.TestCase):
 
     def test_saved_reference_reuses_gain_measurement_frame(self):
         bp = self.bp
-        frame = np.linspace(100, 3000, 10000, dtype=np.uint16).reshape(100, 100)
+        calibration_frames = [
+            np.linspace(100 + offset, 3000 + offset, 10000, dtype=np.uint16)
+            .reshape(100, 100)
+            for offset in (0, 1, 2)
+        ]
+        measured_frame = np.linspace(
+            110, 2900, 10000, dtype=np.uint16).reshape(100, 100)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             tracker = bp.ReferenceGainTracker(
                 os.path.join(temp_dir, 'gain.csv'), 'reference.npy')
-            bp.REFERENCE_SAVE_IMAGES = True
-            try:
-                with mock.patch.object(bp, 'grab_frame', return_value=frame), \
-                        mock.patch.object(bp, 'save_captured_reference') as saver:
+            with mock.patch.multiple(
+                    bp, REFERENCE_SAVE_IMAGES=True,
+                    REFERENCE_ROI_CALIBRATION_FRAMES=3):
+                with mock.patch.object(
+                        bp, 'grab_frame', side_effect=[
+                            *calibration_frames, measured_frame
+                        ]) as grabber, mock.patch.object(
+                            bp, 'save_captured_reference') as saver:
                     measurement, _ = bp.capture_reference_measurement(
                         object(), tracker, mask_path='target.npy', idx=7)
-            finally:
-                bp.REFERENCE_SAVE_IMAGES = False
 
             self.assertEqual(measurement['status'], 'OK')
-            saver.assert_called_once_with(frame, 'target.npy', 7)
+            self.assertEqual(measurement['relative_intensity'], 1.0)
+            self.assertEqual(grabber.call_count, 4)
+            saver.assert_called_once_with(measured_frame, 'target.npy', 7)
+
+    def test_reference_roi_calibration_reduces_single_frame_selection_bias(self):
+        bp = self.bp
+        rng = np.random.default_rng(42)
+        base = np.full((100, 100), 100, dtype=np.float32)
+        base[:20, :] = 500
+        calibration_frames = [
+            np.clip(base + rng.normal(0, 40, base.shape), 0, 4095).astype(np.uint16)
+            for _ in range(3)
+        ]
+        measured = np.clip(
+            base + rng.normal(0, 40, base.shape), 0, 4095).astype(np.uint16)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracker = bp.ReferenceGainTracker(
+                os.path.join(temp_dir, 'gain.csv'), 'reference.npy')
+            tracker.initialize_regions_from_frames(calibration_frames)
+            result = tracker.measure(measured)
+
+        self.assertEqual(result['relative_intensity'], 1.0)
+        self.assertLess(abs(result['signal_mean'] - 500), 5)
 
     def test_optimized_preprocessor_caches_wfc_and_bypasses_identity_tonemap(self):
         bp = self.bp

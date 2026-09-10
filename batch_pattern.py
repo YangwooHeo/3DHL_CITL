@@ -209,9 +209,10 @@ REFERENCE_SAVE_IMAGES = False
 # e.g. target.raw and reference_captures\target.raw form one capture pair.
 REFERENCE_IMAGE_SUBFOLDER = 'reference_captures'
 
-# The first reference frame defines fixed signal/background pixel regions.
-# Every later frame is measured over those same pixels, avoiding the instability
-# of a single maximum pixel while remaining insensitive to dark image borders.
+# Average a few startup reference frames to define fixed signal/background pixel
+# regions. These calibration frames are not used as the baseline or saved, which
+# avoids selecting bright-noise pixels and measuring them in the same frame.
+REFERENCE_ROI_CALIBRATION_FRAMES = 3
 REFERENCE_SIGNAL_PERCENTILE = 90.0
 REFERENCE_BACKGROUND_PERCENTILE = 20.0
 REFERENCE_MIN_ROI_PIXELS = 1024
@@ -335,6 +336,9 @@ def validate_reference_config():
                 'inside OUTPUT_FOLDER')
     if not REFERENCE_GAIN_ENABLED:
         return
+    if (not isinstance(REFERENCE_ROI_CALIBRATION_FRAMES, int) or
+            REFERENCE_ROI_CALIBRATION_FRAMES < 1):
+        raise ValueError('REFERENCE_ROI_CALIBRATION_FRAMES must be a positive integer')
     if not REFERENCE_MASK_PATH:
         raise ValueError('REFERENCE_MASK_PATH is required when REFERENCE_GAIN_ENABLED=True')
     if not os.path.isfile(REFERENCE_MASK_PATH):
@@ -478,6 +482,23 @@ class ReferenceGainTracker:
             f'  reference ROI initialized: signal={np.count_nonzero(signal_mask)} px, '
             f'background={np.count_nonzero(background_mask)} px')
 
+    def initialize_regions_from_frames(self, frames):
+        """Define fixed ROIs from an averaged calibration sequence."""
+        if not frames:
+            raise ValueError('at least one reference ROI calibration frame is required')
+
+        first = np.asarray(frames[0])
+        accumulator = np.zeros(first.shape, dtype=np.float32)
+        for frame in frames:
+            raw = np.asarray(frame)
+            if raw.shape != first.shape:
+                raise RuntimeError(
+                    f'reference calibration shape changed from '
+                    f'{first.shape} to {raw.shape}')
+            np.add(accumulator, raw, out=accumulator, casting='unsafe')
+        accumulator /= float(len(frames))
+        self._initialize_regions(accumulator)
+
     def measure(self, img):
         raw, stats = raw_image_stats(img)
         if self.signal_mask is None:
@@ -549,6 +570,17 @@ def capture_reference_measurement(cam, tracker, mask_path=None, idx=None):
     """Capture one reference frame, measure it, and optionally save that frame."""
     try:
         img = grab_frame(cam)
+        if tracker.signal_mask is None:
+            calibration_frames = [img]
+            for _ in range(REFERENCE_ROI_CALIBRATION_FRAMES - 1):
+                calibration_frames.append(grab_frame(cam))
+            tracker.initialize_regions_from_frames(calibration_frames)
+            _log(
+                f'  reference ROI calibrated from '
+                f'{REFERENCE_ROI_CALIBRATION_FRAMES} frame(s); '
+                f'capturing an independent baseline frame')
+            del calibration_frames
+            img = grab_frame(cam)
     except Exception as e:
         _log(f'  reference capture failed (target capture will continue): {e!r}')
         if REFERENCE_SAVE_IMAGES:
