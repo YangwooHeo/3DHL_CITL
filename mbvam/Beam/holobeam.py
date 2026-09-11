@@ -94,6 +94,130 @@ class HoloBeam(Beam):
         return shift_x, shift_y
 
     @staticmethod
+    def _normalize_spatial_filter_mode(spatial_filter_mode):
+        """Return the canonical Fourier-plane spatial-filter mode."""
+        mode = (
+            'center_block'
+            if spatial_filter_mode is None
+            else str(spatial_filter_mode).strip().lower()
+        )
+        aliases = {
+            'center_block': 'center_block',
+            'central_block': 'center_block',
+            'zero_order_block': 'center_block',
+            'lee_left_first_order': 'lee_left_first_order',
+            'left_first_order': 'lee_left_first_order',
+            'lee': 'lee_left_first_order',
+        }
+        try:
+            return aliases[mode]
+        except KeyError as exc:
+            raise ValueError(
+                "spatial_filter_mode must be 'center_block' or "
+                "'lee_left_first_order'."
+            ) from exc
+
+    @classmethod
+    def _build_fourier_plane_spatial_filter(
+            cls, FX, FY, wavelength_m, spatial_filter_mode='center_block',
+            focal_length_m=0.250, center_block_size_m=550e-6,
+            lee_aperture_diameter_m=2e-3,
+            lee_first_order_offset_m=None,
+            lee_carrier_period_pixels=None,
+            physical_slm_pixel_pitch_m=8e-6):
+        """Build a spatial-filter amplitude mask on an fftshifted frequency grid.
+
+        ``center_block`` preserves the existing hardware model: a centred
+        550 um square is blocked and every other Fourier-plane position passes.
+
+        ``lee_left_first_order`` models an opaque Fourier-plane mask with one
+        circular opening. The 2 mm diameter opening is centred on the left
+        first order in an ``imshow`` view of the fftshifted spectrum, i.e. at
+        negative FY (tensor axis 1). Its offset can be supplied directly in
+        metres at the Fourier plane or derived from the Lee carrier period in
+        native physical SLM pixels.
+        """
+        mode = cls._normalize_spatial_filter_mode(spatial_filter_mode)
+        wavelength_m = float(wavelength_m)
+        focal_length_m = float(focal_length_m)
+        if not math.isfinite(wavelength_m) or wavelength_m <= 0:
+            raise ValueError('wavelength_m must be finite and positive.')
+        if not math.isfinite(focal_length_m) or focal_length_m <= 0:
+            raise ValueError('focal_length_m must be finite and positive.')
+
+        frequency_to_fourier_plane_m = wavelength_m * focal_length_m
+        if mode == 'center_block':
+            center_block_size_m = float(center_block_size_m)
+            if not math.isfinite(center_block_size_m) or center_block_size_m <= 0:
+                raise ValueError('center_block_size_m must be finite and positive.')
+            half_width_frequency = (
+                center_block_size_m / 2.0 / frequency_to_fourier_plane_m
+            )
+            return ~(
+                (torch.abs(FX) <= half_width_frequency)
+                & (torch.abs(FY) <= half_width_frequency)
+            )
+
+        lee_aperture_diameter_m = float(lee_aperture_diameter_m)
+        if (
+            not math.isfinite(lee_aperture_diameter_m)
+            or lee_aperture_diameter_m <= 0
+        ):
+            raise ValueError('lee_aperture_diameter_m must be finite and positive.')
+        if (
+            lee_first_order_offset_m is not None
+            and lee_carrier_period_pixels is not None
+        ):
+            raise ValueError(
+                'Specify either lee_first_order_offset_m or '
+                'lee_carrier_period_pixels, not both.'
+            )
+
+        if lee_first_order_offset_m is None:
+            if lee_carrier_period_pixels is None:
+                raise ValueError(
+                    "The 'lee_left_first_order' mode requires either "
+                    'lee_first_order_offset_m (measured Fourier-plane offset) '
+                    'or lee_carrier_period_pixels.'
+                )
+            lee_carrier_period_pixels = float(lee_carrier_period_pixels)
+            physical_slm_pixel_pitch_m = float(physical_slm_pixel_pitch_m)
+            if (
+                not math.isfinite(lee_carrier_period_pixels)
+                or lee_carrier_period_pixels <= 0
+            ):
+                raise ValueError('lee_carrier_period_pixels must be finite and positive.')
+            if (
+                not math.isfinite(physical_slm_pixel_pitch_m)
+                or physical_slm_pixel_pitch_m <= 0
+            ):
+                raise ValueError('physical_slm_pixel_pitch_m must be finite and positive.')
+            carrier_period_m = (
+                lee_carrier_period_pixels * physical_slm_pixel_pitch_m
+            )
+            lee_first_order_offset_m = (
+                frequency_to_fourier_plane_m / carrier_period_m
+            )
+        else:
+            lee_first_order_offset_m = float(lee_first_order_offset_m)
+            if (
+                not math.isfinite(lee_first_order_offset_m)
+                or lee_first_order_offset_m <= 0
+            ):
+                raise ValueError('lee_first_order_offset_m must be finite and positive.')
+
+        aperture_radius_frequency = (
+            lee_aperture_diameter_m / 2.0 / frequency_to_fourier_plane_m
+        )
+        left_order_center_fy = (
+            -lee_first_order_offset_m / frequency_to_fourier_plane_m
+        )
+        return (
+            torch.square(FX) + torch.square(FY - left_order_center_fy)
+            <= aperture_radius_frequency ** 2
+        )
+
+    @staticmethod
     def _translate_complex_field_fourier(field, offset_axis0,
                                          offset_axis1, pixel_size):
         """Return ``field(x + offset)`` via a differentiable Fourier shift."""
@@ -717,6 +841,12 @@ class HoloBeam(Beam):
     def propagateToVolume_Axicon2(self, axicon_angle: float, upsample_factor=int, phase_mask=None, beam_mean_amplitude=None, 
                                  slm_amplitude_profile=None, H_asm=None, convert_to_intensity=False, roi_size=1000,
                                  apply_spatial_filter=False, n_medium=1.0,
+                                 spatial_filter_mode='center_block',
+                                 spatial_filter_focal_length_m=0.250,
+                                 center_block_size_m=550e-6,
+                                 lee_aperture_diameter_m=2e-3,
+                                 lee_first_order_offset_m=None,
+                                 lee_carrier_period_pixels=None,
                                  axicon_angle_in_medium=False,
                                  axicon_transverse_frequency=None,
                                  axicon_profile='continuous',
@@ -736,6 +866,12 @@ class HoloBeam(Beam):
         axicon_profile='binary' applies a two-level radial phase grating and
         therefore requires an H_asm that retains the desired diffraction
         orders (build_axicon_ASM_TF handles this when given the same profile).
+        With apply_spatial_filter=True, spatial_filter_mode='center_block'
+        blocks the central 550 um square as before. Mode
+        'lee_left_first_order' instead passes only a 2 mm circular aperture
+        centred on the left first order of the fftshifted Fourier-plane view.
+        Supply that centre through either lee_first_order_offset_m or the Lee
+        carrier period in native SLM pixels.
         axicon_lateral_shift_x/y move the physical axicon centre relative to
         the optical grid origin along tensor axes 0/1, respectively, in metres.
         slm_field_sample_offset_x/y provide the equivalent differentiable
@@ -796,8 +932,6 @@ class HoloBeam(Beam):
             )
 
             if apply_spatial_filter:
-                filter_size_um = 550
-                f1 = 0.250
                 slm_fft = torch.fft.fftshift(torch.fft.fft2(slm_field, norm="ortho"))
 
                 lam = self.beam_config.lambda_
@@ -812,8 +946,6 @@ class HoloBeam(Beam):
                     8e-6 / slm_input_subpixel_factor
                 )
 
-                f_limit = (filter_size_um * 1e-6 / 2.0) / (lam * f1)
-
                 fx = torch.fft.fftshift(torch.fft.fftfreq(
                     Nx_orig,
                     d=physical_slm_sample_pitch,
@@ -826,7 +958,18 @@ class HoloBeam(Beam):
                 ))
                 FX, FY = torch.meshgrid(fx, fy, indexing='ij')
 
-                filter_mask = ~((torch.abs(FX) <= f_limit) & (torch.abs(FY) <= f_limit))
+                filter_mask = self._build_fourier_plane_spatial_filter(
+                    FX,
+                    FY,
+                    wavelength_m=lam,
+                    spatial_filter_mode=spatial_filter_mode,
+                    focal_length_m=spatial_filter_focal_length_m,
+                    center_block_size_m=center_block_size_m,
+                    lee_aperture_diameter_m=lee_aperture_diameter_m,
+                    lee_first_order_offset_m=lee_first_order_offset_m,
+                    lee_carrier_period_pixels=lee_carrier_period_pixels,
+                    physical_slm_pixel_pitch_m=8e-6,
+                )
                 filter_mask = filter_mask.to(slm_fft.dtype)
 
                 if apply_slm_field_sample_offset:

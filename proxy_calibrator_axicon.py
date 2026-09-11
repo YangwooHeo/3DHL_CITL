@@ -63,10 +63,16 @@ from axicon_simulator import (
     DEFAULT_AXICON_PHASE_DEPTH_RAD,
     DEFAULT_AXICON_PROFILE,
     DEFAULT_AXICON_RADIAL_OFFSET,
+    DEFAULT_CENTER_BLOCK_SIZE_UM,
     DEFAULT_FLIP_PHASE_FIRST_AXIS,
+    DEFAULT_LEE_APERTURE_DIAMETER_MM,
+    DEFAULT_LEE_CARRIER_PERIOD_PIXELS,
+    DEFAULT_LEE_FIRST_ORDER_OFFSET_MM,
     DEFAULT_PHASE_LEVEL_MAX,
     DEFAULT_PROPAGATION_MEDIUM_INDEX,
     DEFAULT_ROI_SIZE,
+    DEFAULT_SPATIAL_FILTER_FOCAL_LENGTH_M,
+    DEFAULT_SPATIAL_FILTER_MODE,
     DEFAULT_TRANSPOSE_OUTPUT_FIELD,
     DEFAULT_TRANSPOSE_PHASE,
     DEFAULT_UPSAMPLE_FACTOR,
@@ -896,6 +902,12 @@ def axicon_forward_proxy(
     fixed_axicon_shift_x_m: float,
     fixed_axicon_shift_y_m: float,
     apply_spatial_filter: bool,
+    spatial_filter_mode: str,
+    spatial_filter_focal_length_m: float,
+    center_block_size_m: float,
+    lee_aperture_diameter_m: float,
+    lee_first_order_offset_m: float | None,
+    lee_carrier_period_pixels: float | None,
     fov_crop_size: int | None,
     transpose_output: bool,
     require_grad: bool,
@@ -949,6 +961,12 @@ def axicon_forward_proxy(
         convert_to_intensity=False,
         roi_size=roi_size,
         apply_spatial_filter=apply_spatial_filter,
+        spatial_filter_mode=spatial_filter_mode,
+        spatial_filter_focal_length_m=spatial_filter_focal_length_m,
+        center_block_size_m=center_block_size_m,
+        lee_aperture_diameter_m=lee_aperture_diameter_m,
+        lee_first_order_offset_m=lee_first_order_offset_m,
+        lee_carrier_period_pixels=lee_carrier_period_pixels,
         n_medium=propagation_medium_index,
         axicon_angle_in_medium=axicon_angle_in_medium,
         axicon_transverse_frequency=axicon_transverse_frequency,
@@ -1087,6 +1105,12 @@ def make_prediction(beam, proxy, sample, base_profile, physics, cfg,
         fixed_axicon_shift_x_m=cfg["axicon_shift_x_um"] * 1e-6,
         fixed_axicon_shift_y_m=cfg["axicon_shift_y_um"] * 1e-6,
         apply_spatial_filter=cfg["apply_spatial_filter"],
+        spatial_filter_mode=cfg["spatial_filter_mode"],
+        spatial_filter_focal_length_m=cfg["spatial_filter_focal_length_m"],
+        center_block_size_m=cfg["center_block_size_m"],
+        lee_aperture_diameter_m=cfg["lee_aperture_diameter_m"],
+        lee_first_order_offset_m=cfg["lee_first_order_offset_m"],
+        lee_carrier_period_pixels=cfg["lee_carrier_period_pixels"],
         fov_crop_size=cfg["fov_crop_size"],
         transpose_output=cfg["transpose_output"],
         require_grad=require_grad,
@@ -1750,6 +1774,33 @@ def build_parser() -> argparse.ArgumentParser:
                         default=DEFAULT_AXICON_ANGLE_IN_MEDIUM)
     parser.add_argument("--apply-spatial-filter", action=argparse.BooleanOptionalAction,
                         default=DEFAULT_APPLY_SPATIAL_FILTER)
+    parser.add_argument(
+        "--spatial-filter-mode",
+        choices=("center_block", "lee_left_first_order"),
+        default=DEFAULT_SPATIAL_FILTER_MODE,
+    )
+    parser.add_argument(
+        "--spatial-filter-focal-length-m", type=float,
+        default=DEFAULT_SPATIAL_FILTER_FOCAL_LENGTH_M,
+    )
+    parser.add_argument(
+        "--center-block-size-um", type=float,
+        default=DEFAULT_CENTER_BLOCK_SIZE_UM,
+    )
+    parser.add_argument(
+        "--lee-aperture-diameter-mm", type=float,
+        default=DEFAULT_LEE_APERTURE_DIAMETER_MM,
+    )
+    parser.add_argument(
+        "--lee-first-order-offset-mm", type=float,
+        default=DEFAULT_LEE_FIRST_ORDER_OFFSET_MM,
+        help="Positive distance from the Fourier-plane centre to the left first order.",
+    )
+    parser.add_argument(
+        "--lee-carrier-period-pixels", type=float,
+        default=DEFAULT_LEE_CARRIER_PERIOD_PIXELS,
+        help="Lee carrier period in native 8 um SLM pixels; alternative to measured offset.",
+    )
     parser.add_argument("--asm-margin-factor", type=float,
                         default=DEFAULT_ASM_MARGIN_FACTOR)
 
@@ -1885,6 +1936,13 @@ def config_from_args(args, device, beam_config) -> dict:
         "gaussian_beam_waist_m": float(beam_config.gaussian_beam_waist),
         "axicon_transverse_frequency": transverse_frequency,
         "axicon_na_air_equiv": float(beam_config.lambda_) * transverse_frequency,
+        "center_block_size_m": args.center_block_size_um * 1e-6,
+        "lee_aperture_diameter_m": args.lee_aperture_diameter_mm * 1e-3,
+        "lee_first_order_offset_m": (
+            None
+            if args.lee_first_order_offset_mm is None
+            else args.lee_first_order_offset_mm * 1e-3
+        ),
         "group_loss_weights_raw": {
             "systematic": args.weight_systematic,
             "real": args.weight_real,
@@ -1964,6 +2022,24 @@ def main() -> None:
         raise ValueError("--axicon-radial-offset must be finite")
     if args.propagation_medium_index <= 0 or args.axicon_grating_pitch_m <= 0:
         raise ValueError("medium index and axicon grating pitch must be positive")
+    if args.spatial_filter_focal_length_m <= 0:
+        raise ValueError("--spatial-filter-focal-length-m must be positive")
+    if args.center_block_size_um <= 0 or args.lee_aperture_diameter_mm <= 0:
+        raise ValueError("spatial-filter aperture dimensions must be positive")
+    if args.lee_first_order_offset_mm is not None and args.lee_first_order_offset_mm <= 0:
+        raise ValueError("--lee-first-order-offset-mm must be positive")
+    if args.lee_carrier_period_pixels is not None and args.lee_carrier_period_pixels <= 0:
+        raise ValueError("--lee-carrier-period-pixels must be positive")
+    if args.apply_spatial_filter and args.spatial_filter_mode == "lee_left_first_order":
+        lee_locations = (
+            args.lee_first_order_offset_mm is not None,
+            args.lee_carrier_period_pixels is not None,
+        )
+        if sum(lee_locations) != 1:
+            raise ValueError(
+                "Lee filtering requires exactly one of --lee-first-order-offset-mm "
+                "or --lee-carrier-period-pixels"
+            )
     if args.fov_crop_size is not None and args.fov_crop_size > args.roi_size:
         raise ValueError("--fov-crop-size cannot exceed --roi-size")
     if args.transfer_radial_bins < 2 or args.transfer_azimuthal_order < 0:
@@ -2095,6 +2171,10 @@ def main() -> None:
         f"z={args.z_m * 1e3:.3f} mm, NA_air={na_air:.4f}, "
         f"upsample={args.upsample_factor}, ROI={args.roi_size}, "
         f"FOV={args.fov_crop_size}, n={args.propagation_medium_index:.4g}"
+    )
+    print(
+        f">>> Spatial filter: enabled={args.apply_spatial_filter}, "
+        f"mode={args.spatial_filter_mode}"
     )
     print(
         f">>> Bounded z refinement: enabled={args.optimize_z}, "

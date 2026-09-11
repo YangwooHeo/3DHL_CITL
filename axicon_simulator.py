@@ -34,6 +34,15 @@ DEFAULT_AXICON_DIFFRACTION_ORDERS = None
 DEFAULT_ROI_SIZE = 1024
 DEFAULT_ASM_MARGIN_FACTOR = 5000
 DEFAULT_APPLY_SPATIAL_FILTER = True
+DEFAULT_SPATIAL_FILTER_MODE = "center_block"
+DEFAULT_SPATIAL_FILTER_FOCAL_LENGTH_M = 0.250
+DEFAULT_CENTER_BLOCK_SIZE_UM = 550.0
+# Lee mode passes only this circular aperture around the left first order.
+DEFAULT_LEE_APERTURE_DIAMETER_MM = 2.0
+# Set exactly one of these when DEFAULT_SPATIAL_FILTER_MODE is
+# "lee_left_first_order". The measured Fourier-plane offset is preferred.
+DEFAULT_LEE_FIRST_ORDER_OFFSET_MM = None
+DEFAULT_LEE_CARRIER_PERIOD_PIXELS = None
 DEFAULT_PHASE_LEVEL_MAX = 1023.0
 DEFAULT_TRANSPOSE_PHASE = True
 DEFAULT_FLIP_PHASE_FIRST_AXIS = True
@@ -97,6 +106,12 @@ def propagate_axicon_field(beam, phase_tensor, cone_angle, upsample_factor, h_as
                            roi_size, propagation_medium_index,
                            axicon_angle_in_medium, axicon_transverse_frequency,
                            apply_spatial_filter=DEFAULT_APPLY_SPATIAL_FILTER,
+                           spatial_filter_mode=DEFAULT_SPATIAL_FILTER_MODE,
+                           spatial_filter_focal_length_m=DEFAULT_SPATIAL_FILTER_FOCAL_LENGTH_M,
+                           center_block_size_m=DEFAULT_CENTER_BLOCK_SIZE_UM * 1e-6,
+                           lee_aperture_diameter_m=DEFAULT_LEE_APERTURE_DIAMETER_MM * 1e-3,
+                           lee_first_order_offset_m=None,
+                           lee_carrier_period_pixels=DEFAULT_LEE_CARRIER_PERIOD_PIXELS,
                            axicon_profile=DEFAULT_AXICON_PROFILE,
                            axicon_phase_depth=DEFAULT_AXICON_PHASE_DEPTH_RAD,
                            axicon_duty_cycle=DEFAULT_AXICON_DUTY_CYCLE,
@@ -111,6 +126,12 @@ def propagate_axicon_field(beam, phase_tensor, cone_angle, upsample_factor, h_as
             H_asm=h_asm,
             roi_size=roi_size,
             apply_spatial_filter=apply_spatial_filter,
+            spatial_filter_mode=spatial_filter_mode,
+            spatial_filter_focal_length_m=spatial_filter_focal_length_m,
+            center_block_size_m=center_block_size_m,
+            lee_aperture_diameter_m=lee_aperture_diameter_m,
+            lee_first_order_offset_m=lee_first_order_offset_m,
+            lee_carrier_period_pixels=lee_carrier_period_pixels,
             n_medium=propagation_medium_index,
             axicon_angle_in_medium=axicon_angle_in_medium,
             axicon_transverse_frequency=axicon_transverse_frequency,
@@ -312,7 +333,14 @@ def run_fno_proxy_inference(beam, beam_config, phase_path, fno_model, fno_cfg,
                             axicon_duty_cycle=DEFAULT_AXICON_DUTY_CYCLE,
                             axicon_radial_offset=DEFAULT_AXICON_RADIAL_OFFSET,
                             axicon_lateral_shift_x_m=0.0,
-                            axicon_lateral_shift_y_m=0.0):
+                            axicon_lateral_shift_y_m=0.0,
+                            apply_spatial_filter=DEFAULT_APPLY_SPATIAL_FILTER,
+                            spatial_filter_mode=DEFAULT_SPATIAL_FILTER_MODE,
+                            spatial_filter_focal_length_m=DEFAULT_SPATIAL_FILTER_FOCAL_LENGTH_M,
+                            center_block_size_m=DEFAULT_CENTER_BLOCK_SIZE_UM * 1e-6,
+                            lee_aperture_diameter_m=DEFAULT_LEE_APERTURE_DIAMETER_MM * 1e-3,
+                            lee_first_order_offset_m=None,
+                            lee_carrier_period_pixels=DEFAULT_LEE_CARRIER_PERIOD_PIXELS):
     from train_fno_axicon import predict_camera, resize_batch
 
     output_directory = Path(output_directory)
@@ -336,6 +364,13 @@ def run_fno_proxy_inference(beam, beam_config, phase_path, fno_model, fno_cfg,
         propagation_medium_index,
         axicon_angle_in_medium,
         axicon_transverse_frequency,
+        apply_spatial_filter=apply_spatial_filter,
+        spatial_filter_mode=spatial_filter_mode,
+        spatial_filter_focal_length_m=spatial_filter_focal_length_m,
+        center_block_size_m=center_block_size_m,
+        lee_aperture_diameter_m=lee_aperture_diameter_m,
+        lee_first_order_offset_m=lee_first_order_offset_m,
+        lee_carrier_period_pixels=lee_carrier_period_pixels,
         axicon_profile=axicon_profile,
         axicon_phase_depth=axicon_phase_depth,
         axicon_duty_cycle=axicon_duty_cycle,
@@ -504,7 +539,14 @@ def export_electric_fields(beam, beam_config, phase_paths, save_directory,
                            axicon_duty_cycle=DEFAULT_AXICON_DUTY_CYCLE,
                            axicon_radial_offset=DEFAULT_AXICON_RADIAL_OFFSET,
                            axicon_lateral_shift_x_m=0.0,
-                           axicon_lateral_shift_y_m=0.0):
+                           axicon_lateral_shift_y_m=0.0,
+                           apply_spatial_filter=DEFAULT_APPLY_SPATIAL_FILTER,
+                           spatial_filter_mode=DEFAULT_SPATIAL_FILTER_MODE,
+                           spatial_filter_focal_length_m=DEFAULT_SPATIAL_FILTER_FOCAL_LENGTH_M,
+                           center_block_size_m=DEFAULT_CENTER_BLOCK_SIZE_UM * 1e-6,
+                           lee_aperture_diameter_m=DEFAULT_LEE_APERTURE_DIAMETER_MM * 1e-3,
+                           lee_first_order_offset_m=None,
+                           lee_carrier_period_pixels=DEFAULT_LEE_CARRIER_PERIOD_PIXELS):
     save_directory = Path(save_directory)
     save_directory.mkdir(parents=True, exist_ok=True)
 
@@ -535,6 +577,13 @@ def export_electric_fields(beam, beam_config, phase_paths, save_directory,
             propagation_medium_index,
             axicon_angle_in_medium,
             axicon_transverse_frequency,
+            apply_spatial_filter=apply_spatial_filter,
+            spatial_filter_mode=spatial_filter_mode,
+            spatial_filter_focal_length_m=spatial_filter_focal_length_m,
+            center_block_size_m=center_block_size_m,
+            lee_aperture_diameter_m=lee_aperture_diameter_m,
+            lee_first_order_offset_m=lee_first_order_offset_m,
+            lee_carrier_period_pixels=lee_carrier_period_pixels,
             axicon_profile=axicon_profile,
             axicon_phase_depth=axicon_phase_depth,
             axicon_duty_cycle=axicon_duty_cycle,
@@ -746,6 +795,31 @@ if __name__ == "__main__":
     axicon_lateral_shift_x_m = DEFAULT_AXICON_LATERAL_SHIFT_X_UM * 1e-6
     axicon_lateral_shift_y_m = DEFAULT_AXICON_LATERAL_SHIFT_Y_UM * 1e-6
     axicon_diffraction_orders = DEFAULT_AXICON_DIFFRACTION_ORDERS
+    apply_spatial_filter = DEFAULT_APPLY_SPATIAL_FILTER
+    spatial_filter_mode = DEFAULT_SPATIAL_FILTER_MODE
+    spatial_filter_focal_length_m = DEFAULT_SPATIAL_FILTER_FOCAL_LENGTH_M
+    center_block_size_m = DEFAULT_CENTER_BLOCK_SIZE_UM * 1e-6
+    lee_aperture_diameter_m = DEFAULT_LEE_APERTURE_DIAMETER_MM * 1e-3
+    lee_first_order_offset_m = (
+        None
+        if DEFAULT_LEE_FIRST_ORDER_OFFSET_MM is None
+        else DEFAULT_LEE_FIRST_ORDER_OFFSET_MM * 1e-3
+    )
+    lee_carrier_period_pixels = DEFAULT_LEE_CARRIER_PERIOD_PIXELS
+    spatial_filter_mode = HoloBeam._normalize_spatial_filter_mode(
+        spatial_filter_mode
+    )
+    if apply_spatial_filter and spatial_filter_mode == "lee_left_first_order":
+        lee_locations = (
+            lee_first_order_offset_m is not None,
+            lee_carrier_period_pixels is not None,
+        )
+        if sum(lee_locations) != 1:
+            raise ValueError(
+                "Lee filtering requires exactly one of "
+                "DEFAULT_LEE_FIRST_ORDER_OFFSET_MM or "
+                "DEFAULT_LEE_CARRIER_PERIOD_PIXELS."
+            )
     axicon_transverse_frequency = 1.0 / axicon_grating_pitch
     axicon_na_air_equiv = beam_config.lambda_ * axicon_transverse_frequency
     if axicon_na_air_equiv >= 1.0:
@@ -758,6 +832,17 @@ if __name__ == "__main__":
     print(f"Single physical z target: {Z_TARGET * 1000:.3f} mm")
     print(f"Axicon lateral shift: x={axicon_lateral_shift_x_m * 1e6:.3f} um, "
           f"y={axicon_lateral_shift_y_m * 1e6:.3f} um")
+    print(f"Spatial filter: enabled={apply_spatial_filter}, mode={spatial_filter_mode!r}")
+    if apply_spatial_filter and spatial_filter_mode == "lee_left_first_order":
+        lee_center_description = (
+            f"measured offset={lee_first_order_offset_m * 1e3:.3f} mm"
+            if lee_first_order_offset_m is not None
+            else f"carrier period={lee_carrier_period_pixels} native SLM pixels"
+        )
+        print(
+            f"Lee aperture: diameter={lee_aperture_diameter_m * 1e3:.3f} mm, "
+            f"left first order from {lee_center_description}"
+        )
 
     print('1. Initializing beam')
     beam = HoloBeam(beam_config)
@@ -821,6 +906,13 @@ if __name__ == "__main__":
             axicon_radial_offset=axicon_radial_offset,
             axicon_lateral_shift_x_m=axicon_lateral_shift_x_m,
             axicon_lateral_shift_y_m=axicon_lateral_shift_y_m,
+            apply_spatial_filter=apply_spatial_filter,
+            spatial_filter_mode=spatial_filter_mode,
+            spatial_filter_focal_length_m=spatial_filter_focal_length_m,
+            center_block_size_m=center_block_size_m,
+            lee_aperture_diameter_m=lee_aperture_diameter_m,
+            lee_first_order_offset_m=lee_first_order_offset_m,
+            lee_carrier_period_pixels=lee_carrier_period_pixels,
         )
     elif run_mode == "viewer":
         phase_tensor, phase_data = load_slm_phase_tensor(
@@ -859,6 +951,13 @@ if __name__ == "__main__":
             axicon_radial_offset=axicon_radial_offset,
             axicon_lateral_shift_x_m=axicon_lateral_shift_x_m,
             axicon_lateral_shift_y_m=axicon_lateral_shift_y_m,
+            apply_spatial_filter=apply_spatial_filter,
+            spatial_filter_mode=spatial_filter_mode,
+            spatial_filter_focal_length_m=spatial_filter_focal_length_m,
+            center_block_size_m=center_block_size_m,
+            lee_aperture_diameter_m=lee_aperture_diameter_m,
+            lee_first_order_offset_m=lee_first_order_offset_m,
+            lee_carrier_period_pixels=lee_carrier_period_pixels,
         )
         print('3. Axicon propagation is successfully computed')
         recon_np = recon.detach().cpu().numpy()
@@ -921,6 +1020,13 @@ if __name__ == "__main__":
                 axicon_radial_offset=axicon_radial_offset,
                 axicon_lateral_shift_x_m=axicon_lateral_shift_x_m,
                 axicon_lateral_shift_y_m=axicon_lateral_shift_y_m,
+                apply_spatial_filter=apply_spatial_filter,
+                spatial_filter_mode=spatial_filter_mode,
+                spatial_filter_focal_length_m=spatial_filter_focal_length_m,
+                center_block_size_m=center_block_size_m,
+                lee_aperture_diameter_m=lee_aperture_diameter_m,
+                lee_first_order_offset_m=lee_first_order_offset_m,
+                lee_carrier_period_pixels=lee_carrier_period_pixels,
             )
     else:
         raise ValueError(f"Unsupported RUN_MODE={RUN_MODE!r}. "
