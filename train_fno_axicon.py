@@ -2,25 +2,32 @@
 """
 Fourier Neural Operator trainer for SLM-axicon camera proxy learning.
 
-This file is intentionally separate from train_residual_unet.py. It keeps the
-same data contract:
+One shared residual FNO learns E_sim(z) -> camera intensity across all planes.
+SLM phase and z are NOT network inputs in the default configuration.
 
 Workflow-folder layout:
 
     pool/
-      0.Phase_Mask/*.npy
-      2.Aligned_Camera/*.npy
-      1.Forward_Sim/*.npy
+      0.Phase_Masks/*.npy                  # optional, shared across z
+      3.Aligned_Camera/z_-0.5/*.npy         # offsets in mm
+      1.Forward_Sim/z_-0.5/*.npy
+      .../z_0/*.npy
+      .../z_+0.5/*.npy
+
+Unnumbered directory names and the previous flat layout are also supported.
+Pairing uses (z in mm, normalized pattern stem). All z views of a pattern,
+including its real/pert family, stay in one train/validation split. The unique
+sample id includes z; pattern_id retains the original normalized stem.
 
 Files are paired by normalized stem, so minor naming differences such as
 `sine80_890_0.npy` vs `sine_80_890_0.npy` and `..._09.npy` vs `..._9.npy`
 can still be matched.
 
-Default model behavior is non-residual:
+Default model behavior is residual:
 
-    [simulation electric field + optional SLM/radial conditioning]
-        -> FNO
-        -> predicted camera intensity
+    [simulation electric field + intensity + spatial coordinates]
+        -> shared FNO -> complex delta_E
+        -> |E_sim + alpha * delta_E|^2 -> camera intensity loss
 
 Set PREDICTION_MODE = 'direct_field' if you want the FNO to generate a complex
 E_out and use |E_out|^2 as the final intensity. Use 'residual_field' if you
@@ -33,6 +40,7 @@ import json
 import math
 import os
 import random
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -64,13 +72,17 @@ class AxiconFieldDataset(Dataset):
                  camera_percentile=99.9,
                  camera_scale=None,
                  camera_black_level=0.0,
-                 fov_crop_size=None):
+                 fov_crop_size=None,
+                 use_slm_phase=True,
+                 scale_max_pixels_per_sample=None):
         self.root_dir = Path(root_dir)
         self.workflow_field_dir = workflow_field_dir
         self.workflow_camera_dir = workflow_camera_dir
         self.workflow_phase_dir = workflow_phase_dir
         self.sim_size = int(sim_size)
         self.phase_flip_lr = phase_flip_lr
+        self.use_slm_phase = bool(use_slm_phase)
+        self.scale_max_pixels_per_sample = scale_max_pixels_per_sample
         self.field_scale_mode = field_scale_mode
         self.field_amp_percentile = field_amp_percentile
         self.field_amp_scale = field_amp_scale
@@ -87,9 +99,18 @@ class AxiconFieldDataset(Dataset):
         self._validate_scale_mode(self.camera_scale_mode, 'camera_scale_mode')
         if self.fov_crop_size is not None and self.fov_crop_size <= 0:
             raise ValueError(f"fov_crop_size must be positive or None; got {self.fov_crop_size}")
+        if scale_max_pixels_per_sample is not None and (
+                not isinstance(scale_max_pixels_per_sample, int) or scale_max_pixels_per_sample <= 0):
+            raise ValueError("scale_max_pixels_per_sample must be a positive integer or None")
 
         self.samples = self._discover_workflow_samples()
+        if not self.samples:
+            raise RuntimeError("No matched simulation/camera samples; check workflow paths and z folders")
+        self.z_positions_mm = sorted({s['z_mm'] for s in self.samples})
         print(f">>> Loaded {len(self.samples)} workflow samples from {self.root_dir}")
+        for z_mm in self.z_positions_mm:
+            count = sum(s['z_mm'] == z_mm for s in self.samples)
+            print(f">>>   z={z_mm:+g} mm: {count} matched samples")
         if self.samples:
             print(f">>> First sample ids: {', '.join(s['id'] for s in self.samples[:5])}")
         if self.camera_scale_mode == 'global_percentile' and self.camera_scale is None:
@@ -110,51 +131,88 @@ class AxiconFieldDataset(Dataset):
             parts.append(str(int(part)) if part.isdigit() else part)
         return '_'.join(parts)
 
-    def _path_map_by_normalized_stem(self, directory, patterns):
-        directory = self.root_dir / directory
-        if not directory.is_dir():
-            raise FileNotFoundError(f"Expected workflow directory not found: {directory}")
+    def _resolve_workflow_directory(self, directory):
+        if directory is None:
+            raise ValueError("A workflow directory is required")
+        requested = self.root_dir / directory
+        if requested.is_dir():
+            return requested
 
-        paths = []
-        for pattern in patterns:
-            paths.extend(directory.glob(pattern))
+        def canonical(name):
+            name = re.sub(r'^\d+[. _-]*', '', name).lower()
+            return {'phase_masks': 'phase_mask',
+                    'camera_aligned': 'aligned_camera'}.get(name, name)
+
+        # Honor exact paths first; tolerate a changed/missing workflow number.
+        candidates = sorted(p for p in requested.parent.iterdir()
+                            if p.is_dir() and canonical(p.name) == canonical(requested.name))
+        if len(candidates) > 1:
+            raise ValueError(f"Ambiguous workflow directory {requested}: {candidates}")
+        if not candidates:
+            raise FileNotFoundError(f"Expected workflow directory not found: {requested}")
+        print(f">>> Resolved {directory} -> {candidates[0]}")
+        return candidates[0]
+
+    def _path_map_by_z_and_stem(self, directory, shared_phase=False):
+        directory = self._resolve_workflow_directory(directory)
+        # Only read NPYs directly in the root or a z folder, never quality sidecars.
+        folders = [(directory, None if shared_phase else 0.0, False)]
+        for child in sorted(directory.iterdir()):
+            if not child.is_dir():
+                continue
+            match = re.fullmatch(r'z_([+-]?(?:\d+(?:\.\d*)?|\.\d+))(?:mm)?',
+                                 child.name, flags=re.IGNORECASE)
+            if match:
+                folders.append((child, float(match[1]), True))
+            elif child.name.lower().startswith('z_'):
+                raise ValueError(f"Invalid z folder (expected e.g. z_+0.5 in mm): {child}")
 
         path_map = {}
-        for path in sorted(p for p in paths if p.is_file()):
-            key = self._normalized_stem(path)
-            if key in path_map:
-                print(f"[skip] duplicate normalized id {key}: {path_map[key].name}, {path.name}")
-                continue
-            path_map[key] = path
+        for folder, z_mm, has_z in folders:
+            for path in sorted(folder.glob('*.npy')):
+                key = (z_mm, self._normalized_stem(path))
+                if key in path_map:
+                    raise ValueError(f"Duplicate (z, pattern) {key}: {path_map[key][0]} and {path}")
+                path_map[key] = (path, has_z)
         return path_map
 
     def _discover_workflow_samples(self):
-        field_map = self._path_map_by_normalized_stem(self.workflow_field_dir, ('*.npy',))
-        camera_map = self._path_map_by_normalized_stem(self.workflow_camera_dir, ('*.npy',))
-        phase_map = self._path_map_by_normalized_stem(self.workflow_phase_dir, ('*.npy',))
+        field_map = self._path_map_by_z_and_stem(self.workflow_field_dir)
+        camera_map = self._path_map_by_z_and_stem(self.workflow_camera_dir)
+        phase_map = (self._path_map_by_z_and_stem(self.workflow_phase_dir, shared_phase=True)
+                     if self.use_slm_phase else {})
 
         common_ids = sorted(set(field_map) & set(camera_map))
         samples = []
-        for sample_id in common_ids:
-            phase_p = phase_map.get(sample_id)
-            if phase_p is None:
-                print(f"[skip] {sample_id} (missing phase)")
+        missing_phase = []
+        for z_mm, pattern_id in common_ids:
+            key = (z_mm, pattern_id)
+            phase_entry = phase_map.get(key, phase_map.get((None, pattern_id)))
+            if self.use_slm_phase and phase_entry is None:
+                missing_phase.append(key)
                 continue
+            has_z = field_map[key][1] or camera_map[key][1]
+            sample_id = f'{pattern_id}__z_{z_mm:+g}mm' if has_z else pattern_id
             samples.append({
                 'id': sample_id,
-                'field': field_map[sample_id],
-                'camera': camera_map[sample_id],
-                'phase': phase_p,
+                'pattern_id': pattern_id,
+                'z_mm': z_mm,
+                'field': field_map[key][0],
+                'camera': camera_map[key][0],
+                'phase': phase_entry[0] if phase_entry else None,
             })
 
         missing_camera = sorted(set(field_map) - set(camera_map))
         missing_field = sorted(set(camera_map) - set(field_map))
         if missing_camera:
             print(f">>> Workflow samples with simulation but no camera: {len(missing_camera)}")
-            print(f">>>   first: {', '.join(missing_camera[:8])}")
+            print(f">>>   first (z_mm, pattern): {missing_camera[:8]}")
         if missing_field:
             print(f">>> Workflow samples with camera but no simulation: {len(missing_field)}")
-            print(f">>>   first: {', '.join(missing_field[:8])}")
+            print(f">>>   first (z_mm, pattern): {missing_field[:8]}")
+        if missing_phase:
+            raise FileNotFoundError(f"SLM phase required but missing for {len(missing_phase)} pairs: "
+                                    f"{missing_phase[:8]}")
         return samples
 
     def __len__(self):
@@ -254,12 +312,22 @@ class AxiconFieldDataset(Dataset):
             return np.sqrt(chw[0].astype(np.float32) ** 2 + chw[1].astype(np.float32) ** 2)
         return chw[0].astype(np.float32)
 
+    def _scale_values(self, arr, rng):
+        values = np.asarray(arr).reshape(-1)
+        values = values[np.isfinite(values)]
+        cap = self.scale_max_pixels_per_sample
+        if cap is not None and values.size > cap:
+            # A fixed RNG makes the bounded global-percentile estimate reproducible.
+            values = values[rng.choice(values.size, size=cap, replace=False)]
+        return values
+
     def _compute_global_camera_scale(self, eps=1e-8):
         values = []
+        rng = np.random.default_rng(0)
         for s in self.samples:
             arr = self._load_camera_array(s['camera']) - float(self.camera_black_level)
             arr = np.clip(arr, 0.0, None)
-            finite = arr[np.isfinite(arr)]
+            finite = self._scale_values(arr, rng)
             if finite.size:
                 values.append(finite.reshape(-1))
         if not values:
@@ -268,11 +336,12 @@ class AxiconFieldDataset(Dataset):
 
     def _compute_global_field_amp_scale(self, eps=1e-8):
         values = []
+        rng = np.random.default_rng(0)
         for s in self.samples:
             arr = np.load(s['field'])
             amp = self._extract_field_amplitude(arr)
             amp = self._center_crop_2d(amp, source_name=f"field amplitude {s['field'].name}")
-            finite = amp[np.isfinite(amp)]
+            finite = self._scale_values(amp, rng)
             if finite.size:
                 values.append(finite.reshape(-1))
         if not values:
@@ -354,9 +423,13 @@ class AxiconFieldDataset(Dataset):
         return {
             'field': field,
             'sim': sim,
-            'phase': self._load_phase(s['phase']),
+            # Keep the existing batching/predict_camera API when phase is disabled.
+            'phase': (self._load_phase(s['phase']) if self.use_slm_phase
+                      else torch.zeros(1, 1, 1)),
             'camera': self._load_camera(s['camera']),
             'id': s['id'],
+            'pattern_id': s['pattern_id'],
+            'z_mm': s['z_mm'],
         }
 
 
@@ -934,7 +1007,7 @@ def normalize_group_loss_weights(dataset, train_indices, raw_weights, enabled=Tr
 
 
 def pert_parent_id_from_id(sample_id, real_ids=None):
-    sample_id = str(sample_id)
+    sample_id = pattern_id_from_id(sample_id)
     if not sample_id.startswith('pert_'):
         return None
 
@@ -983,6 +1056,11 @@ def sample_group_from_id(sample_id):
     return 'other'
 
 
+def pattern_id_from_id(sample_id):
+    """Remove only the trainer's z suffix, retaining the original pattern name."""
+    return str(sample_id).split('__z_', 1)[0]
+
+
 def split_dataset(dataset, real_train_ratio=0.8, sys_train_ratio=1.0,
                   seed=42, train_ratio=None):
     # train_ratio is retained as a compatibility alias for older callers.
@@ -994,6 +1072,31 @@ def split_dataset(dataset, real_train_ratio=0.8, sys_train_ratio=1.0,
                         ('sys_train_ratio', sys_train_ratio)]:
         if not 0.0 <= ratio <= 1.0:
             raise ValueError(f"{name} must be between 0 and 1; got {ratio}")
+
+    # Apply the existing family split to UNIQUE patterns, then expand all their
+    # z views. Splitting individual (pattern, z) pairs would leak patterns.
+    indices_by_pattern = {}
+    for idx, sample in enumerate(dataset.samples):
+        pattern_id = sample.get('pattern_id', pattern_id_from_id(sample['id']))
+        indices_by_pattern.setdefault(pattern_id, []).append(idx)
+    if (len(indices_by_pattern) != len(dataset) or
+            any(pattern != dataset.samples[indices[0]]['id']
+                for pattern, indices in indices_by_pattern.items())):
+        patterns = sorted(indices_by_pattern)
+        grouped = Subset(dataset, [indices_by_pattern[p][0] for p in patterns])
+        grouped.samples = [{'id': p} for p in patterns]
+        _, _, train_patterns, val_patterns = split_dataset(
+            grouped, real_train_ratio=real_train_ratio,
+            sys_train_ratio=sys_train_ratio, seed=seed,
+        )
+        train_idx = sorted(i for p in train_patterns for i in indices_by_pattern[patterns[p]])
+        val_idx = sorted(i for p in val_patterns for i in indices_by_pattern[patterns[p]])
+        print(f">>> Expanded pattern split: {len(train_idx)} train / {len(val_idx)} val pairs")
+        for z_mm in sorted({s.get('z_mm', 0.0) for s in dataset.samples}):
+            nt = sum(dataset.samples[i].get('z_mm', 0.0) == z_mm for i in train_idx)
+            nv = sum(dataset.samples[i].get('z_mm', 0.0) == z_mm for i in val_idx)
+            print(f">>>   z={z_mm:+g} mm: {nt} train / {nv} val")
+        return Subset(dataset, train_idx), Subset(dataset, val_idx), train_idx, val_idx
 
     rng = random.Random(seed)
 
@@ -1477,20 +1580,21 @@ def plot_loss_curve(history, run_dir):
 
 def write_per_sample_metrics(rows, dataset, train_idx, val_idx, run_dir, metric_prefix=''):
     run_dir = Path(run_dir)
-    train_ids = {dataset.samples[i]['id'] for i in train_idx}
-    val_ids = {dataset.samples[i]['id'] for i in val_idx}
+    train_indices, val_indices = set(train_idx), set(val_idx)
     records = []
 
     for idx, sid, raw_mse, display_mse, ssim in rows:
-        if sid in train_ids:
+        if idx in train_indices:
             split = 'train'
-        elif sid in val_ids:
+        elif idx in val_indices:
             split = 'val'
         else:
             split = 'unknown'
         records.append({
             'index': int(idx),
             'id': sid,
+            'pattern_id': dataset.samples[idx].get('pattern_id', pattern_id_from_id(sid)),
+            'z_mm': float(dataset.samples[idx].get('z_mm', 0.0)),
             'type': sample_type_from_id(sid),
             'group': sample_group_from_id(sid),
             'split': split,
@@ -1502,7 +1606,7 @@ def write_per_sample_metrics(rows, dataset, train_idx, val_idx, run_dir, metric_
     with open(run_dir / 'per_sample_metrics.csv', 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow([
-            'index', 'id', 'type', 'group', 'split',
+            'index', 'id', 'pattern_id', 'z_mm', 'type', 'group', 'split',
             f'{metric_prefix}raw_mse',
             f'{metric_prefix}display_log_mse',
             f'{metric_prefix}ssim',
@@ -1511,6 +1615,8 @@ def write_per_sample_metrics(rows, dataset, train_idx, val_idx, run_dir, metric_
             writer.writerow([
                 record['index'],
                 record['id'],
+                record['pattern_id'],
+                record['z_mm'],
                 record['type'],
                 record['group'],
                 record['split'],
@@ -1548,6 +1654,18 @@ def write_per_sample_metrics(rows, dataset, train_idx, val_idx, run_dir, metric_
                 float(np.median(bucket['display'])),
                 float(np.mean(bucket['ssim'])),
                 float(np.median(bucket['ssim'])),
+            ])
+
+    # Report z separately: the many z=0 patterns otherwise dominate pooled metrics.
+    with open(run_dir / 'per_z_metrics_summary.csv', 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['z_mm', 'split', 'n', f'mean_{metric_prefix}raw_mse',
+                         f'mean_{metric_prefix}display_log_mse', f'mean_{metric_prefix}ssim'])
+        for z_mm, split in sorted({(r['z_mm'], r['split']) for r in records}):
+            group = [r for r in records if r['z_mm'] == z_mm and r['split'] == split]
+            writer.writerow([z_mm, split, len(group)] + [
+                float(np.mean([r[metric] for r in group]))
+                for metric in ('raw_mse', 'display_log_mse', 'ssim')
             ])
 
     return records
@@ -1634,15 +1752,16 @@ def plot_per_sample_metrics(records, run_dir, metric_prefix=''):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    POOL_DIR = r'H:\Shared drives\taylorlab\3DHL\CITL\Fourier Neural Operator_Training phase masks\06_14_2026_sample3_z6mm'
-    OUTPUT_DIR = r'C:\REVAMP\Yangwoo Heo\SLM_to_Axicon_Optimiaztion\FNO_train_898sample_FOVfix'
+    POOL_DIR = r'D:\PhDResearch\Measurement\09_08_2026_FNOtraining'
+    OUTPUT_DIR = Path(__file__).resolve().parent / 'fno_runs_multiz'
     RUN_NAME = datetime.now().strftime('%Y%m%d_%H%M%S')
     EVAL_ONLY_RUN_DIR = None
 
     # Data
+    # Exact paths take priority; missing/changed leading numbers are auto-resolved.
     WORKFLOW_FIELD_DIR = '1.Forward_Sim'
     WORKFLOW_CAMERA_DIR = '3.Aligned_Camera'
-    WORKFLOW_PHASE_DIR = '0.Phase_Masks'
+    WORKFLOW_PHASE_DIR = '0.Phase_Masks'  # may be an absolute path; unused when USE_SLM_PHASE=False
     # Set to None for full-frame training. 608 is a native ~60% crop of 1024
     # and avoids resizing the valid FOV back to the original resolution.
     FOV_CROP_SIZE = 608
@@ -1656,9 +1775,12 @@ if __name__ == '__main__':
     FIELD_AMP_SCALE = None
     CAMERA_SCALE = None
     CAMERA_BLACK_LEVEL = 0.0
+    # One shared scale across z preserves relative brightness. Bound RAM use for
+    # the multi-z pool; set None to compute the exact percentile over every pixel.
+    SCALE_MAX_PIXELS_PER_SAMPLE = 8192
 
     # FNO architecture
-    PREDICTION_MODE = 'intensity'  # 'intensity', 'direct_field', or 'residual_field'
+    PREDICTION_MODE = 'residual_field'  # 'intensity', 'direct_field', or 'residual_field'
     WIDTH = 12
     INTENSITY_ACTIVATION = 'softplus'
     DEPTH = 3
@@ -1668,7 +1790,7 @@ if __name__ == '__main__':
     OUTPUT_BIAS_INIT = -4.0  # softplus(-4) gives a dark, nonzero initial output
 
     # Axicon/SLM-aware conditioning
-    USE_SLM_PHASE = False
+    USE_SLM_PHASE = False  # field-only shared FNO; no SLM phase or z input channels
     SLM_PHASE_WEIGHT = 0.10
     SLM_PHASE_LOWPASS_SIZE = 64
     SLM_PHASE_RING_RADIUS = None  # normalized radius in camera coordinates, e.g. 0.55
@@ -1682,7 +1804,7 @@ if __name__ == '__main__':
     FIELD_OUT_SCALE = 4.0
     FIELD_OUT_SCALE_MODE = 'field_rms'
     DIRECT_FIELD_ACTIVATION = 'tanh'
-    DIRECT_FIELD_NOISE_STD = 0.05
+    DIRECT_FIELD_NOISE_STD = 0.0  # deterministic residual baseline; optional training noise
     RESIDUAL_FIELD_ALPHA = 1.0
     # Makes residual_field start as E_pred = E_sim without freezing learning.
     RESIDUAL_FIELD_ZERO_INIT = True
@@ -1752,6 +1874,10 @@ if __name__ == '__main__':
         'camera_scale_mode': CAMERA_SCALE_MODE,
         'field_amp_percentile': FIELD_AMP_PERCENTILE,
         'camera_percentile': CAMERA_PERCENTILE,
+        'scale_max_pixels_per_sample': SCALE_MAX_PIXELS_PER_SAMPLE,
+        'z_input_mode': 'none',
+        'z_units': 'mm',
+        'z_semantics': 'offset_from_reference_plane',
         'prediction_mode': PREDICTION_MODE,
         'intensity_activation': INTENSITY_ACTIVATION,
         'width': WIDTH,
@@ -1822,9 +1948,12 @@ if __name__ == '__main__':
         camera_scale=CAMERA_SCALE,
         camera_black_level=CAMERA_BLACK_LEVEL,
         fov_crop_size=FOV_CROP_SIZE,
+        use_slm_phase=USE_SLM_PHASE,
+        scale_max_pixels_per_sample=SCALE_MAX_PIXELS_PER_SAMPLE,
     )
     cfg['field_amp_scale_actual'] = dataset.field_amp_scale
     cfg['camera_scale_actual'] = dataset.camera_scale
+    cfg['z_positions_mm'] = dataset.z_positions_mm
 
     if len(dataset) < 2:
         raise RuntimeError(f"Need at least 2 samples, found {len(dataset)}")
@@ -1851,13 +1980,28 @@ if __name__ == '__main__':
                     'split_rule': (
                         'sys_* -> family-stratified random train/val; '
                         'real_* parent groups -> random train/val; '
-                        'pert_* -> same split as matching real_* parent; others -> random train/val'
+                        'pert_* -> same split as matching real_* parent; others -> random train/val; '
+                        'all z views of each pattern stay in the same split'
                     ),
                     'sys_train_ratio': SYS_TRAIN_RATIO,
                     'real_train_ratio_for_parents_and_other': REAL_TRAIN_RATIO,
                     'train': [dataset.samples[i]['id'] for i in train_idx],
                     'val': [dataset.samples[i]['id'] for i in val_idx],
+                    'z_positions_mm': dataset.z_positions_mm,
                 }, f, indent=2)
+
+    if not train_idx or not val_idx:
+        raise RuntimeError("Training and validation must both contain samples; adjust split ratios")
+    train_index_set = set(train_idx)
+    val_index_set = set(val_idx)
+    with open(run_dir / 'dataset_manifest.csv', 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['id', 'pattern_id', 'z_mm', 'split', 'field', 'camera', 'phase'])
+        for i, sample in enumerate(dataset.samples):
+            split = 'train' if i in train_index_set else ('val' if i in val_index_set else 'unknown')
+            writer.writerow([sample['id'], sample['pattern_id'], sample['z_mm'], split,
+                             str(sample['field']), str(sample['camera']),
+                             str(sample['phase']) if sample['phase'] else ''])
 
     normalized_group_weights, train_group_counts = normalize_group_loss_weights(
         dataset,
