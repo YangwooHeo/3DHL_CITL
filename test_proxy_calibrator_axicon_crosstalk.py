@@ -203,6 +203,39 @@ class MultiZDatasetTests(unittest.TestCase):
             self.assertEqual(len(dataset), 2)
             self.assertEqual(len({s["pattern_id"] for s in dataset.samples}), 1)
 
+    def test_phase_directory_defines_the_pattern_whitelist(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            phase_dir = root / "0.Phase_Masks_mini"
+            phase_dir.mkdir()
+            selected_patterns = {"real_0", "real_2"}
+            for pattern_id in selected_patterns:
+                np.save(
+                    phase_dir / f"{pattern_id}.npy",
+                    np.array([[0.0, 1023.0]], dtype=np.float32),
+                )
+            for z_folder in ("z_-0.5", "z_+0.5"):
+                camera_dir = root / "3.Aligned_Camera" / z_folder
+                camera_dir.mkdir(parents=True, exist_ok=True)
+                for pattern_id in ("real_0", "real_1", "real_2"):
+                    np.save(
+                        camera_dir / f"{pattern_id}.npy",
+                        np.ones((1, 2), dtype=np.float32),
+                    )
+
+            dataset = self._dataset(
+                root,
+                phase_dir="Phase_Masks_mini",
+                require_all_z=True,
+            )
+
+            self.assertEqual(len(dataset), 4)
+            self.assertEqual(
+                {sample["pattern_id"] for sample in dataset.samples},
+                selected_patterns,
+            )
+            self.assertEqual(dataset.z_positions_mm, [-0.5, 0.5])
+
     def test_sparse_transfer_is_sliced_to_one_plane_per_sample(self):
         transfer = torch.arange(12).reshape(4, 3)
         h_asm = {

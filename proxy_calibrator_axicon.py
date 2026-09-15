@@ -344,6 +344,27 @@ class ProxyCalibrationDataset(Dataset):
                     f"{self.pattern_globs} at z offsets {selected_z}"
                 )
 
+        # The selected phase directory is also the pattern-set definition.
+        # This preserves the legacy workflow where users make a small phase
+        # folder instead of spelling out many --pattern-glob arguments.
+        phase_pattern_ids = {pattern_id for _, pattern_id in phase_map}
+        camera_pair_count = len(camera_keys)
+        camera_keys = {
+            (z_mm, pattern_id)
+            for z_mm, pattern_id in camera_keys
+            if (z_mm, pattern_id) in phase_map
+            or (None, pattern_id) in phase_map
+        }
+        if not camera_keys:
+            raise RuntimeError(
+                f"No camera samples at z offsets {selected_z} match phase "
+                f"masks in {self._resolve_workflow_directory(self.phase_dir)}"
+            )
+        print(
+            f">>> Phase-directory selection: {len(phase_pattern_ids)} mask "
+            f"patterns matched {len(camera_keys)}/{camera_pair_count} camera pairs"
+        )
+
         coverage: dict[str, set[float]] = {}
         for z_mm, pattern_id in camera_keys:
             coverage.setdefault(pattern_id, set()).add(float(z_mm))
@@ -377,15 +398,16 @@ class ProxyCalibrationDataset(Dataset):
         selected_keys = sorted(
             key for key in camera_keys if key[1] in selected_patterns
         )
-        missing_phase = []
         samples = []
         for z_mm, pattern_id in selected_keys:
             phase_entry = phase_map.get(
                 (z_mm, pattern_id), phase_map.get((None, pattern_id))
             )
             if phase_entry is None:
-                missing_phase.append((z_mm, pattern_id))
-                continue
+                raise RuntimeError(
+                    "Internal phase-selection mismatch for "
+                    f"{(z_mm, pattern_id)}"
+                )
             camera_path, has_explicit_z = camera_map[(z_mm, pattern_id)]
             sample_id = (
                 f"{pattern_id}__z_{z_mm:+g}mm"
@@ -398,11 +420,6 @@ class ProxyCalibrationDataset(Dataset):
                 "phase": phase_entry[0],
                 "camera": camera_path,
             })
-        if missing_phase:
-            raise FileNotFoundError(
-                f"SLM phase is missing for {len(missing_phase)} selected "
-                f"camera samples; first: {missing_phase[:8]}"
-            )
         return samples
 
     def _load_camera_raw(self, path: Path) -> np.ndarray:
