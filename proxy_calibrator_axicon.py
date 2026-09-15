@@ -6,11 +6,16 @@ The calibration data uses the same workflow-folder contract as
     pool/
       0.Phase_Masks/*.npy
       1.Forward_Sim/*.npy       # not read by this script
-      3.Aligned_Camera/*.npy
+      3.Aligned_Camera/z_-0.5/*.npy
+      3.Aligned_Camera/z_0/*.npy
+      3.Aligned_Camera/z_+0.5/*.npy
 
-Phase and camera files are paired by the same normalized-stem rule used by the
-FNO trainer. The optical defaults are imported from ``axicon_simulator.py`` so
-z, NA, upsampling, ROI, medium, orientation, and spatial filtering cannot drift
+The z-folder suffix is an offset in millimetres from ``--z-m``.  Flat camera
+directories remain supported as the zero-offset, single-z layout. Phase and
+camera files are paired by the same normalized-stem rule used by the FNO
+trainer, and every z view of a pattern remains in one train/validation split.
+The optical defaults are imported from ``axicon_simulator.py`` so z, NA,
+upsampling, ROI, medium, orientation, and spatial filtering cannot drift
 between simulation and calibration.
 
 The learned proxy is deliberately low dimensional:
@@ -22,8 +27,8 @@ The learned proxy is deliberately low dimensional:
 * A bounded, coarse source map describes smooth illumination non-uniformity.
 * A polar complex transfer correction describes deterministic coherent
   camera-path aberrations with aggressive radial/azimuthal capacity.
-* A bounded propagation-distance refinement describes a small camera-plane
-  defocus around the simulator's fixed, full-resolution propagation distance.
+* A bounded propagation-distance refinement describes one shared camera-plane
+  defocus correction around all known, full-resolution sample distances.
 * A bounded two-axis axicon-centre displacement describes lateral alignment
   through a differentiable shift-equivalent propagation path.
 * A positive log-parameterized scalar describes camera/throughput gain.
@@ -38,9 +43,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fnmatch
 import json
 import math
 import random
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -158,6 +165,10 @@ class ProxyCalibrationDataset(Dataset):
         camera_percentile: float = 99.9,
         camera_scale: float | None = None,
         scale_sample_pixels: int = 8192,
+        z_offsets_mm: tuple[float, ...] | list[float] | None = None,
+        pattern_globs: tuple[str, ...] | list[str] | None = None,
+        require_all_z: bool = True,
+        max_patterns: int | None = None,
         seed: int = 42,
     ) -> None:
         self.root_dir = Path(root_dir)
@@ -171,6 +182,13 @@ class ProxyCalibrationDataset(Dataset):
         self.camera_black_level = float(camera_black_level)
         self.camera_percentile = float(camera_percentile)
         self.scale_sample_pixels = int(scale_sample_pixels)
+        self.requested_z_offsets_mm = (
+            None if z_offsets_mm is None
+            else tuple(float(value) for value in z_offsets_mm)
+        )
+        self.pattern_globs = tuple(pattern_globs or ())
+        self.require_all_z = bool(require_all_z)
+        self.max_patterns = max_patterns
         self.seed = int(seed)
 
         if not self.root_dir.is_dir():
@@ -181,10 +199,20 @@ class ProxyCalibrationDataset(Dataset):
             raise ValueError("camera_percentile must be in (0, 100]")
         if self.scale_sample_pixels <= 0:
             raise ValueError("scale_sample_pixels must be positive")
+        if self.requested_z_offsets_mm is not None:
+            if not self.requested_z_offsets_mm:
+                raise ValueError("z_offsets_mm must contain at least one value")
+            if not all(math.isfinite(value) for value in self.requested_z_offsets_mm):
+                raise ValueError("z_offsets_mm values must be finite")
+        if any(not pattern for pattern in self.pattern_globs):
+            raise ValueError("pattern_globs must not contain empty patterns")
+        if self.max_patterns is not None and self.max_patterns <= 0:
+            raise ValueError("max_patterns must be positive or None")
 
         self.samples = self._discover_samples()
         if not self.samples:
             raise RuntimeError(f"No paired phase/camera samples found under {self.root_dir}")
+        self.z_positions_mm = sorted({float(s["z_mm"]) for s in self.samples})
         self.camera_scale = (
             float(camera_scale) if camera_scale is not None
             else self._estimate_camera_scale()
@@ -193,41 +221,189 @@ class ProxyCalibrationDataset(Dataset):
             raise ValueError(f"camera_scale must be finite and positive; got {self.camera_scale}")
 
         print(f">>> Loaded {len(self.samples)} phase/camera pairs from {self.root_dir}")
+        z_counts = {}
+        for z_mm in self.z_positions_mm:
+            count = sum(float(sample["z_mm"]) == z_mm for sample in self.samples)
+            z_counts[z_mm] = count
+            print(f">>>   z offset={z_mm:+g} mm: {count} paired samples")
+        if len(z_counts) > 1 and max(z_counts.values()) > 2 * min(z_counts.values()):
+            print(
+                ">>> WARNING: z planes are strongly imbalanced. Use "
+                "--require-all-z for matched multi-z patterns, or restrict "
+                "patterns with --pattern-glob/--max-patterns."
+            )
         print(f">>> Camera scale: p{self.camera_percentile:g} ~= {self.camera_scale:.6g}")
         print(f">>> First sample ids: {', '.join(s['id'] for s in self.samples[:5])}")
 
-    def _path_map(self, directory_name: str) -> dict[str, Path]:
-        directory = self.root_dir / directory_name
-        if not directory.is_dir():
-            raise FileNotFoundError(f"Expected workflow directory not found: {directory}")
-        result: dict[str, Path] = {}
-        for path in sorted(directory.glob("*.npy")):
-            sample_id = normalized_sample_stem(path)
-            if sample_id in result:
+    def _resolve_workflow_directory(self, directory_name: str) -> Path:
+        requested = self.root_dir / directory_name
+        if requested.is_dir():
+            return requested
+
+        def canonical(name: str) -> str:
+            name = re.sub(r"^\d+[. _-]*", "", name).lower()
+            return {
+                "phase_masks": "phase_mask",
+                "camera_aligned": "aligned_camera",
+            }.get(name, name)
+
+        candidates = sorted(
+            path for path in requested.parent.iterdir()
+            if path.is_dir() and canonical(path.name) == canonical(requested.name)
+        )
+        if len(candidates) > 1:
+            raise ValueError(
+                f"Ambiguous workflow directory {requested}: {candidates}"
+            )
+        if not candidates:
+            raise FileNotFoundError(
+                f"Expected workflow directory not found: {requested}"
+            )
+        print(f">>> Resolved {directory_name} -> {candidates[0]}")
+        return candidates[0]
+
+    def _path_map_by_z_and_stem(
+        self, directory_name: str, *, shared_root: bool
+    ) -> dict[tuple[float | None, str], tuple[Path, bool]]:
+        directory = self._resolve_workflow_directory(directory_name)
+        folders: list[tuple[Path, float | None, bool]] = [
+            (directory, None if shared_root else 0.0, False)
+        ]
+        z_pattern = re.compile(
+            r"z_([+-]?(?:\d+(?:\.\d*)?|\.\d+))(?:mm)?",
+            flags=re.IGNORECASE,
+        )
+        for child in sorted(directory.iterdir()):
+            if not child.is_dir():
+                continue
+            match = z_pattern.fullmatch(child.name)
+            if match:
+                folders.append((child, float(match.group(1)), True))
+            elif child.name.lower().startswith("z_"):
                 raise ValueError(
-                    f"Duplicate normalized sample id {sample_id!r}: "
-                    f"{result[sample_id].name}, {path.name}"
+                    "Invalid z folder; expected an offset in mm such as "
+                    f"z_-0.5 or z_+1.0: {child}"
                 )
-            result[sample_id] = path
+
+        result: dict[tuple[float | None, str], tuple[Path, bool]] = {}
+        for folder, z_mm, has_explicit_z in folders:
+            for path in sorted(folder.glob("*.npy")):
+                key = (z_mm, normalized_sample_stem(path))
+                if key in result:
+                    raise ValueError(
+                        f"Duplicate (z, pattern) {key}: "
+                        f"{result[key][0]}, {path}"
+                    )
+                result[key] = (path, has_explicit_z)
         return result
 
-    def _discover_samples(self) -> list[dict[str, Path | str]]:
-        phase_map = self._path_map(self.phase_dir)
-        camera_map = self._path_map(self.camera_dir)
-        common_ids = sorted(set(phase_map) & set(camera_map))
-        missing_camera = sorted(set(phase_map) - set(camera_map))
-        missing_phase = sorted(set(camera_map) - set(phase_map))
-        if missing_camera:
-            print(f">>> Phase files without camera match: {len(missing_camera)}")
-            print(f">>>   first: {', '.join(missing_camera[:8])}")
+    def _selected_z_positions(self, available: list[float]) -> list[float]:
+        if self.requested_z_offsets_mm is None:
+            return available
+        selected = []
+        for requested in self.requested_z_offsets_mm:
+            matches = [
+                value for value in available
+                if math.isclose(value, requested, rel_tol=0.0, abs_tol=1e-9)
+            ]
+            if not matches:
+                raise ValueError(
+                    f"Requested z offset {requested:+g} mm is unavailable; "
+                    f"available offsets are {available}"
+                )
+            if matches[0] not in selected:
+                selected.append(matches[0])
+        return sorted(selected)
+
+    def _discover_samples(self) -> list[dict[str, Path | str | float]]:
+        phase_map = self._path_map_by_z_and_stem(
+            self.phase_dir, shared_root=True
+        )
+        camera_map = self._path_map_by_z_and_stem(
+            self.camera_dir, shared_root=False
+        )
+        available_z = sorted({
+            float(z_mm) for z_mm, _ in camera_map if z_mm is not None
+        })
+        selected_z = self._selected_z_positions(available_z)
+        selected_z_set = set(selected_z)
+
+        camera_keys = {
+            key for key in camera_map
+            if key[0] is not None and float(key[0]) in selected_z_set
+        }
+        if self.pattern_globs:
+            camera_keys = {
+                key for key in camera_keys
+                if any(fnmatch.fnmatchcase(key[1], pattern)
+                       for pattern in self.pattern_globs)
+            }
+            if not camera_keys:
+                raise RuntimeError(
+                    "No camera samples matched --pattern-glob filters "
+                    f"{self.pattern_globs} at z offsets {selected_z}"
+                )
+
+        coverage: dict[str, set[float]] = {}
+        for z_mm, pattern_id in camera_keys:
+            coverage.setdefault(pattern_id, set()).add(float(z_mm))
+        selected_patterns = set(coverage)
+        if self.require_all_z:
+            required = set(selected_z)
+            selected_patterns = {
+                pattern_id for pattern_id, positions in coverage.items()
+                if positions == required
+            }
+            removed = len(coverage) - len(selected_patterns)
+            print(
+                f">>> Complete-z pattern filter: kept={len(selected_patterns)}, "
+                f"removed={removed}, z_offsets={selected_z}"
+            )
+            if not selected_patterns:
+                raise RuntimeError(
+                    "No pattern has a camera image at every selected z offset"
+                )
+
+        if self.max_patterns is not None and len(selected_patterns) > self.max_patterns:
+            rng = random.Random(self.seed)
+            selected_patterns = set(
+                rng.sample(sorted(selected_patterns), self.max_patterns)
+            )
+            print(
+                f">>> Pattern cap: selected {len(selected_patterns)} unique "
+                f"patterns with seed={self.seed}"
+            )
+
+        selected_keys = sorted(
+            key for key in camera_keys if key[1] in selected_patterns
+        )
+        missing_phase = []
+        samples = []
+        for z_mm, pattern_id in selected_keys:
+            phase_entry = phase_map.get(
+                (z_mm, pattern_id), phase_map.get((None, pattern_id))
+            )
+            if phase_entry is None:
+                missing_phase.append((z_mm, pattern_id))
+                continue
+            camera_path, has_explicit_z = camera_map[(z_mm, pattern_id)]
+            sample_id = (
+                f"{pattern_id}__z_{z_mm:+g}mm"
+                if has_explicit_z else pattern_id
+            )
+            samples.append({
+                "id": sample_id,
+                "pattern_id": pattern_id,
+                "z_mm": float(z_mm),
+                "phase": phase_entry[0],
+                "camera": camera_path,
+            })
         if missing_phase:
-            print(f">>> Camera files without phase match: {len(missing_phase)}")
-            print(f">>>   first: {', '.join(missing_phase[:8])}")
-        return [
-            {"id": sample_id, "phase": phase_map[sample_id],
-             "camera": camera_map[sample_id]}
-            for sample_id in common_ids
-        ]
+            raise FileNotFoundError(
+                f"SLM phase is missing for {len(missing_phase)} selected "
+                f"camera samples; first: {missing_phase[:8]}"
+            )
+        return samples
 
     def _load_camera_raw(self, path: Path) -> np.ndarray:
         array = np.load(path)
@@ -302,6 +478,8 @@ class ProxyCalibrationDataset(Dataset):
             "slm_drive": self._load_slm_drive(sample["phase"]).float(),
             "camera": torch.from_numpy(camera).unsqueeze(0).float(),
             "id": sample["id"],
+            "pattern_id": sample["pattern_id"],
+            "z_mm": torch.tensor(float(sample["z_mm"]), dtype=torch.float64),
         }
 
 
@@ -1074,6 +1252,72 @@ def visual_loss(prediction: torch.Tensor, target: torch.Tensor,
     return losses.mean(), {name: value.mean() for name, value in components.items()}
 
 
+def scalar_z_offset_mm(value) -> float:
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise ValueError(
+                f"Each proxy forward pass requires one z offset; got {value.shape}"
+            )
+        value = value.detach().cpu().item()
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"z offset must be finite; got {value}")
+    return value
+
+
+def split_axicon_transfer_by_z(
+    h_asm, z_offsets_mm: list[float]
+) -> dict[float, torch.Tensor | dict]:
+    """Create cheap one-plane views so each sample propagates only to its z."""
+    offsets = [float(value) for value in z_offsets_mm]
+    if isinstance(h_asm, dict) and h_asm.get("type") == "sparse":
+        transfer = h_asm["H_asm_sparse"]
+        if transfer.ndim != 2 or transfer.shape[1] != len(offsets):
+            raise ValueError(
+                "Sparse ASM z dimension does not match dataset z offsets: "
+                f"{tuple(transfer.shape)} versus {offsets}"
+            )
+        result = {}
+        for index, z_mm in enumerate(offsets):
+            plane = dict(h_asm)
+            plane["H_asm_sparse"] = transfer[:, index:index + 1]
+            if "z_query" in h_asm:
+                plane["z_query"] = h_asm["z_query"][index:index + 1]
+            result[z_mm] = plane
+        return result
+    if not isinstance(h_asm, torch.Tensor) or h_asm.ndim != 3:
+        raise ValueError("Expected sparse ASM dictionary or dense HxWxNz tensor")
+    if h_asm.shape[2] != len(offsets):
+        raise ValueError(
+            "Dense ASM z dimension does not match dataset z offsets: "
+            f"{tuple(h_asm.shape)} versus {offsets}"
+        )
+    return {
+        z_mm: h_asm[:, :, index:index + 1]
+        for index, z_mm in enumerate(offsets)
+    }
+
+
+def transfer_for_z_offset(physics: dict, z_offset_mm) -> torch.Tensor | dict:
+    requested = scalar_z_offset_mm(z_offset_mm)
+    planes = physics.get("h_asm_by_z_mm")
+    if planes is None:
+        if "h_asm" in physics and math.isclose(
+            requested, 0.0, rel_tol=0.0, abs_tol=1e-7
+        ):
+            return physics["h_asm"]
+        raise KeyError("Physics bundle has no per-z ASM transfer functions")
+    if requested in planes:
+        return planes[requested]
+    nearest = min(planes, key=lambda value: abs(value - requested))
+    if not math.isclose(nearest, requested, rel_tol=0.0, abs_tol=1e-7):
+        raise KeyError(
+            f"No ASM plane for z offset {requested:+g} mm; "
+            f"available offsets are {sorted(planes)}"
+        )
+    return planes[nearest]
+
+
 def make_prediction(beam, proxy, sample, base_profile, physics, cfg,
                     device, require_grad, enable_z_grad=False,
                     enable_xy_grad=False):
@@ -1091,7 +1335,7 @@ def make_prediction(beam, proxy, sample, base_profile, physics, cfg,
         proxy=proxy,
         slm_drive=slm_drive,
         base_profile=base_profile,
-        h_asm=physics["h_asm"],
+        h_asm=transfer_for_z_offset(physics, sample.get("z_mm", 0.0)),
         cone_angle=physics["cone_angle"],
         upsample_factor=cfg["upsample_factor"],
         roi_size=cfg["roi_size"],
@@ -1123,9 +1367,12 @@ def make_prediction(beam, proxy, sample, base_profile, physics, cfg,
 @torch.no_grad()
 def initialize_camera_scale(beam, proxy, dataset, train_indices, base_profile,
                             physics, cfg, device) -> None:
-    """Match mean energy on a few training samples before Adam starts."""
+    """Match mean energy on a small z-balanced training subset."""
     ratios = []
-    for index in train_indices[:min(3, len(train_indices))]:
+    sample_count = min(
+        len(train_indices), max(3, len(getattr(dataset, "z_positions_mm", [])))
+    )
+    for index in evenly_spaced_by_z(dataset, train_indices, sample_count):
         sample = dataset[index]
         prediction, target = make_prediction(
             beam, proxy, sample, base_profile, physics, cfg, device, False)
@@ -1142,9 +1389,10 @@ def initialize_camera_scale(beam, proxy, dataset, train_indices, base_profile,
 
 
 def train_epoch(beam, proxy, loader, optimizer, base_profile, physics,
-                cfg, device, global_step: int) -> tuple[dict[str, float], int]:
+                cfg, device, global_step: int) -> tuple[dict, int]:
     proxy.train()
     totals = {"loss": 0.0, "data": 0.0, "reg": 0.0, "raw_mse": 0.0}
+    z_totals: dict[float, dict[str, float]] = {}
     n_samples = 0
     for batch in tqdm(loader, desc="train", leave=False):
         enable_z_grad = (
@@ -1167,6 +1415,7 @@ def train_epoch(beam, proxy, loader, optimizer, base_profile, physics,
             sample = {
                 "slm_drive": batch["slm_drive"][i],
                 "camera": batch["camera"][i:i + 1],
+                "z_mm": batch["z_mm"][i],
             }
             prediction, target = make_prediction(
                 beam, proxy, sample, base_profile, physics, cfg, device, True,
@@ -1176,8 +1425,17 @@ def train_epoch(beam, proxy, loader, optimizer, base_profile, physics,
             group = sample_type_from_id(sample_id)
             weight = cfg["group_loss_weights_normalized"].get(group, 1.0)
             (weight * data_loss / batch_size).backward()
-            batch_data += float((weight * data_loss).detach())
-            batch_mse += float(components["raw_mse"].detach())
+            weighted_data = float((weight * data_loss).detach())
+            raw_mse = float(components["raw_mse"].detach())
+            batch_data += weighted_data
+            batch_mse += raw_mse
+            z_mm = scalar_z_offset_mm(sample["z_mm"])
+            z_bucket = z_totals.setdefault(
+                z_mm, {"data": 0.0, "raw_mse": 0.0, "n": 0.0}
+            )
+            z_bucket["data"] += weighted_data
+            z_bucket["raw_mse"] += raw_mse
+            z_bucket["n"] += 1.0
 
         reg_loss, _ = proxy_regularization(
             proxy,
@@ -1204,21 +1462,49 @@ def train_epoch(beam, proxy, loader, optimizer, base_profile, physics,
         n_samples += batch_size
 
     metrics = {name: value / max(n_samples, 1) for name, value in totals.items()}
+    metrics["per_z"] = {
+        z_mm: {
+            name: values[name] / max(values["n"], 1.0)
+            for name in ("data", "raw_mse")
+        }
+        for z_mm, values in sorted(z_totals.items())
+    }
     return metrics, global_step
 
 
 @torch.no_grad()
 def evaluate_indices(beam, proxy, dataset, indices, base_profile,
-                     physics, cfg, device, description="val") -> dict[str, float]:
+                     physics, cfg, device, description="val") -> dict:
     proxy.eval()
     totals = {"loss": 0.0, "raw_mse": 0.0}
+    z_totals: dict[float, dict[str, float]] = {}
     for index in tqdm(indices, desc=description, leave=False):
+        sample = dataset[index]
         prediction, target = make_prediction(
-            beam, proxy, dataset[index], base_profile, physics, cfg, device, False)
+            beam, proxy, sample, base_profile, physics, cfg, device, False)
         loss, components = visual_loss(prediction, target, cfg)
-        totals["loss"] += float(loss)
-        totals["raw_mse"] += float(components["raw_mse"])
-    return {name: value / max(len(indices), 1) for name, value in totals.items()}
+        loss_value = float(loss)
+        raw_mse = float(components["raw_mse"])
+        totals["loss"] += loss_value
+        totals["raw_mse"] += raw_mse
+        z_mm = scalar_z_offset_mm(sample.get("z_mm", 0.0))
+        z_bucket = z_totals.setdefault(
+            z_mm, {"loss": 0.0, "raw_mse": 0.0, "n": 0.0}
+        )
+        z_bucket["loss"] += loss_value
+        z_bucket["raw_mse"] += raw_mse
+        z_bucket["n"] += 1.0
+    metrics = {
+        name: value / max(len(indices), 1) for name, value in totals.items()
+    }
+    metrics["per_z"] = {
+        z_mm: {
+            name: values[name] / max(values["n"], 1.0)
+            for name in ("loss", "raw_mse")
+        }
+        for z_mm, values in sorted(z_totals.items())
+    }
+    return metrics
 
 
 def checkpoint_selection_score(train_metrics: dict[str, float],
@@ -1305,8 +1591,13 @@ def checkpoint_payload(proxy, optimizer, epoch, history, cfg, dataset,
         "slm_crosstalk_support_pixels": proxy.crosstalk_kernel_size,
         "slm_crosstalk_subpixel_factor": proxy.crosstalk_subpixel_factor,
         "camera_scale_factor": proxy.camera_scale().detach().cpu(),
+        "z_reference_position_m": proxy.z_position_m(False).detach().cpu(),
         "z_position_m": proxy.z_position_m(False).detach().cpu(),
         "delta_z_m": proxy.delta_z_m(False).detach().cpu(),
+        "z_offsets_mm": list(cfg.get("z_positions_mm", [0.0])),
+        "z_absolute_positions_m": list(
+            cfg.get("z_absolute_positions_m", [proxy.z_initial_m.item()])
+        ),
         "z_initial_m": proxy.z_initial_m.detach().cpu(),
         "z_min_m": proxy.z_min_m.detach().cpu(),
         "z_max_m": proxy.z_max_m.detach().cpu(),
@@ -1631,6 +1922,42 @@ def evenly_spaced(indices: list[int], count: int) -> list[int]:
     return [indices[position] for position in positions]
 
 
+def evenly_spaced_by_z(dataset, indices: list[int], count: int) -> list[int]:
+    """Select a small, approximately z-balanced evaluation/preview subset."""
+    if count <= 0 or not indices:
+        return []
+    if len(indices) <= count:
+        return list(indices)
+    groups: dict[float, list[int]] = {}
+    for index in indices:
+        z_mm = float(dataset.samples[index].get("z_mm", 0.0))
+        groups.setdefault(z_mm, []).append(index)
+    if len(groups) == 1:
+        return evenly_spaced(indices, count)
+
+    z_values = sorted(groups)
+    if count < len(z_values):
+        chosen_positions = np.linspace(
+            0, len(z_values) - 1, count
+        ).round().astype(int)
+        return sorted(
+            evenly_spaced(groups[z_values[position]], 1)[0]
+            for position in chosen_positions
+        )
+    allocations = {z_mm: 0 for z_mm in z_values}
+    for _ in range(count):
+        eligible = [
+            z_mm for z_mm in z_values
+            if allocations[z_mm] < len(groups[z_mm])
+        ]
+        chosen = min(eligible, key=lambda z_mm: (allocations[z_mm], z_mm))
+        allocations[chosen] += 1
+    selected = []
+    for z_mm in z_values:
+        selected.extend(evenly_spaced(groups[z_mm], allocations[z_mm]))
+    return sorted(selected)
+
+
 def parse_optional_int(value: str) -> int | None:
     if value.lower() in {"none", "null", "full"}:
         return None
@@ -1661,6 +1988,45 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate pairing/preprocessing without constructing the optical system.")
+    parser.add_argument(
+        "--z-offset-mm",
+        dest="z_offsets_mm",
+        action="append",
+        type=float,
+        default=None,
+        help=(
+            "include one relative-z folder in mm (repeatable); by default all "
+            "z_* folders are used, and a flat camera directory is z=0"
+        ),
+    )
+    parser.add_argument(
+        "--pattern-glob",
+        dest="pattern_globs",
+        action="append",
+        default=None,
+        help=(
+            "include normalized pattern ids matching this shell-style glob "
+            "(repeatable; multiple globs are ORed)"
+        ),
+    )
+    parser.add_argument(
+        "--require-all-z",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "keep only patterns present at every selected/discovered z offset "
+            "(default; use --no-require-all-z to include incomplete sweeps)"
+        ),
+    )
+    parser.add_argument(
+        "--max-patterns",
+        type=parse_optional_int,
+        default=None,
+        help=(
+            "deterministic cap on unique patterns after z/glob filtering; all "
+            "available z views of each chosen pattern are retained"
+        ),
+    )
 
     parser.add_argument("--fov-crop-size", type=parse_optional_int, default=608)
     parser.add_argument("--camera-black-level", type=float, default=0.0)
@@ -1679,8 +2045,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--optimize-z", action=argparse.BooleanOptionalAction, default=False,
         help=(
-            "learn a bounded ROI-domain delta-z around --z-m; the expensive "
-            "full-resolution ASM remains fixed at --z-m"
+            "learn one shared bounded ROI-domain delta-z around --z-m; each "
+            "sample's full-resolution ASM stays fixed at --z-m plus its "
+            "known folder offset"
         ),
     )
     parser.add_argument(
@@ -1979,6 +2346,10 @@ def main() -> None:
         args.n_vis_val = args.n_vis
     if args.n_vis_train < 0 or args.n_vis_val < 0:
         raise ValueError("--n-vis-train and --n-vis-val must be non-negative")
+    if args.z_offsets_mm is not None and not all(
+        math.isfinite(value) for value in args.z_offsets_mm
+    ):
+        raise ValueError("--z-offset-mm values must be finite")
     if args.z_m <= 0 or args.roi_size <= 0 or args.upsample_factor <= 0:
         raise ValueError("z, ROI size, and upsample factor must be positive")
     if not 0 < args.z_min_m < args.z_m < args.z_max_m:
@@ -2081,10 +2452,22 @@ def main() -> None:
         camera_percentile=args.camera_percentile,
         camera_scale=args.camera_scale,
         scale_sample_pixels=args.scale_sample_pixels,
+        z_offsets_mm=args.z_offsets_mm,
+        pattern_globs=args.pattern_globs,
+        require_all_z=args.require_all_z,
+        max_patterns=args.max_patterns,
         seed=args.seed,
     )
     if len(dataset) < 1:
         raise RuntimeError("At least one paired sample is required for calibration")
+    absolute_z_positions_m = [
+        args.z_m + z_mm * 1e-3 for z_mm in dataset.z_positions_mm
+    ]
+    if any(z_m <= 0 for z_m in absolute_z_positions_m):
+        raise ValueError(
+            "Every absolute propagation distance --z-m + z_offset must be "
+            f"positive; got {absolute_z_positions_m}"
+        )
     first = dataset[0]
     print(f">>> First SLM drive shape: {tuple(first['slm_drive'].shape)}")
     print(f">>> First camera shape: {tuple(first['camera'].shape)}")
@@ -2101,17 +2484,27 @@ def main() -> None:
         raise RuntimeError("The configured split produced an empty training set")
     has_validation = bool(val_indices)
     eval_indices = (
-        evenly_spaced(val_indices, args.val_max_samples)
+        evenly_spaced_by_z(dataset, val_indices, args.val_max_samples)
         if has_validation else []
     )
-    train_preview_indices = evenly_spaced(train_indices, args.n_vis_train)
-    val_preview_indices = evenly_spaced(val_indices, args.n_vis_val)
+    train_preview_indices = evenly_spaced_by_z(
+        dataset, train_indices, args.n_vis_train
+    )
+    val_preview_indices = evenly_spaced_by_z(
+        dataset, val_indices, args.n_vis_val
+    )
     checkpoint_metric = "val_loss" if has_validation else "train_loss"
 
     cfg = config_from_args(args, device, beam_config)
+    cfg["z_positions_mm"] = dataset.z_positions_mm
+    cfg["z_absolute_positions_m"] = absolute_z_positions_m
+    cfg["z_semantics"] = (
+        "sample z = z_m + known folder offset; learned delta_z is one shared "
+        "global correction applied to every plane"
+    )
     cfg["z_refinement_model"] = (
-        "ROI angular-spectrum delta-z fused with polar transfer FFT; "
-        "full-resolution ASM fixed at z_m"
+        "full-resolution ASM at z_m + known sample offset; one shared ROI "
+        "angular-spectrum delta-z fused with the polar transfer FFT"
     )
     cfg["xy_refinement_model"] = (
         "continuous-axicon shift equivariance: sample the filtered SLM field "
@@ -2136,6 +2529,7 @@ def main() -> None:
         json.dump(cfg, handle, indent=2)
     with (run_dir / "split.json").open("w", encoding="utf-8") as handle:
         json.dump({
+            "z_positions_mm": dataset.z_positions_mm,
             "train": [dataset.samples[i]["id"] for i in train_indices],
             "val": [dataset.samples[i]["id"] for i in val_indices],
             "validation_evaluated": [dataset.samples[i]["id"] for i in eval_indices],
@@ -2148,6 +2542,27 @@ def main() -> None:
                 ],
             },
         }, handle, indent=2)
+    train_index_set = set(train_indices)
+    val_index_set = set(val_indices)
+    with (run_dir / "dataset_manifest.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            "id", "pattern_id", "z_offset_mm", "absolute_z_m", "split",
+            "phase", "camera",
+        ])
+        for index, sample in enumerate(dataset.samples):
+            split = (
+                "train" if index in train_index_set
+                else "val" if index in val_index_set
+                else "unknown"
+            )
+            writer.writerow([
+                sample["id"], sample["pattern_id"], sample["z_mm"],
+                args.z_m + float(sample["z_mm"]) * 1e-3, split,
+                str(sample["phase"]), str(sample["camera"]),
+            ])
 
     print(
         ">>> Final previews: "
@@ -2168,7 +2583,8 @@ def main() -> None:
     transverse_frequency = cfg["axicon_transverse_frequency"]
     print(
         f">>> Physics: profile={args.axicon_profile}, "
-        f"z={args.z_m * 1e3:.3f} mm, NA_air={na_air:.4f}, "
+        f"z_reference={args.z_m * 1e3:.3f} mm, "
+        f"offsets={dataset.z_positions_mm} mm, NA_air={na_air:.4f}, "
         f"upsample={args.upsample_factor}, ROI={args.roi_size}, "
         f"FOV={args.fov_crop_size}, n={args.propagation_medium_index:.4g}"
     )
@@ -2178,7 +2594,8 @@ def main() -> None:
     )
     print(
         f">>> Bounded z refinement: enabled={args.optimize_z}, "
-        f"range=[{args.z_min_m * 1e3:.3f}, {args.z_max_m * 1e3:.3f}] mm, "
+        f"shared_reference_range=[{args.z_min_m * 1e3:.3f}, "
+        f"{args.z_max_m * 1e3:.3f}] mm, "
         f"update_every={args.z_update_every} optimizer step(s), lr={args.lr_z:g}"
     )
     print(
@@ -2211,7 +2628,9 @@ def main() -> None:
     )
 
     beam = HoloBeam(beam_config)
-    z_query = torch.tensor([args.z_m], device=device, dtype=beam_config.fdtype)
+    z_query = torch.tensor(
+        absolute_z_positions_m, device=device, dtype=beam_config.fdtype
+    )
     h_asm = build_axicon_transfer_function(
         beam,
         show_debug_plot=False,
@@ -2228,7 +2647,9 @@ def main() -> None:
     )
     plt.close("all")
     physics = {
-        "h_asm": h_asm,
+        "h_asm_by_z_mm": split_axicon_transfer_by_z(
+            h_asm, dataset.z_positions_mm
+        ),
         "cone_angle": cone_angle,
         "axicon_transverse_frequency": transverse_frequency,
     }
@@ -2350,7 +2771,11 @@ def main() -> None:
             )
             scheduler.step(val_metrics["loss"])
         else:
-            val_metrics = {"loss": float("nan"), "raw_mse": float("nan")}
+            val_metrics = {
+                "loss": float("nan"),
+                "raw_mse": float("nan"),
+                "per_z": {},
+            }
             if not has_validation:
                 scheduler.step(train_metrics["loss"])
 
@@ -2392,6 +2817,12 @@ def main() -> None:
                 proxy.z_max_m - proxy.z_initial_m
             ).item() * 1e6,
         }
+        for z_mm, metrics in train_metrics["per_z"].items():
+            row[f"train_data_z_{z_mm:+g}mm"] = metrics["data"]
+            row[f"train_raw_mse_z_{z_mm:+g}mm"] = metrics["raw_mse"]
+        for z_mm, metrics in val_metrics["per_z"].items():
+            row[f"val_loss_z_{z_mm:+g}mm"] = metrics["loss"]
+            row[f"val_raw_mse_z_{z_mm:+g}mm"] = metrics["raw_mse"]
         history.append(row)
         write_history(history, run_dir)
         if has_validation:
@@ -2408,6 +2839,12 @@ def main() -> None:
             f"(delta=({row['delta_x_um']:+.3f}, "
             f"{row['delta_y_um']:+.3f}) um)"
         )
+        if val_metrics["per_z"]:
+            summary = ", ".join(
+                f"{z_mm:+g}mm={metrics['loss']:.6g}"
+                for z_mm, metrics in val_metrics["per_z"].items()
+            )
+            print(f">>> Validation loss by z offset: {summary}")
 
         score = checkpoint_selection_score(
             train_metrics,

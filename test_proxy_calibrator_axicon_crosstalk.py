@@ -6,7 +6,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from proxy_calibrator_axicon import AxiconProxyParameters, ProxyCalibrationDataset
+from proxy_calibrator_axicon import (
+    AxiconProxyParameters,
+    ProxyCalibrationDataset,
+    split_axicon_transfer_by_z,
+    transfer_for_z_offset,
+)
 
 
 def make_proxy(kernel_size: int, subpixel_factor: int = 1) -> AxiconProxyParameters:
@@ -131,6 +136,89 @@ class SlmCrosstalkTests(unittest.TestCase):
 
         self.assertEqual(filtered.shape, drive.shape)
         torch.testing.assert_close(filtered, drive)
+
+
+class MultiZDatasetTests(unittest.TestCase):
+    @staticmethod
+    def _write_pair(root: Path, pattern_id: str, z_folder: str) -> None:
+        np.save(
+            root / "0.Phase_Masks" / f"{pattern_id}.npy",
+            np.array([[0.0, 1023.0]], dtype=np.float32),
+        )
+        camera_dir = root / "3.Aligned_Camera" / z_folder
+        camera_dir.mkdir(parents=True, exist_ok=True)
+        np.save(
+            camera_dir / f"{pattern_id}.npy",
+            np.ones((1, 2), dtype=np.float32),
+        )
+
+    @staticmethod
+    def _dataset(root: Path, **kwargs) -> ProxyCalibrationDataset:
+        return ProxyCalibrationDataset(
+            root,
+            fov_crop_size=None,
+            phase_transpose=False,
+            phase_flip_first_axis=False,
+            expected_phase_shape=(1, 2),
+            camera_scale=1.0,
+            **kwargs,
+        )
+
+    def test_shared_phase_is_paired_with_every_z_and_complete_filter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "0.Phase_Masks").mkdir()
+            for z_folder in ("z_-0.5", "z_0", "z_+0.5"):
+                self._write_pair(root, "real_0", z_folder)
+            self._write_pair(root, "real_1", "z_0")
+
+            dataset = self._dataset(root, require_all_z=True)
+
+            self.assertEqual(dataset.z_positions_mm, [-0.5, 0.0, 0.5])
+            self.assertEqual(len(dataset), 3)
+            self.assertEqual({s["pattern_id"] for s in dataset.samples}, {"real_0"})
+            self.assertEqual(
+                {float(dataset[index]["z_mm"]) for index in range(len(dataset))},
+                {-0.5, 0.0, 0.5},
+            )
+            self.assertTrue(all("__z_" in s["id"] for s in dataset.samples))
+
+    def test_z_and_pattern_selection_retain_all_views_of_chosen_patterns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "0.Phase_Masks").mkdir()
+            for pattern_id in ("real_0", "real_1", "other_0"):
+                for z_folder in ("z_-1.0", "z_0", "z_+1.0"):
+                    self._write_pair(root, pattern_id, z_folder)
+
+            dataset = self._dataset(
+                root,
+                z_offsets_mm=[-1.0, 1.0],
+                pattern_globs=["real_*"],
+                max_patterns=1,
+                seed=7,
+            )
+
+            self.assertEqual(dataset.z_positions_mm, [-1.0, 1.0])
+            self.assertEqual(len(dataset), 2)
+            self.assertEqual(len({s["pattern_id"] for s in dataset.samples}), 1)
+
+    def test_sparse_transfer_is_sliced_to_one_plane_per_sample(self):
+        transfer = torch.arange(12).reshape(4, 3)
+        h_asm = {
+            "type": "sparse",
+            "H_asm_sparse": transfer,
+            "ring_mask": torch.ones(2, 2, dtype=torch.bool),
+            "z_query": torch.tensor([0.005, 0.006, 0.007]),
+        }
+        planes = split_axicon_transfer_by_z(h_asm, [-1.0, 0.0, 1.0])
+        physics = {"h_asm_by_z_mm": planes}
+
+        selected = transfer_for_z_offset(physics, torch.tensor(1.0))
+
+        self.assertEqual(selected["H_asm_sparse"].shape, (4, 1))
+        torch.testing.assert_close(selected["H_asm_sparse"], transfer[:, 2:3])
+        torch.testing.assert_close(selected["z_query"], torch.tensor([0.007]))
 
 
 if __name__ == "__main__":
