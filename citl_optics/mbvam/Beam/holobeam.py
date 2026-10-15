@@ -1,0 +1,1624 @@
+from mbvam.Beam.beam import Beam
+from mbvam.Beam.holobeamconfig import HoloBeamConfig, MaterialLayer
+from mbvam.Geometry.coordinate import CoordinateArray
+import torch
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+from typing import Union
+from tqdm import tqdm
+from .zernike import combine_zernike_basis, compute_zernike_basis 
+import time
+import math
+from .slm_tilt import incidence_options, reproject_slm_field, apply_relay_spatial_filter, tilt_execution_options
+
+class HoloBeam(Beam):
+    '''
+    This subclass of Beam implements the coherent propagation of the holographic beam.
+    It has methods to construct propagation kernels, store them as attributes, and propagate the beam with angular spectrum method.
+    #TODO: Use alpha (absorption of the resin) to convert to volumetric dose
+    '''
+    def __init__(self, beam_config):
+        if not isinstance(beam_config, HoloBeamConfig):
+            raise Exception("beam_config is not an instance of HoloBeamConfig")
+        
+        super().__init__(beam_config)
+        self.phase_mask_init = None # Initial guess of the phase mask
+        self.phase_mask_iter = None # This is the phase mask for the iterative optimization. This is where the grad will be stored.
+        self.beam_mean_amplitude_init = None #Initial guess of the mean amplitude of the beam.
+        self.beam_mean_amplitude_iter = None #0D tensor describing the mean amplitude of the beam. This will be updated during optimization.
+        self.slm_amplitude_profile = None #2D tensor describing the profile of the beam at the SLM plane. Normalized to 1. Could be Gaussian or flat top.
+        self.H = None # The propagation kernel
+
+        ### New addition for CITL proxy model ###
+        self.zernike_coeffs = None
+        self.zernike_basis = None
+        self.source_modulation_map = None
+        self.camera_scale_factor = None
+
+    def _resolve_axicon_radial_frequency(self, axicon_angle=None, n_medium=1.0,
+                                         axicon_angle_in_medium=False,
+                                         axicon_transverse_frequency=None):
+        """
+        Return the axicon radial spatial frequency in cycles/m.
+
+        By default axicon_angle is interpreted as the free-space/equivalent
+        angle used by a phase grating: f_r = sin(theta_air) / lambda0. If the
+        supplied angle is already the physical cone angle inside the medium,
+        set axicon_angle_in_medium=True so f_r = n sin(theta_medium) / lambda0.
+        Passing axicon_transverse_frequency is the least ambiguous option for
+        grating-pitch-defined axicons.
+        """
+        device = self.beam_config.device
+        fdtype = self.beam_config.fdtype
+
+        if axicon_transverse_frequency is not None:
+            return torch.as_tensor(axicon_transverse_frequency, device=device, dtype=fdtype)
+
+        if axicon_angle is None:
+            raise ValueError('Either axicon_angle or axicon_transverse_frequency must be provided.')
+
+        angle = torch.as_tensor(axicon_angle, device=device, dtype=fdtype)
+        n = torch.as_tensor(n_medium, device=device, dtype=fdtype)
+        if torch.any(n <= 0):
+            raise ValueError('n_medium must be positive.')
+
+        if axicon_angle_in_medium:
+            return n * torch.sin(angle) / self.beam_config.lambda_
+        return torch.sin(angle) / self.beam_config.lambda_
+
+    @staticmethod
+    def _normalize_axicon_profile(axicon_profile):
+        profile = str(axicon_profile).strip().lower()
+        aliases = {
+            'continuous': 'continuous',
+            'kinoform': 'continuous',
+            'blazed': 'continuous',
+            'binary': 'binary',
+            'binary_phase': 'binary',
+        }
+        try:
+            return aliases[profile]
+        except KeyError as exc:
+            raise ValueError(
+                "axicon_profile must be 'continuous' (aliases: 'kinoform', "
+                "'blazed') or 'binary' (alias: 'binary_phase')."
+            ) from exc
+
+    @staticmethod
+    def _validate_axicon_lateral_shift(axicon_lateral_shift_x,
+                                       axicon_lateral_shift_y):
+        """Return finite physical axicon-center shifts in metres."""
+        shift_x = float(axicon_lateral_shift_x)
+        shift_y = float(axicon_lateral_shift_y)
+        if not math.isfinite(shift_x) or not math.isfinite(shift_y):
+            raise ValueError('Axicon lateral shifts must be finite.')
+        return shift_x, shift_y
+
+    @staticmethod
+    def _normalize_spatial_filter_mode(spatial_filter_mode):
+        """Return the canonical Fourier-plane spatial-filter mode."""
+        mode = (
+            'center_block'
+            if spatial_filter_mode is None
+            else str(spatial_filter_mode).strip().lower()
+        )
+        aliases = {
+            'center_block': 'center_block',
+            'central_block': 'center_block',
+            'zero_order_block': 'center_block',
+            'lee_left_first_order': 'lee_left_first_order',
+            'left_first_order': 'lee_left_first_order',
+            'lee': 'lee_left_first_order',
+        }
+        try:
+            return aliases[mode]
+        except KeyError as exc:
+            raise ValueError(
+                "spatial_filter_mode must be 'center_block' or "
+                "'lee_left_first_order'."
+            ) from exc
+
+    @classmethod
+    def _build_fourier_plane_spatial_filter(
+            cls, FX, FY, wavelength_m, spatial_filter_mode='center_block',
+            focal_length_m=0.250, center_block_size_m=550e-6,
+            lee_aperture_diameter_m=2e-3,
+            lee_first_order_offset_m=None,
+            lee_carrier_period_pixels=None,
+            physical_slm_pixel_pitch_m=8e-6):
+        """Build a spatial-filter amplitude mask on an fftshifted frequency grid.
+
+        ``center_block`` preserves the existing hardware model: a centred
+        550 um square is blocked and every other Fourier-plane position passes.
+
+        ``lee_left_first_order`` models an opaque Fourier-plane mask with one
+        circular opening. The 2 mm diameter opening is centred on the left
+        first order in an ``imshow`` view of the fftshifted spectrum, i.e. at
+        negative FY (tensor axis 1). Its offset can be supplied directly in
+        metres at the Fourier plane or derived from the Lee carrier period in
+        native physical SLM pixels.
+        """
+        mode = cls._normalize_spatial_filter_mode(spatial_filter_mode)
+        wavelength_m = float(wavelength_m)
+        focal_length_m = float(focal_length_m)
+        if not math.isfinite(wavelength_m) or wavelength_m <= 0:
+            raise ValueError('wavelength_m must be finite and positive.')
+        if not math.isfinite(focal_length_m) or focal_length_m <= 0:
+            raise ValueError('focal_length_m must be finite and positive.')
+
+        frequency_to_fourier_plane_m = wavelength_m * focal_length_m
+        if mode == 'center_block':
+            center_block_size_m = float(center_block_size_m)
+            if not math.isfinite(center_block_size_m) or center_block_size_m <= 0:
+                raise ValueError('center_block_size_m must be finite and positive.')
+            half_width_frequency = (
+                center_block_size_m / 2.0 / frequency_to_fourier_plane_m
+            )
+            return ~(
+                (torch.abs(FX) <= half_width_frequency)
+                & (torch.abs(FY) <= half_width_frequency)
+            )
+
+        lee_aperture_diameter_m = float(lee_aperture_diameter_m)
+        if (
+            not math.isfinite(lee_aperture_diameter_m)
+            or lee_aperture_diameter_m <= 0
+        ):
+            raise ValueError('lee_aperture_diameter_m must be finite and positive.')
+        if (
+            lee_first_order_offset_m is not None
+            and lee_carrier_period_pixels is not None
+        ):
+            raise ValueError(
+                'Specify either lee_first_order_offset_m or '
+                'lee_carrier_period_pixels, not both.'
+            )
+
+        if lee_first_order_offset_m is None:
+            if lee_carrier_period_pixels is None:
+                raise ValueError(
+                    "The 'lee_left_first_order' mode requires either "
+                    'lee_first_order_offset_m (measured Fourier-plane offset) '
+                    'or lee_carrier_period_pixels.'
+                )
+            lee_carrier_period_pixels = float(lee_carrier_period_pixels)
+            physical_slm_pixel_pitch_m = float(physical_slm_pixel_pitch_m)
+            if (
+                not math.isfinite(lee_carrier_period_pixels)
+                or lee_carrier_period_pixels <= 0
+            ):
+                raise ValueError('lee_carrier_period_pixels must be finite and positive.')
+            if (
+                not math.isfinite(physical_slm_pixel_pitch_m)
+                or physical_slm_pixel_pitch_m <= 0
+            ):
+                raise ValueError('physical_slm_pixel_pitch_m must be finite and positive.')
+            carrier_period_m = (
+                lee_carrier_period_pixels * physical_slm_pixel_pitch_m
+            )
+            lee_first_order_offset_m = (
+                frequency_to_fourier_plane_m / carrier_period_m
+            )
+        else:
+            lee_first_order_offset_m = float(lee_first_order_offset_m)
+            if (
+                not math.isfinite(lee_first_order_offset_m)
+                or lee_first_order_offset_m <= 0
+            ):
+                raise ValueError('lee_first_order_offset_m must be finite and positive.')
+
+        aperture_radius_frequency = (
+            lee_aperture_diameter_m / 2.0 / frequency_to_fourier_plane_m
+        )
+        left_order_center_fy = (
+            -lee_first_order_offset_m / frequency_to_fourier_plane_m
+        )
+        return (
+            torch.square(FX) + torch.square(FY - left_order_center_fy)
+            <= aperture_radius_frequency ** 2
+        )
+
+    @staticmethod
+    def _translate_complex_field_fourier(field, offset_axis0,
+                                         offset_axis1, pixel_size):
+        """Return ``field(x + offset)`` via a differentiable Fourier shift."""
+        if field.ndim != 2:
+            raise ValueError(f'Expected a 2D complex field; got {field.shape}')
+        if not torch.is_complex(field):
+            raise ValueError('Fourier field translation expects a complex tensor.')
+        if float(pixel_size) <= 0:
+            raise ValueError('Field pixel size must be positive.')
+
+        real_dtype = field.real.dtype
+        device = field.device
+        offset_axis0 = torch.as_tensor(
+            offset_axis0, device=device, dtype=real_dtype
+        )
+        offset_axis1 = torch.as_tensor(
+            offset_axis1, device=device, dtype=real_dtype
+        )
+        if offset_axis0.numel() != 1 or offset_axis1.numel() != 1:
+            raise ValueError('Field offsets must be scalar values.')
+        if not bool(torch.isfinite(offset_axis0.detach()).item()) or not bool(
+            torch.isfinite(offset_axis1.detach()).item()
+        ):
+            raise ValueError('Field offsets must be finite.')
+
+        frequency_axis0 = torch.fft.fftfreq(
+            field.shape[0], d=float(pixel_size), device=device, dtype=real_dtype
+        )[:, None]
+        frequency_axis1 = torch.fft.fftfreq(
+            field.shape[1], d=float(pixel_size), device=device, dtype=real_dtype
+        )[None, :]
+        phase = 2.0 * math.pi * (
+            frequency_axis0 * offset_axis0
+            + frequency_axis1 * offset_axis1
+        )
+        translated_spectrum = torch.fft.fft2(field, norm='ortho') * torch.exp(
+            1j * phase
+        )
+        return torch.fft.ifft2(translated_spectrum, norm='ortho')
+
+    @classmethod
+    def _axicon_phase_from_radius(cls, radius, radial_frequency,
+                                  axicon_profile='continuous',
+                                  axicon_phase_depth=math.pi,
+                                  axicon_duty_cycle=0.5,
+                                  axicon_radial_offset=0.0):
+        """Return the physical axicon phase delay on a sampled radial grid.
+
+        ``continuous`` reproduces the original blazed/kinoform transmission
+        exp(-i 2 pi f_r r). ``binary`` uses two phase levels, 0 and
+        -axicon_phase_depth, with a configurable high-zone fraction and radial
+        offset (both expressed within one full grating period).
+        """
+        profile = cls._normalize_axicon_profile(axicon_profile)
+        if not math.isfinite(float(axicon_phase_depth)):
+            raise ValueError('axicon_phase_depth must be finite.')
+        if not 0.0 < float(axicon_duty_cycle) < 1.0:
+            raise ValueError('axicon_duty_cycle must be strictly between 0 and 1.')
+        if not math.isfinite(float(axicon_radial_offset)):
+            raise ValueError('axicon_radial_offset must be finite.')
+
+        radial_frequency = torch.as_tensor(
+            radial_frequency, device=radius.device, dtype=radius.dtype
+        )
+        if torch.any(radial_frequency <= 0):
+            raise ValueError('Axicon radial frequency must be positive.')
+
+        if profile == 'continuous':
+            return -(2 * torch.pi * radial_frequency) * radius
+
+        cycle_position = torch.remainder(
+            radial_frequency * radius + float(axicon_radial_offset), 1.0
+        )
+        low_phase = torch.zeros_like(radius)
+        high_phase = torch.full_like(radius, -float(axicon_phase_depth))
+        return torch.where(
+            cycle_position < float(axicon_duty_cycle), high_phase, low_phase
+        )
+
+    @classmethod
+    def _resolve_axicon_diffraction_orders(cls, axicon_profile,
+                                            radial_frequency,
+                                            max_radial_frequency,
+                                            axicon_phase_depth=math.pi,
+                                            axicon_duty_cycle=0.5,
+                                            axicon_diffraction_orders=None,
+                                            coefficient_threshold=1e-3):
+        """Choose radial diffraction-order bands retained by sparse ASM."""
+        profile = cls._normalize_axicon_profile(axicon_profile)
+        radial_frequency = float(radial_frequency)
+        max_radial_frequency = float(max_radial_frequency)
+        if not math.isfinite(radial_frequency) or radial_frequency <= 0:
+            raise ValueError('radial_frequency must be positive and finite.')
+        if not math.isfinite(max_radial_frequency) or max_radial_frequency < 0:
+            raise ValueError('max_radial_frequency must be non-negative and finite.')
+        if not math.isfinite(float(axicon_phase_depth)):
+            raise ValueError('axicon_phase_depth must be finite.')
+        if not 0.0 < float(axicon_duty_cycle) < 1.0:
+            raise ValueError('axicon_duty_cycle must be strictly between 0 and 1.')
+        if axicon_diffraction_orders is not None:
+            raw_orders = tuple(axicon_diffraction_orders)
+            if any(float(order) != int(order) for order in raw_orders):
+                raise ValueError('axicon_diffraction_orders must contain integers.')
+            orders = tuple(sorted(set(int(order) for order in raw_orders)))
+            if not orders or any(order < 0 for order in orders):
+                raise ValueError(
+                    'axicon_diffraction_orders must contain non-negative integers.'
+                )
+            return orders
+
+        if profile == 'continuous':
+            return (1,)
+
+        # A two-level phase grating has a DC term and integer harmonics. For an
+        # ideal 50%-duty pi grating, the DC/even coefficients vanish and only
+        # odd orders remain. Order 0 is retained anyway so finite-aperture,
+        # sampling, and fabrication-error leakage is not silently discarded.
+        max_order = int(max_radial_frequency // radial_frequency)
+        orders = [0]
+        phase_factor = abs(math.sin(0.5 * float(axicon_phase_depth)))
+        duty_cycle = float(axicon_duty_cycle)
+        for order in range(1, max_order + 1):
+            coefficient = (
+                2.0 * phase_factor * abs(math.sin(math.pi * order * duty_cycle))
+                / (math.pi * order)
+            )
+            if coefficient >= float(coefficient_threshold):
+                orders.append(order)
+        return tuple(orders)
+
+    def _get_zernike_phase(self, shape):
+        """
+        return zernike phase from zernike coefficients
+        
+        """
+        if self.zernike_coeffs is None:
+            return 0
+        if self.zernike_basis is None or self.zernike_basis.shape[-2:] != shape[-2:]:
+            self.zernike_basis = compute_zernike_basis(num_polynomials=len(self.zernike_coeffs),
+                                                       field_res=shape[-2:],
+                                                       dtype=self.beam_config.fdtype).to(self.beam_config.device)
+
+        coeffs = self.zernike_coeffs.view(-1, 1, 1)
+        zernike_phase = (coeffs*self.zernike_basis).sum(dim=0)
+
+        return zernike_phase
+
+    @torch.no_grad()
+    def buildASPropagationTF(self, z_prop:Union[CoordinateArray, torch.Tensor]=None, material_layer:MaterialLayer=None, delta:bool=False):
+        '''
+        This function build the full/incremental transfer function for angular spectrum propagation in a homogeneous medium.
+        The transfer function implemented here is written as equation 6.20 in Fourier Optics Notes.
+
+        CAUTION: This function does not take refractions at material interface into account. Use buildEffectiveTF() for that.
+        This function is used to build full transfer function for free space propagation, and incremental transfer function for propagation in a homogeneous medium.
+        This function cannot be used to build full transfer function in a layered medium.
+        When computing the full transfer function in free space, the'z_prop' is relative to free space focus.
+        For delta transfer function, 'z_prop' is distance is only the net distance from the previous propagation.
+        To compute delta transfer function, remember to enter 'z_prop' to be the delta_z values, and set 'delta' flag to be true.
+        
+        Parameters
+        ----------
+        z_prop: float tensor, z propagation distance. Positive for forward and negative for backward.
+        
+        material_layer: MaterialLayer object, the material layer the beam is propagating in.
+
+        delta: bool, whether to compute the delta transfer function. Default is False, which computes the full transfer function.
+
+        '''
+        # Defaults
+        if z_prop is None:
+            z_prop = self.local_coord_vec[2] # this returns a local z coordinate vector in torch.Tensor, already in the correct device and dtype
+        else:
+            z_prop = torch.atleast_1d(torch.as_tensor(z_prop, device=self.beam_config.device, dtype=self.beam_config.fdtype))
+            
+        if material_layer is None: #by default use the first layer of the material stack
+            n = self.beam_config.material_stack[0].n
+            alpha = self.beam_config.material_stack[0].alpha
+        else:
+            n = material_layer.n
+            alpha = material_layer.alpha
+            
+        if delta: # if delta transfer function is to be computed
+            const_prefactor = 1 #set const_prefactor to 1 because the prefactor is already included in the full transfer function it builds on.
+        else: 
+            if override_for_debug := True:
+                const_prefactor = 1 #set const_prefactor to 1 because the prefactor is already included in the full transfer function it builds on.
+            else:
+                k0 = 2*torch.pi/self.beam_config.lambda_ #wavevector in the first medium
+                k0 = torch.tensor(k0, device=self.beam_config.device, dtype=self.beam_config.fdtype) 
+                const_prefactor = torch.exp(1j*k0*2*self.beam_config.focal_SLM)/(1j*self.beam_config.lambda_*self.beam_config.focal_SLM)
+
+
+        Nx = self.beam_config.Nx
+        Ny = self.beam_config.Ny
+        X_slm, Y_slm = torch.meshgrid(
+            torch.linspace(-(Nx-1)/2, (Nx-1)/2, Nx, device=self.beam_config.device, dtype=self.beam_config.fdtype)*self.beam_config.psSLM,
+            torch.linspace(-(Ny-1)/2, (Ny-1)/2, Ny, device=self.beam_config.device, dtype=self.beam_config.fdtype)*self.beam_config.psSLM,
+            indexing='ij')
+
+        X_slm = X_slm.to(self.beam_config.fdtype)
+        Y_slm = Y_slm.to(self.beam_config.fdtype)
+
+        gamma = torch.sqrt(1 - (X_slm/(n*self.beam_config.focal_SLM))**2 - (Y_slm/(n*self.beam_config.focal_SLM))**2) # directional cosine relative to z (optical axis), sqrt of a real number
+        gamma = torch.real(gamma) # truncate all spatial frequencies that are mapped to evanescent waves. sqrt(-|real|)= purely complex. 
+
+        z_prop = z_prop[None,None,:] # add two dimensions to z_prop to make it 1 x 1 x len(z_prop)
+        gamma = gamma[:,:,None] # add one dimension to gamma to make it Nx x Ny x 1
+
+        km = 2*torch.pi*n/self.beam_config.lambda_ #wavevector in the current medium
+        exponent = 1j*km*z_prop*gamma - (alpha/2.0)*z_prop/gamma #first term is phase curvature, second term is attenuation.
+        #Bug fix: Note that alpha is attenuation coef of intensity, so the above line now use alpha/2 for decay of complex amplitude.
+        
+        H = const_prefactor*torch.exp(exponent)
+
+        if torch.any(torch.isinf(exponent) | torch.isnan(exponent)): #This check is redundant if input is valid.
+            self.logger.warning('Propagation transfer function has NaN or Inf values. Setting the TF elements to be zero. Check input.')
+            H[torch.isinf(exponent) | torch.isnan(exponent)] = 0 #remove the NaN and Inf resulted from 0/0 and 1/0 operations because of gamma=0
+
+        H = H.to(self.beam_config.cdtype)
+        H.requires_grad_(False) #set requires_grad to be false so that gradient is not computed w.r.t. H
+        return H
+
+    @torch.no_grad()
+    def buildEffectiveTF(self, z_query:Union[CoordinateArray, torch.Tensor]=None) -> torch.Tensor:
+        '''
+        This function build the effective transfer function for angular spectrum propagation in a layered medium.
+        This function takes the focal plane shift due to refraction into account.
+
+        (1) It uses an absolute coordinate system that is consistent to how the interface_z in MaterialLayer is defined.
+        (2) It build the transfer function incrementally for each material layer, starting from the free space focus.
+
+        Parameters
+        ----------
+        z_query: float tensor, z position in the absolute coordinate system. Consistent with how the interface_z in MaterialLayer is defined.
+        If None, the transfer function is built using the Zv attribute of the beam config object.
+
+        '''
+        # Defaults
+        if z_query is None:
+            z_query = self.local_coord_vec[2] # this returns a local z coordinate vector in torch.Tensor, already in the correct device and dtype
+        else:
+            z_query = torch.atleast_1d(torch.as_tensor(z_query, device=self.beam_config.device, dtype=self.beam_config.fdtype))
+            
+        # Check if z_query is strictly increasing
+        if torch.any(z_query[1:] <= z_query[:-1]): # if any element is smaller than or equal to the previous element
+            raise ValueError('z_query must be strictly increasing.')
+        
+        material_stack = self.beam_config.material_stack #get the material stack from beam config
+        
+        # Bin z_query into material layers
+        edges = torch.as_tensor([layer.interface_z for layer in material_stack], device=self.beam_config.device) #Edge of bins is the z position of material interfaces
+        material_indices = torch.bucketize(z_query, edges, right=False) - 1 # get material indices which start from 0. "right=False" means the bins are defined with right edge closed (a,b].
+        #It put values to the left bin if possible and minimize redundant computation.
+
+        if torch.all(material_indices == 0): # beam doesn't cross any material interface
+            H_eff = self.buildASPropagationTF(z_query-float(self.beam_config.free_space_focus_z), material_stack[0], False) #relative to free space focus. Subtract python float instead of numpy array.
+        else:
+            # Double pass algorithm. First evaluate the kernel at the interface. Then evaluate the effective kernel after respective interfaces.
+
+            # First get transfer function to interfaces
+            # num_crossed_interface = material_indices.max() #This is how many interfaces the beam crosses
+            unique_material_indices = material_indices.unique()
+            #unique_material_indices.numel() is the number of interfaces subsequent transfer functions need to base upon
+            H_interface = torch.zeros(self.beam_config.Nx, self.beam_config.Ny, unique_material_indices.numel(), dtype=self.beam_config.cdtype, device=self.beam_config.device)
+
+            H_iter = self.buildASPropagationTF(z_prop=0, material_layer=material_stack[0], delta=False) # initialize
+            H_iter_progress_inter = 0 #This tracks the progress of H_iter. The left face of the material layer i is called interface i.
+            H_iter_progress_z = self.beam_config.free_space_focus_z #This tracks the z position of H_iter. 
+
+            for array_ind, interface in enumerate(unique_material_indices): 
+                #Build up the transfer function progressively for a particular interface. 
+                while H_iter_progress_inter < interface: #Iterate until the desired interface is reached
+                    dz = material_stack[H_iter_progress_inter+1].interface_z - H_iter_progress_z #distance to the next interface
+                    H_iter *= self.buildASPropagationTF(dz, material_stack[H_iter_progress_inter], True) #propagate in current medium to reach next interface
+                    H_iter_progress_inter += 1
+                    H_iter_progress_z += dz
+
+                H_interface[...,array_ind] = H_iter.squeeze() #squeeze to remove the singleton dimension
+        
+            # Build kernel at z_query 
+            dist = z_query - edges[material_indices]  # distance from the last interface. Note z_query residing in the 0th medium would have infinite distance.
+            H_eff = torch.zeros(self.beam_config.Nx, self.beam_config.Ny, z_query.numel(), dtype=self.beam_config.cdtype, device=self.beam_config.device, requires_grad=False)
+
+            for array_ind, mat in enumerate(unique_material_indices): #iterate for each material
+                z_query_idx = (material_indices == mat)  #select the indices of z_query that are in the current material
+                if mat == 0: # Exception for the first material. TF of these planes are not build upon any interface.
+                    H_eff[...,z_query_idx] = self.buildASPropagationTF(z_query[z_query_idx]-float(self.beam_config.free_space_focus_z), material_stack[0], False) #Subtract python float instead of numpy array.
+                else: # For other materials, build upon the interface
+                    H_eff[...,z_query_idx] = H_interface[...,array_ind][:,:,None] * self.buildASPropagationTF(dist[z_query_idx], material_stack[mat], True)
+                    # [:,:,None] is to add a dimension to H_interface so that it can broadcast to the same shape as H_eff[...,z_query_idx]
+            H_eff.requires_grad_(False) #set requires_grad to be false so that gradient is not computed w.r.t. H
+
+        return H_eff
+        
+    def build_true_ASM_TF(self, z_query: torch.Tensor, upsample_factor=8, n_medium=1.0):
+        '''
+        Real spatial frequency based ASM transfer function.
+
+        z_query is the physical propagation distance in the selected
+        homogeneous medium, not an optical path length or free-space-equivalent
+        distance. Use n_medium=1.0 for air/free space and n_medium=1.48 for the
+        current resin setup.
+        '''
+        Nx, Ny = self.beam_config.Nx, self.beam_config.Ny
+        ps = self.beam_config.psSLM
+        lambda_ = self.beam_config.lambda_
+        z_query = torch.atleast_1d(torch.as_tensor(z_query, device=self.beam_config.device, dtype=self.beam_config.fdtype))
+        n_medium = torch.as_tensor(n_medium, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+        if torch.any(n_medium <= 0):
+            raise ValueError('n_medium must be positive.')
+        Nx_orig, Ny_orig = self.beam_config.Nx, self.beam_config.Ny
+        ps_orig = self.beam_config.psSLM
+        
+        Nx_up = Nx_orig * int(upsample_factor)
+        Ny_up = Ny_orig * int(upsample_factor)
+        ps_up = ps_orig / upsample_factor
+
+        fx = torch.fft.fftfreq(Nx_up, d=ps_up, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+        fy = torch.fft.fftfreq(Ny_up, d=ps_up, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+        FX, FY = torch.meshgrid(fx, fy, indexing='ij')
+        
+        gamma_sq = 1 - (lambda_ * FX / n_medium)**2 - (lambda_ * FY / n_medium)**2
+        gamma = torch.sqrt(torch.clamp(gamma_sq, min=0)) # Clamp to prevent Evanescent wave
+        
+        km = 2 * torch.pi * n_medium / lambda_
+        z_query = z_query[None, None, :]
+        gamma = gamma[:, :, None]
+        
+        # ASM Transfer Function: H(fx, fy, z) = exp(i * k_z * z)
+        exponent = 1j * km * z_query * gamma
+        H_asm = torch.exp(exponent)
+        
+        # Masking evanescent wave 
+        #H_asm[gamma_sq[:, :, None] < 0] = 0
+        valid_mask = (gamma_sq >= 0).unsqueeze(-1)  # [Nx, Ny, 1] 
+        H_asm = H_asm * valid_mask
+        
+        return H_asm.to(self.beam_config.cdtype)
+
+    def build_axicon_ASM_TF(self, z_query: torch.Tensor, upsample_factor=8, n_medium=1.0,
+                            axicon_angle=None, margin_factor=5,
+                            axicon_angle_in_medium=False,
+                            axicon_transverse_frequency=None,
+                            axicon_profile='continuous',
+                            axicon_phase_depth=math.pi,
+                            axicon_duty_cycle=0.5,
+                            axicon_diffraction_orders=None):
+        '''
+        Real spatial frequency based ASM transfer function with Sparse Ring Masking.
+
+        z_query is the physical propagation distance in the selected
+        homogeneous medium. The wavelength is the vacuum wavelength lambda_;
+        n_medium changes kz = sqrt((n*k0)^2 - kx^2 - ky^2), so z_min/z_max
+        should be entered as actual distances in resin/air.
+        '''
+        Nx_orig, Ny_orig = self.beam_config.Nx, self.beam_config.Ny
+        ps_orig = self.beam_config.psSLM
+        lambda_ = self.beam_config.lambda_
+        z_query = torch.atleast_1d(torch.as_tensor(z_query, device=self.beam_config.device, dtype=self.beam_config.fdtype))
+        n_medium = torch.as_tensor(n_medium, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+        if torch.any(n_medium <= 0):
+            raise ValueError('n_medium must be positive.')
+        n_medium_value = float(n_medium.detach().cpu().item())
+        
+        Nx_up = Nx_orig * int(upsample_factor)
+        Ny_up = Ny_orig * int(upsample_factor)
+        ps_up = ps_orig / upsample_factor
+
+        fx = torch.fft.fftfreq(Nx_up, d=ps_up, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+        fy = torch.fft.fftfreq(Ny_up, d=ps_up, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+        
+        FX2 = fx.view(-1, 1) ** 2
+        FY2 = fy.view(1, -1) ** 2
+        KR = torch.sqrt(FX2 + FY2)
+        
+        # None explicitly disables the numerical ring truncation. It does not
+        # change the continuous axicon phase applied by the forward operator.
+        if margin_factor is not None and (axicon_angle is not None or axicon_transverse_frequency is not None):
+            k_ring_radius = self._resolve_axicon_radial_frequency(
+                axicon_angle=axicon_angle,
+                n_medium=n_medium,
+                axicon_angle_in_medium=axicon_angle_in_medium,
+                axicon_transverse_frequency=axicon_transverse_frequency,
+            )
+            k_ring_radius_value = float(k_ring_radius.detach().cpu().item())
+            max_grid_frequency = math.sqrt(2.0) / (2.0 * ps_up)
+            max_propagating_frequency = n_medium_value / lambda_
+            max_radial_frequency = min(max_grid_frequency, max_propagating_frequency)
+            diffraction_orders = self._resolve_axicon_diffraction_orders(
+                axicon_profile=axicon_profile,
+                radial_frequency=k_ring_radius_value,
+                max_radial_frequency=max_radial_frequency,
+                axicon_phase_depth=axicon_phase_depth,
+                axicon_duty_cycle=axicon_duty_cycle,
+                axicon_diffraction_orders=axicon_diffraction_orders,
+            )
+            df = 1.0 / (Nx_orig * ps_orig)
+            band_half_width = df * margin_factor
+            ring_mask = torch.zeros_like(KR, dtype=torch.bool)
+            for order in diffraction_orders:
+                order_radius = float(order) * k_ring_radius
+                if order == 0:
+                    order_mask = KR <= band_half_width
+                else:
+                    order_mask = torch.abs(KR - order_radius) <= band_half_width
+                ring_mask |= order_mask
+                del order_mask
+            
+            # visualize ring mask
+            import matplotlib.pyplot as plt
+            ring_mask_shift = torch.fft.fftshift(ring_mask)
+            plt.figure(figsize=(6,6))
+            plt.imshow(ring_mask_shift.cpu().numpy(), cmap='gray', origin='lower')
+            plt.title(
+                f"Axicon Sparse Mask ({self._normalize_axicon_profile(axicon_profile)}, "
+                f"orders={diffraction_orders})"
+            )
+            plt.xlabel('fy index')
+            plt.ylabel('fx index')
+            plt.colorbar(label='Mask (True=1, False=0)')
+            plt.show()
+            
+            KR_sparse = KR[ring_mask] # Shape: [N_sparse]
+            
+            gamma_sq_sparse = 1 - (lambda_ * KR_sparse / n_medium)**2
+            gamma_sparse = torch.sqrt(torch.clamp(gamma_sq_sparse, min=0))
+            
+            km = 2 * torch.pi * n_medium / lambda_
+            
+            # z_query: [Nz], gamma_sparse: [N_sparse] => result: [N_sparse, Nz]
+            H_asm_sparse = torch.exp(1j * km * z_query.view(1, -1) * gamma_sparse.view(-1, 1))
+            
+            valid_mask_sparse = (gamma_sq_sparse >= 0).unsqueeze(-1)
+            H_asm_sparse = H_asm_sparse * valid_mask_sparse
+            
+            retention = ring_mask.sum().item() / (Nx_up * Ny_up) * 100
+            print(
+                f"[Method B] K-space Sparse Masking Active! "
+                f"profile={self._normalize_axicon_profile(axicon_profile)}, "
+                f"orders={diffraction_orders}, using {retention:.3f}% of K-space. "
+                f"n_medium={n_medium_value:.4g}"
+            )
+            
+            # Delete redundant files
+            del FX2, FY2, KR, KR_sparse, gamma_sq_sparse, gamma_sparse
+            
+            return {
+                'type': 'sparse',
+                'ring_mask': ring_mask,
+                'H_asm_sparse': H_asm_sparse.to(self.beam_config.cdtype),
+                'Nx_up': Nx_up, 'Ny_up': Ny_up,
+                'n_medium': n_medium_value,
+                'z_query': z_query.detach(),
+                'axicon_transverse_frequency': float(k_ring_radius.detach().cpu().item()),
+                'axicon_angle_in_medium': axicon_angle_in_medium,
+                'axicon_profile': self._normalize_axicon_profile(axicon_profile),
+                'axicon_diffraction_orders': diffraction_orders,
+                'axicon_phase_depth': float(axicon_phase_depth),
+                'axicon_duty_cycle': float(axicon_duty_cycle),
+            }
+        else:
+            gamma_sq = 1 - (lambda_**2 * KR**2 / n_medium**2)
+            gamma = torch.sqrt(torch.clamp(gamma_sq, min=0))
+            km = 2 * torch.pi * n_medium / lambda_
+            H_asm = torch.exp(1j * km * z_query.view(1, 1, -1) * gamma.unsqueeze(-1))
+            valid_mask = (gamma_sq >= 0).unsqueeze(-1)
+            H_asm = H_asm * valid_mask
+            return H_asm.to(self.beam_config.cdtype)
+
+    # def storeTransferFunction(self, H:torch.Tensor): #This function stores the transfer function in the beam object.
+    #     self.H = H
+
+    # def clearTransferFunction(self): #This function clears the transfer function in the beam object.
+    #     self.H = None
+
+    def propagateToVolume(self, phase_mask:torch.Tensor=None, beam_mean_amplitude:torch.Tensor=None, slm_amplitude_profile:torch.Tensor=None, H:torch.Tensor=None, convert_to_intensity=False):
+        '''
+        Propagate using the stored transfer function
+
+        FFT convention: 
+        As derived in AS spectrum notes, forward FFT is used for forward propagation (taking phase mask to volume E-field). 
+        The inverse FFT is used for backward propagation (taking volume E-field back to phase mask).
+        With torch.fft.fft2(norm='ortho'), the FFT operation is self-adjoint (ifft2 is adjoint of fft2).
+        
+        fftshift convention:
+        All quantities are saved in physical format (center-oriented) where the middle of the array represent the lowest frequencies.
+        fftshift is applied after fft2 during forward propagation.
+        Then ifftshift is applied before ifft2 during backward propagation.
+        '''
+
+        # Defaults
+        if phase_mask is None:
+            phase_mask = self.phase_mask_iter
+
+        if beam_mean_amplitude is None:
+            beam_mean_amplitude = self.beam_mean_amplitude_iter
+
+        if slm_amplitude_profile is None:
+            slm_amplitude_profile = self.slm_amplitude_profile
+
+        if H is None:
+            H = self.H
+
+        #Check inputs
+        if phase_mask is None:
+            raise ValueError('Phase mask is not provided nor stored.')
+
+        if phase_mask.dim() != 2:
+            raise ValueError('phase_mask must be a 2D tensor. Current dimension is ' +str(phase_mask.dim()))
+        
+        if (beam_mean_amplitude is None):
+            raise ValueError('beam_mean_amplitude is not provided nor stored.')
+        
+        if (slm_amplitude_profile is None):
+            raise ValueError('slm_amplitude_profile is not provided nor stored.')
+
+        if slm_amplitude_profile.dim() != 2:
+            raise ValueError('slm_amplitude_profile must be a 2D tensor.')
+
+        if H is None:
+            raise ValueError('Transfer function is not provided nor stored. Use buildTransferFunction() to build the transfer function first.')
+        
+        # Add aberrated phase map onto the phase mask
+        aberration_phase = self._get_zernike_phase(phase_mask.shape[-2:])
+        phase_mask = phase_mask + aberration_phase
+
+        #Computation
+        # slm_field = torch.sqrt(beam_total_energy[None,None]*slm_energy_profile)*torch.exp(1j*phase_mask) #float tensor becomes complex
+        slm_field = beam_mean_amplitude[None,None]*slm_amplitude_profile*torch.exp(1j*phase_mask) #float tensor becomes complex
+        vol_field = torch.fft.fft2(slm_field[:,:,None]*H, dim=(0,1), norm="ortho")
+
+        if convert_to_intensity:
+            vol_field = torch.abs(vol_field)**2
+
+        return torch.fft.fftshift(vol_field, dim=(0,1))
+
+    @torch.no_grad()
+    def propagateToVolume_Axicon(self, axicon_angle: float,  upsample_factor=int,  phase_mask=None, beam_mean_amplitude=None, 
+                                 slm_amplitude_profile=None, H_asm=None, convert_to_intensity=False,
+                                 n_medium=1.0, axicon_angle_in_medium=False,
+                                 axicon_transverse_frequency=None,
+                                 axicon_profile='continuous',
+                                 axicon_phase_depth=math.pi,
+                                 axicon_duty_cycle=0.5,
+                                 axicon_radial_offset=0.0,
+                                 axicon_lateral_shift_x=0.0,
+                                 axicon_lateral_shift_y=0.0):
+        '''
+        Axicon lens forward propagation
+        '''
+        if phase_mask is None: phase_mask = self.phase_mask_iter
+        if beam_mean_amplitude is None: beam_mean_amplitude = self.beam_mean_amplitude_iter
+        if slm_amplitude_profile is None: slm_amplitude_profile = self.slm_amplitude_profile
+
+        # 1. SLM plane phase with Zernike aberration
+        aberration_phase = self._get_zernike_phase(phase_mask.shape[-2:])
+        total_phase = phase_mask + aberration_phase
+        slm_field = beam_mean_amplitude[None,None] * slm_amplitude_profile * torch.exp(1j * total_phase)
+
+        # 2. Axicon phase mask
+        Nx_orig, Ny_orig = self.beam_config.Nx, self.beam_config.Ny
+        ps_orig = self.beam_config.psSLM
+        if upsample_factor > 1:
+            # Separate real and imaginary for interpolation
+            real_part = slm_field.real.unsqueeze(0).unsqueeze(0)  # [1, 1, Nx, Ny]
+            imag_part = slm_field.imag.unsqueeze(0).unsqueeze(0)
+            
+            # mode='nearest' exactly mimics the physical square shape of SLM pixels
+            real_up = F.interpolate(real_part, scale_factor=upsample_factor, mode='nearest').squeeze()
+            imag_up = F.interpolate(imag_part, scale_factor=upsample_factor, mode='nearest').squeeze()
+            
+            slm_field_up = real_up + 1j * imag_up
+            Nx_up = Nx_orig * int(upsample_factor)
+            Ny_up = Ny_orig * int(upsample_factor)
+            ps_up = ps_orig / upsample_factor
+            print(f"Upsampled pixel size for axicon simulation is {ps_up*1e6}um")
+        else:
+            slm_field_up = slm_field
+            Nx_up, Ny_up = Nx_orig, Ny_orig
+            ps_up = ps_orig
+        #Nx, Ny = self.beam_config.Nx, self.beam_config.Ny
+        #ps = self.beam_config.psSLM
+        
+        t_loop_start = time.perf_counter()
+        x = torch.linspace(-(Nx_up-1)/2, (Nx_up-1)/2, Nx_up, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps_up
+        y = torch.linspace(-(Ny_up-1)/2, (Ny_up-1)/2, Ny_up, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps_up
+        X, Y = torch.meshgrid(x, y, indexing='ij')
+        shift_x, shift_y = self._validate_axicon_lateral_shift(
+            axicon_lateral_shift_x, axicon_lateral_shift_y
+        )
+        R = torch.sqrt((X - shift_x)**2 + (Y - shift_y)**2)
+        
+        radial_frequency = self._resolve_axicon_radial_frequency(
+            axicon_angle=axicon_angle,
+            n_medium=n_medium,
+            axicon_angle_in_medium=axicon_angle_in_medium,
+            axicon_transverse_frequency=axicon_transverse_frequency,
+        )
+
+        # Continuous kinoform or discrete binary axicon phase.
+        axicon_phase_mask = self._axicon_phase_from_radius(
+            R,
+            radial_frequency,
+            axicon_profile=axicon_profile,
+            axicon_phase_depth=axicon_phase_depth,
+            axicon_duty_cycle=axicon_duty_cycle,
+            axicon_radial_offset=axicon_radial_offset,
+        )
+        field_after_axicon = slm_field_up * torch.exp(1j * axicon_phase_mask)
+
+        # 3. Space to Space True ASM propagation 
+        E_fourier = torch.fft.fft2(field_after_axicon, dim=(0,1), norm="ortho")
+        vol_fourier = E_fourier[:,:,None] * H_asm
+        vol_field = torch.fft.ifft2(vol_fourier, dim=(0,1), norm="ortho")
+
+        if convert_to_intensity:
+            vol_field = torch.abs(vol_field)**2
+
+        print(f"Slice computed in {time.perf_counter() - t_loop_start:.2f}s")
+        return vol_field
+
+    def propagateToVolume_Axicon2(self, axicon_angle: float, upsample_factor=int, phase_mask=None, beam_mean_amplitude=None, 
+                                 slm_amplitude_profile=None, H_asm=None, convert_to_intensity=False, roi_size=1000,
+                                 apply_spatial_filter=False, n_medium=1.0,
+                                 spatial_filter_mode='center_block',
+                                 spatial_filter_focal_length_m=0.250,
+                                 center_block_size_m=550e-6,
+                                 lee_aperture_diameter_m=2e-3,
+                                 lee_first_order_offset_m=None,
+                                 lee_carrier_period_pixels=None,
+                                 axicon_angle_in_medium=False,
+                                 axicon_transverse_frequency=None,
+                                 axicon_profile='continuous',
+                                 axicon_phase_depth=math.pi,
+                                 axicon_duty_cycle=0.5,
+                                 axicon_radial_offset=0.0,
+                                 slm_input_subpixel_factor=1,
+                                 slm_field_sample_offset_x=0.0,
+                                 slm_field_sample_offset_y=0.0,
+                                 apply_slm_field_sample_offset=False,
+                                 axicon_lateral_shift_x=0.0,
+                                 axicon_lateral_shift_y=0.0,
+                                 slm_resample_mode='auto',
+                                 slm_incidence_angle_deg=None, slm_incidence_axis=None,
+                                 slm_tilt_model=None, slm_tilt_padding=None,
+                                 relay_magnification=None,
+                                 slm_tilt_backend=None, slm_tilt_stream_cols=None,
+                                 slm_complex_field=None):
+        '''
+        Axicon forward propagation with ROI-only, slice-by-slice ASM storage.
+
+        An H_asm descriptor with type='streamed' evaluates the same full-grid
+        map using CPU staging and a first-order adjoint. It bypasses the dense
+        FFT allocations and whole-engine checkpoint replay.
+
+        upsample_factor may be a noninteger ratio (e.g. 20/3 for P=3).
+        slm_resample_mode='auto' preserves integer nearest repetition and
+        otherwise uses pixel-centred bilinear interpolation of the filtered
+        complex field. 'bilinear' and 'nearest' force a consistent rule for
+        subpixel-factor sweeps. The physical extent stays fixed.
+
+        axicon_profile='continuous' keeps the original blazed/kinoform phase.
+        axicon_profile='binary' applies a two-level radial phase grating and
+        therefore requires an H_asm that retains the desired diffraction
+        orders (build_axicon_ASM_TF handles this when given the same profile).
+        With apply_spatial_filter=True, spatial_filter_mode='center_block'
+        blocks the central 550 um square as before. Mode
+        'lee_left_first_order' instead passes only a 2 mm circular aperture
+        centred on the left first order of the fftshifted Fourier-plane view.
+        Supply that centre through either lee_first_order_offset_m or the Lee
+        carrier period in native SLM pixels.
+        axicon_lateral_shift_x/y move the physical axicon centre relative to
+        the optical grid origin along tensor axes 0/1, respectively, in metres.
+        slm_field_sample_offset_x/y provide the equivalent differentiable
+        coordinate transform used by proxy calibration: sample U(x + offset)
+        before a centred axicon, then translate the propagated field outside
+        this routine by the same offset.
+
+        Nonzero slm_incidence_angle_deg reprojects the tilted SLM envelope
+        before the separate axicon. None inherits beam_config; old configs
+        default to 0 degrees. The relay follows the specular reflected ray.
+        Spatial filters and sample offsets then act in that outgoing frame.
+        With streamed CUDA propagation, tilt backend='auto' uses GPU frequency
+        slabs with host staging. 'reference' retains the previous CPU path.
+
+        slm_complex_field supplies the complete illuminated SLM envelope in
+        place of phase_mask, beam_mean_amplitude and slm_amplitude_profile.
+        Static Zernike phase is still applied. This exposes the same linear
+        field map for adjoint CGH; its complex VJP is the Hermitian adjoint.
+        '''
+        if slm_complex_field is not None:
+            if any(value is not None for value in
+                   (phase_mask, beam_mean_amplitude, slm_amplitude_profile)):
+                raise ValueError('slm_complex_field replaces phase/amplitude inputs; do not supply both')
+            if slm_complex_field.ndim != 2 or not slm_complex_field.is_complex():
+                raise ValueError('slm_complex_field must be a 2D complex tensor')
+            phase_mask = torch.zeros_like(slm_complex_field.real)
+            beam_mean_amplitude = slm_complex_field.real.new_ones(())
+            slm_amplitude_profile = slm_complex_field
+        if phase_mask is None: phase_mask = self.phase_mask_iter
+        if beam_mean_amplitude is None: beam_mean_amplitude = self.beam_mean_amplitude_iter
+        if slm_amplitude_profile is None: slm_amplitude_profile = self.slm_amplitude_profile
+        tilt = incidence_options(self.beam_config, slm_incidence_angle_deg,
+                                 slm_incidence_axis, slm_tilt_model,
+                                 slm_tilt_padding, relay_magnification)
+        is_tilted = tilt['angle_deg'] != 0.0
+        tilt_backend, tilt_cols = tilt_execution_options(
+            self.beam_config, slm_tilt_backend, slm_tilt_stream_cols)
+        if tilt_backend == 'streamed' and tilt['model'] != 'angular_spectrum':
+            raise ValueError('Streamed tilt requires slm_tilt_model=angular_spectrum')
+        slm_input_subpixel_factor = int(slm_input_subpixel_factor)
+        if slm_input_subpixel_factor <= 0:
+            raise ValueError('slm_input_subpixel_factor must be positive')
+        if phase_mask.dim() != 2 or slm_amplitude_profile.dim() != 2:
+            raise ValueError('phase_mask and slm_amplitude_profile must be 2D')
+        if phase_mask.shape != slm_amplitude_profile.shape:
+            raise ValueError(
+                'phase_mask and slm_amplitude_profile must have the same shape; '
+                f'got {phase_mask.shape} and {slm_amplitude_profile.shape}'
+            )
+        expected_shape = (
+            int(self.beam_config.Nx) * slm_input_subpixel_factor,
+            int(self.beam_config.Ny) * slm_input_subpixel_factor,
+        )
+        if tuple(phase_mask.shape) != expected_shape:
+            raise ValueError(
+                'sub-pixel SLM input shape does not match the beam configuration: '
+                f'got {tuple(phase_mask.shape)}, expected {expected_shape}'
+            )
+
+        shift_x, shift_y = self._validate_axicon_lateral_shift(
+            axicon_lateral_shift_x, axicon_lateral_shift_y
+        )
+
+        is_sparse = isinstance(H_asm, dict) and H_asm.get('type') == 'sparse'
+        is_streamed = isinstance(H_asm, dict) and H_asm.get('type') == 'streamed'
+        t0 = time.perf_counter()
+
+        def forward_engine(p_mask, b_amp, s_prof):
+            # 1. SLM plane phase
+            native_shape = (
+                p_mask.shape[-2] // slm_input_subpixel_factor,
+                p_mask.shape[-1] // slm_input_subpixel_factor,
+            )
+            aberration_phase = self._get_zernike_phase(native_shape)
+            if (
+                slm_input_subpixel_factor > 1
+                and isinstance(aberration_phase, torch.Tensor)
+            ):
+                aberration_phase = aberration_phase.repeat_interleave(
+                    slm_input_subpixel_factor, dim=0
+                ).repeat_interleave(slm_input_subpixel_factor, dim=1)
+            total_phase = p_mask + aberration_phase
+            slm_field = b_amp[None,None] * s_prof * torch.exp(1j * total_phase)
+
+            Nx_orig, Ny_orig = p_mask.shape[-2:]
+            ps_orig = (
+                self.beam_config.psSLM / slm_input_subpixel_factor
+            )
+
+            if apply_spatial_filter and not is_tilted:
+                slm_fft = torch.fft.fftshift(torch.fft.fft2(slm_field, norm="ortho"))
+
+                lam = self.beam_config.lambda_
+                # This Fourier plane is formed directly by f1 from the
+                # physical 8 um SLM.  beam_config.psSLM is 6.4 um because the
+                # later f2/f3/f4 relay is collapsed into a 0.8x-demagnified
+                # target-equivalent grid, so it must not set this aperture's
+                # frequency coordinates.  At sub-pixel resolution the sample
+                # pitch scales by P while the represented SLM extent stays
+                # fixed.
+                physical_slm_sample_pitch = (
+                    8e-6 / slm_input_subpixel_factor
+                )
+
+                fx = torch.fft.fftshift(torch.fft.fftfreq(
+                    Nx_orig,
+                    d=physical_slm_sample_pitch,
+                    device=self.beam_config.device,
+                ))
+                fy = torch.fft.fftshift(torch.fft.fftfreq(
+                    Ny_orig,
+                    d=physical_slm_sample_pitch,
+                    device=self.beam_config.device,
+                ))
+                FX, FY = torch.meshgrid(fx, fy, indexing='ij')
+
+                filter_mask = self._build_fourier_plane_spatial_filter(
+                    FX,
+                    FY,
+                    wavelength_m=lam,
+                    spatial_filter_mode=spatial_filter_mode,
+                    focal_length_m=spatial_filter_focal_length_m,
+                    center_block_size_m=center_block_size_m,
+                    lee_aperture_diameter_m=lee_aperture_diameter_m,
+                    lee_first_order_offset_m=lee_first_order_offset_m,
+                    lee_carrier_period_pixels=lee_carrier_period_pixels,
+                    physical_slm_pixel_pitch_m=8e-6,
+                )
+                filter_mask = filter_mask.to(slm_fft.dtype)
+
+                if apply_slm_field_sample_offset:
+                    offset_x = torch.as_tensor(
+                        slm_field_sample_offset_x,
+                        device=slm_field.device,
+                        dtype=slm_field.real.dtype,
+                    )
+                    offset_y = torch.as_tensor(
+                        slm_field_sample_offset_y,
+                        device=slm_field.device,
+                        dtype=slm_field.real.dtype,
+                    )
+                    # FX/FY above use the physical 8 um pitch solely to size
+                    # the 4f aperture.  Lateral axicon displacement lives on
+                    # the post-relay target-equivalent grid (ps_orig =
+                    # 6.4 um/P), so rescale the DFT frequency coordinates for
+                    # the translation ramp without allocating another mesh.
+                    translation_frequency_scale = (
+                        physical_slm_sample_pitch / ps_orig
+                    )
+                    shift_phase = 2.0 * math.pi * (
+                        translation_frequency_scale
+                        * (FX * offset_x + FY * offset_y)
+                    )
+                    filter_mask = filter_mask * torch.exp(1j * shift_phase)
+
+                slm_fft_filtered = slm_fft * filter_mask
+                slm_field = torch.fft.ifft2(torch.fft.ifftshift(slm_fft_filtered), norm="ortho")
+
+                del slm_fft, slm_fft_filtered, FX, FY, filter_mask
+
+            if apply_slm_field_sample_offset and not apply_spatial_filter and not is_tilted:
+                slm_field = self._translate_complex_field_fourier(
+                    slm_field,
+                    slm_field_sample_offset_x,
+                    slm_field_sample_offset_y,
+                    ps_orig,
+                )
+            
+            if is_tilted:
+                from .field_resample import scaled_field_shape, resize_complex_field
+                Nx_up, Ny_up = scaled_field_shape((Nx_orig, Ny_orig), upsample_factor)
+                ps_up = ps_orig / upsample_factor
+                use_tilt_slabs = tilt['model'] == 'angular_spectrum' and (
+                    tilt_backend == 'streamed' or
+                    (tilt_backend == 'auto' and is_streamed and slm_field.device.type == 'cuda'))
+                preparation_device = 'cpu' if is_streamed or use_tilt_slabs else slm_field.device
+                #print(f"SLM incidence {tilt['angle_deg']:g} deg ({tilt['axis']}): "
+                #      f"{Nx_up}x{Ny_up} "
+                #      f"{'streamed ' + str(slm_field.device) if use_tilt_slabs else 'reference ' + str(preparation_device)}, "
+                #      f"propagation on {slm_field.device}", flush=True)
+                slm_field_up = resize_complex_field(
+                    slm_field.to(preparation_device), (Nx_up, Ny_up), mode=slm_resample_mode)
+                filter_options = dict(spatial_filter_mode=spatial_filter_mode,
+                             focal_length_m=spatial_filter_focal_length_m,
+                             center_block_size_m=center_block_size_m,
+                             lee_aperture_diameter_m=lee_aperture_diameter_m,
+                             lee_first_order_offset_m=lee_first_order_offset_m,
+                             lee_carrier_period_pixels=lee_carrier_period_pixels,
+                             physical_slm_pixel_pitch_m=8e-6)
+                if use_tilt_slabs:
+                    from .streamed_slm_tilt import reproject_slm_field_streamed
+                    slab_geometry = {key: value for key, value in tilt.items() if key != 'model'}
+                    slm_field_up = reproject_slm_field_streamed(
+                        slm_field_up, pitch=ps_up, wavelength=self.beam_config.lambda_,
+                        **slab_geometry, processing_device=slm_field.device, cols=tilt_cols,
+                        rows=H_asm['rows'] if is_streamed else 256,
+                        mask_builder=self._build_fourier_plane_spatial_filter if apply_spatial_filter else None,
+                        filter_options=filter_options)
+                    if not is_streamed:
+                        slm_field_up = slm_field_up.to(slm_field.device)
+                else:
+                    slm_field_up = reproject_slm_field(
+                        slm_field_up, pitch=ps_up, wavelength=self.beam_config.lambda_, **tilt)
+                    if apply_spatial_filter:
+                        slm_field_up = apply_relay_spatial_filter(
+                            slm_field_up, ps_up, self.beam_config.lambda_, tilt['magnification'],
+                            self._build_fourier_plane_spatial_filter, filter_options)
+                if apply_slm_field_sample_offset:
+                    slm_field_up = self._translate_complex_field_fourier(
+                        slm_field_up, slm_field_sample_offset_x,
+                        slm_field_sample_offset_y, ps_up)
+
+            if is_streamed:
+                from .streamed_axicon import propagate_streamed
+                radial_frequency = self._resolve_axicon_radial_frequency(
+                    axicon_angle, n_medium, axicon_angle_in_medium,
+                    axicon_transverse_frequency)
+                volume = propagate_streamed(
+                    slm_field_up if is_tilted else slm_field, H_asm,
+                    1 if is_tilted else upsample_factor, roi_size, self,
+                    radial_frequency=radial_frequency, profile=axicon_profile,
+                    phase_depth=axicon_phase_depth, duty_cycle=axicon_duty_cycle,
+                    radial_offset=axicon_radial_offset, shift_x=shift_x, shift_y=shift_y,
+                    resample_mode='nearest' if is_tilted else slm_resample_mode,
+                    processing_device=slm_field.device)
+                return volume.abs().square() if convert_to_intensity else volume
+
+            # 2. Resample to the final optical grid, independently of P.
+            from .field_resample import scaled_field_shape, resize_complex_field
+            if not is_tilted:
+                Nx_up, Ny_up = scaled_field_shape((Nx_orig, Ny_orig), upsample_factor)
+                slm_field_up = resize_complex_field(
+                    slm_field, (Nx_up, Ny_up), mode=slm_resample_mode)
+                ps_up = ps_orig / upsample_factor
+
+            # 3. Axicon phase mask (Chunked)
+            x = torch.linspace(-(Nx_up-1)/2, (Nx_up-1)/2, Nx_up, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps_up
+            y = torch.linspace(-(Ny_up-1)/2, (Ny_up-1)/2, Ny_up, device=self.beam_config.device, dtype=self.beam_config.fdtype) * ps_up
+            
+            Y2 = (y - shift_y).view(1, -1) ** 2
+            radial_frequency = self._resolve_axicon_radial_frequency(
+                axicon_angle=axicon_angle,
+                n_medium=n_medium,
+                axicon_angle_in_medium=axicon_angle_in_medium,
+                axicon_transverse_frequency=axicon_transverse_frequency,
+            )
+            chunk_size = 1024
+            for i in range(0, Nx_up, chunk_size):
+                end_idx = min(i + chunk_size, Nx_up)
+                X2_chunk = (x[i:end_idx] - shift_x).view(-1, 1) ** 2
+                
+                R_chunk = torch.sqrt(X2_chunk + Y2)
+                phase_chunk = self._axicon_phase_from_radius(
+                    R_chunk,
+                    radial_frequency,
+                    axicon_profile=axicon_profile,
+                    axicon_phase_depth=axicon_phase_depth,
+                    axicon_duty_cycle=axicon_duty_cycle,
+                    axicon_radial_offset=axicon_radial_offset,
+                )
+                slm_field_up[i:end_idx] *= torch.exp(1j * phase_chunk)
+            
+            field_after_axicon = slm_field_up
+            del x, y, Y2, R_chunk, phase_chunk
+            
+            # 4. K-space Transformation
+            E_fourier = torch.fft.fft2(field_after_axicon, dim=(0,1), norm="ortho")
+            del field_after_axicon 
+
+            out_dtype = self.beam_config.fdtype if convert_to_intensity else self.beam_config.cdtype
+            
+            m_start = Nx_up // 2 - roi_size // 2
+            n_start = Ny_up // 2 - roi_size // 2
+
+            if is_sparse:
+                ring_mask = H_asm['ring_mask']
+                H_sparse = H_asm['H_asm_sparse']
+                Nz = H_sparse.shape[1]
+
+                E_fourier_sparse = E_fourier[ring_mask]
+                del E_fourier
+
+                vol_field = torch.zeros((roi_size, roi_size, Nz), dtype=out_dtype, device=self.beam_config.device)
+
+                for z in range(Nz):
+                    t_loop_start = time.perf_counter()
+                    
+                    E_dense = torch.zeros((Nx_up, Ny_up), dtype=self.beam_config.cdtype, device=self.beam_config.device)
+                    E_dense[ring_mask] = E_fourier_sparse * H_sparse[:, z]
+                    
+                    slice_spatial = torch.fft.ifft2(E_dense, dim=(0,1), norm="ortho")
+                    del E_dense
+                    
+                    # ROI cropping
+                    slice_cropped = slice_spatial[m_start:m_start+roi_size, n_start:n_start+roi_size]
+                    del slice_spatial 
+                    
+                    if convert_to_intensity:
+                        vol_field[:, :, z] = torch.abs(slice_cropped)**2
+                    else:
+                        vol_field[:, :, z] = slice_cropped
+                        
+                    #print(f"Slice {z+1}/{Nz} computed in {time.perf_counter() - t_loop_start:.2f}s")
+                
+                del E_fourier_sparse
+            else:
+                Nz = H_asm.shape[2]
+                vol_field = torch.zeros((roi_size, roi_size, Nz), dtype=out_dtype, device=self.beam_config.device)
+                
+                for z in range(Nz):
+                    E_dense = E_fourier * H_asm[:, :, z]
+                    slice_spatial = torch.fft.ifft2(E_dense, dim=(0,1), norm="ortho")
+                    
+                    slice_cropped = slice_spatial[m_start:m_start+roi_size, n_start:n_start+roi_size]
+                    del slice_spatial 
+                    
+                    if convert_to_intensity:
+                        vol_field[:, :, z] = torch.abs(slice_cropped)**2
+                    else:
+                        vol_field[:, :, z] = slice_cropped
+                del E_fourier
+
+            return vol_field
+
+        # The streamed linear operator has its own adjoint and saves no large
+        # activations. Replaying this whole function would repeat its host I/O.
+        if is_streamed:
+            return forward_engine(phase_mask, beam_mean_amplitude, slm_amplitude_profile)
+        if phase_mask.requires_grad or (self.source_modulation_map is not None and self.source_modulation_map.requires_grad) or (self.zernike_coeffs is not None and self.zernike_coeffs.requires_grad):
+            return torch.utils.checkpoint.checkpoint(forward_engine, phase_mask, beam_mean_amplitude, slm_amplitude_profile, use_reentrant=False)
+        else:
+            return forward_engine(phase_mask, beam_mean_amplitude, slm_amplitude_profile)
+
+    def propagateToMask(self, volume_field, H:torch.Tensor=None):
+        '''
+        Propagate the volume field back to the phase mask using the inverse transfer function.
+        volume field is the complex amplitude of the electric field in the volume.
+        Output the complex light field at phase modulation plane for every input plane.
+        Output is 3D, same shape as input.
+
+        FFT convention:
+        As derived in AS spectrum notes, forward FFT is used for forward propagation (taking phase mask to volume E-field).
+        The inverse FFT is used for backward propagation (taking volume E-field back to phase mask).
+        With torch.fft.fft2(norm='ortho'), the FFT operation is self-adjoint (ifft2 is adjoint of fft2).
+
+        fftshift convention:
+        All quantities are saved in physical format (center-oriented) where the middle of the array represent the lowest frequencies.
+        fftshift is applied after fft2 during forward propagation.
+        Then ifftshift is applied before ifft2 during backward propagation.
+        '''
+
+        # Check inputs
+
+        if volume_field.dim() != 3:
+            raise ValueError('volume_field must be a 3D tensor.')
+        
+        if H is None:
+            H = self.H
+        if H is None:
+            raise ValueError('Transfer function is not provided nor stored. Use buildTransferFunction() to build the transfer function first.')
+
+        # Computation
+        mask_field = torch.fft.ifft2(torch.fft.ifftshift(volume_field, dim=(0, 1)), dim=(0, 1), norm="ortho") #still 3D
+        mask_field /= H #divide by the transfer function
+        mask_field[torch.isinf(mask_field) | torch.isnan(mask_field)] = 0 #remove inf and nan resulted from region where H is zero. These frequencies are evanescent waves.
+        
+        # Aberration compensation
+        if self.zernike_coeffs is not None:
+            aberration_phase = self._get_zernike_phase(mask_field.shape[-2:])
+            correction_phasor = torch.exp(-1j * aberration_phase)
+            mask_field *= correction_phasor
+
+        return mask_field
+
+    #@torch.no_grad()
+    def buildSLMAmplitudeProfile(self):
+        '''
+        This function builds the source profile at the SLM plane.
+        The amplitude profile should have mean value equal to 1.
+        If the source profile is Gaussian, the kwargs should contain the gaussian_beam_waist in [m].
+        '''
+
+        # If computed profile exist and not in the training step, return cached value
+        if self.slm_amplitude_profile is not None and self.source_modulation_map is None:
+             return self.slm_amplitude_profile
+        
+        if self.beam_config.amplitude_profile_type == 'flat_top':
+            slm_amplitude_profile = self.buildFlatTopSourceProfile()
+        elif self.beam_config.amplitude_profile_type == 'gaussian':
+            slm_amplitude_profile = self.buildGaussianSourceProfile(self.beam_config.gaussian_beam_waist)
+        else:
+            raise ValueError('Invalid source profile type.')
+        
+        if self.source_modulation_map is not None:
+            combined_profile = slm_amplitude_profile * self.source_modulation_map
+        else:
+            combined_profile = slm_amplitude_profile
+
+        # Re-normalization 
+        mean_val = torch.mean(torch.abs(combined_profile)) + 1e-12
+        final_profile = combined_profile / mean_val
+        
+        if self.source_modulation_map is None or not self.source_modulation_map.requires_grad:
+            self.slm_amplitude_profile = final_profile
+            
+        return final_profile
+
+    @torch.no_grad()
+    def buildFlatTopSourceProfile(self): # flat top with mean value of 1.
+        return torch.ones(self.beam_config.Nx, self.beam_config.Ny, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+
+    @torch.no_grad()
+    def buildGaussianSourceProfile(self, gaussian_beam_waist): # gaussian with mean value of 1.
+        '''
+        gaussian_beam_waist is in [m]
+        w_0 as defined in https://en.wikipedia.org/wiki/Gaussian_beam#Beam_waist
+        It is the radius at which the field amplitudes fall to 1/e of their axial values.
+        It is where the intensity values fall to 1/e^2 of their axial values.
+        Also denoted as sigma.
+        '''
+        Xv = torch.linspace(-(self.beam_config.Nx-1)/2.0, (self.beam_config.Nx-1)/2.0, self.beam_config.Nx)*self.beam_config.psSLM #Center coordinates of the pixels
+        Yv = torch.linspace(-(self.beam_config.Ny-1)/2.0, (self.beam_config.Ny-1)/2.0, self.beam_config.Ny)*self.beam_config.psSLM
+        X, Y = torch.meshgrid(Xv, Yv, indexing='ij')
+        tilt = incidence_options(self.beam_config)
+        illumination_frame = getattr(self.beam_config, 'slm_illumination_frame', 'surface')
+        if illumination_frame not in ('beam', 'surface'):
+            raise ValueError('slm_illumination_frame must be beam or surface.')
+        if tilt['angle_deg'] and illumination_frame == 'beam':
+            # A circular incident beam has a stretched footprint on the SLM.
+            cosine = math.cos(math.radians(tilt['angle_deg']))
+            if tilt['axis'] == 'x':
+                X = X * cosine
+            else:
+                Y = Y * cosine
+        R = torch.sqrt(X**2 + Y**2)
+
+        slm_amplitude_profile = torch.exp(-(R**2)/(gaussian_beam_waist**2))
+        slm_amplitude_profile = slm_amplitude_profile/slm_amplitude_profile.mean() #normalize to have mean amplitude value of 1.
+
+        return slm_amplitude_profile.detach().to(self.beam_config.device)
+
+    def compensateSpatialFilter(self):
+        # Copy holobeamconfig
+        # create another beam object with different material layer and focal length
+
+        # build the effective transfer function for the new beam
+        # Forward through the material stack of the spatial filter and backward through free space
+        # This is the additional transfer function to be multiplied to the effective transfer function of the original beam.
+        ...
+
+    @torch.no_grad()
+    def initializePhaseMaskAndEnergy(self, global_grid_energy_req, global_coord_vec):
+        '''
+        This function initialize the value for the phase mask and beam mean amplitude. It also set these tensors to require gradient.
+        The implementation differ for time-multiplexed beams.
+
+        Parameters
+        ----------
+        global_grid_energy_req: FloatTensor, the energy required for this beam at each voxel of the global grid.
+        global_coord_vec: tuple[FloatTensor], the coordinate vectors of the global grid.
+        '''
+        # (1) Map energy_required back to local grids
+        local_grid_energy_req = self.mapGlobalToLocal(global_grid_energy_req, global_coord_vec, use_precomputed_sampling_coord=False).to(self.beam_config.fdtype)
+        
+        local_vol_field = torch.sqrt(local_grid_energy_req)*torch.exp(1j*2*torch.pi*torch.rand_like(local_grid_energy_req)) #complex amplitude of the volumetric light field
+
+        # (3) Backpropagate the field to SLM
+        mask_field = self.propagateToMask(local_vol_field)
+
+        # (4) Extract the phase and use it as initial phase mask
+        mask_field_2D = torch.mean(mask_field, dim=2) #average over z to get 2D field
+        self.phase_mask_init = torch.angle(mask_field_2D)
+        self.phase_mask_iter = self.phase_mask_init.detach().clone()
+        self.logger.debug(f'Mean amplitude of every plane: {torch.mean(mask_field.abs(), dim=(0,1))}')
+
+
+        # (5) Extract the power to set the total power
+        # self.beam_mean_amplitude_init = mask_field.abs().mean() #the mean beam field amplitude. Initialized as the mean over the SLM plane.
+        self.beam_mean_amplitude_init = ((mask_field.abs())**2).mean().sqrt() #the mean beam field amplitude, initialized using sqrt of mean intensities of all planes and all pixels.
+        self.beam_mean_amplitude_iter = self.beam_mean_amplitude_init.detach().clone()
+        self.logger.debug(f'Mean amp of every plane and every pixel: {torch.mean(mask_field.abs())}')
+
+        # (6) Set the optimization variables to require gradient
+        self.phase_mask_iter.requires_grad = True
+        self.beam_mean_amplitude_iter.requires_grad = True
+
+    def propagateAllSubBeamsToGlobalVolumeIntensity(self, global_coord_vec):
+        '''
+        This method propagate each sub-beams and interpolate them to the global grid.
+        In the case of HoloBeam, there is only one sub-beam.
+        The implementation differ for time-multiplexed beams.
+        '''
+        
+        if self.beam_config.grad_checkpoint:
+            # Forward propagate phase mask
+            local_vol_intensity = checkpoint(self.propagateToVolume,convert_to_intensity=True, use_reentrant=False)
+            # Interpolate on global grid
+            global_vol_intensity = checkpoint(self.mapLocalToGlobal,local_vol_intensity, global_coord_vec, use_precomputed_sampling_coord=False, use_reentrant=False)
+        else:
+            # Forward propagate phase mask
+            local_vol_intensity = self.propagateToVolume(convert_to_intensity=True)
+
+            # Interpolate on global grid
+            global_vol_intensity = self.mapLocalToGlobal(local_vol_intensity, global_coord_vec, use_precomputed_sampling_coord=False)
+
+        return global_vol_intensity
+
+    @torch.no_grad()
+    def gerchbergsaxton(self, target_intensity:torch.Tensor, H:torch.Tensor, iterations:int=50):
+        '''
+        Optimize a phase mask for the specified target intensity distribution using Gerchberg-Saxton algorithm.
+        target_intensity is ordered in x,y,z.
+        zv is the z positions of the planes in the local coordinate system.
+
+        This implementation is isolated from the multi-beam optimization. It is used for debugging and testing SLM display only.
+        '''
+        #Convert inputs
+        target_intensity = target_intensity.to(self.beam_config.device).to(self.beam_config.fdtype)
+        target_amplitude = torch.sqrt(target_intensity)
+
+        #Build required components for this function only. These do not affect the stored attributes.
+        beam_mean_amplitude = torch.as_tensor(1.0, device=self.beam_config.device, dtype=self.beam_config.fdtype) #beam mean amplitude
+        slm_amplitude_profile = self.buildSLMAmplitudeProfile()
+
+        #Initial guess
+        local_vol_field = target_amplitude*torch.exp(1j*2*torch.pi*torch.rand_like(target_amplitude)) #complex amplitude of the volumetric light field
+        mask_field = self.propagateToMask(local_vol_field, H=H)
+        phase_mask = torch.angle(torch.mean(mask_field, dim=2)) #average over z to get 2D field
+
+        #Gerchberg-Saxton iterations
+        for iter in tqdm(range(iterations)):
+            # Forward propagate phase mask, enforce amplitude constraint in the Fourier space (modulation plane)
+            local_vol_field = self.propagateToVolume(phase_mask=phase_mask,
+                                                    beam_mean_amplitude=beam_mean_amplitude,
+                                                    slm_amplitude_profile=slm_amplitude_profile,
+                                                    H=H,
+                                                    convert_to_intensity=False)
+
+            local_vol_field = target_amplitude*torch.exp(1j*torch.angle(local_vol_field)) #enforce amplitude constraint in the real space
+
+            # Backward propagate to get the new phase mask
+            mask_field = self.propagateToMask(local_vol_field, H=H)
+            phase_mask = torch.angle(torch.mean(mask_field, dim=2))
+
+        return phase_mask
+
+    def init_proxy_params(self, num_zernike=20, init_source_map=None, device=None):
+        """
+        Activate gradient and initialize the parameters of proxy model
+        """
+        
+        target_device = device if device is not None else self.beam_config.device
+        self.beam_config.device = target_device # Config update
+
+        print(f"[HoloBeam] Initializing Proxy Params on {target_device}...")
+
+        # 1. Zernike Coefficients to zero
+        self.zernike_coeffs = torch.zeros(
+            num_zernike, 
+            device=target_device, 
+            dtype=self.beam_config.fdtype
+        ).requires_grad_(True)
+
+        # 2. Source Map to 1
+        if init_source_map is None:
+            #current_profile = self.buildSLMAmplitudeProfile().to(target_device).detach()
+            #self.source_modulation_map = current_profile.clone().requires_grad_(True)
+            self.source_modulation_map = torch.ones(
+                (self.beam_config.Nx, self.beam_config.Ny),
+                device=target_device,
+                dtype=self.beam_config.fdtype
+            ).requires_grad_(True)
+        else:
+            self.source_modulation_map = init_source_map.to(target_device).detach().requires_grad_(True)
+
+        # 3. Global Scale Factor
+        self.camera_scale_factor = torch.tensor(1.0, device=target_device, dtype=self.beam_config.fdtype).requires_grad_(True)
+
+    def get_proxy_parameters(self):
+        """
+        Return parameter list to the Optimizer
+        """
+        params = [self.zernike_coeffs, self.source_modulation_map, self.camera_scale_factor]
+        return params
+
+    #def forward_propagate_2D(self, slm_phase, defocus=0.0):
+    def forward_proxy_2D(self, slm_phase, source_profile=None, defocus=0.0):
+        """
+        Test code for the Camera in the Loop system. (written on 01_28_2026)
+        Return intensity at a specific focal plane.
+        
+        Input: SLM phase
+        Output: reconstructed amplitutde
+        """
+        if not slm_phase.requires_grad:
+            slm_phase.requires_grad_(True)
+
+        # beam initialization
+        if source_profile is not None:
+            use_profile = source_profile
+        elif self.source_modulation_map is not None:
+            use_profile = self.source_modulation_map
+        elif self.slm_amplitude_profile is not None:
+            use_profile = self.slm_amplitude_profile
+        else:
+            use_profile = self.buildSLMAmplitudeProfile()
+        beam_amp = torch.tensor(1, device=self.beam_config.device)
+        #use_profile = self.buildSLMAmplitudeProfile()
+
+        # propagation
+        vol_field = self.propagateToVolume(phase_mask=slm_phase, 
+                                           beam_mean_amplitude=beam_amp, 
+                                           slm_amplitude_profile=use_profile,
+                                           H=self.H,
+                                           convert_to_intensity=False)
+        
+        # get focal plane
+        zv = self.local_coord_vec[2]
+        defocus_m = defocus * 1e-9
+
+        # check if defocus exceeds the volume
+        if defocus_m < zv.min() or defocus_m > zv.max():
+             print(f"Warning: Defocus {defocus}nm is out of volume range [{zv.min().item()*1e9:.1f}, {zv.max().item()*1e9:.1f}]nm.")
+
+        dz = zv[1] - zv[0]
+        z_start = zv[0]
+        
+        # Index = (Target_Position - Start_Position) / Step_Size
+        exact_idx = (defocus_m - z_start) / dz
+        
+        # index clamping
+        exact_idx = torch.clamp(exact_idx, 0, len(zv) - 1.001)
+
+        # Linear Interpolation (Lerp)
+        idx_low = torch.floor(exact_idx).long()
+        idx_high = idx_low + 1
+        alpha = exact_idx - idx_low  
+
+        slice_low = vol_field[:, :, idx_low]
+        slice_high = vol_field[:, :, idx_high]
+        
+        # Complex Interpolation
+        target_field_slice = (1 - alpha) * slice_low + alpha * slice_high
+        reconstructed_intensity = torch.abs(target_field_slice) ** 2
+        
+        if self.camera_scale_factor is not None:
+            return reconstructed_intensity * torch.abs(self.camera_scale_factor)
+        else:
+            return reconstructed_intensity
+
+    def forward_proxy_2D_Axicon(self, slm_phase, axicon_angle=0.0835, upsample_factor=20,
+                                source_profile=None, defocus=0, n_medium=1.0,
+                                axicon_angle_in_medium=False,
+                                axicon_transverse_frequency=None,
+                                axicon_profile='continuous',
+                                axicon_phase_depth=math.pi,
+                                axicon_duty_cycle=0.5,
+                                axicon_radial_offset=0.0,
+                                axicon_lateral_shift_x=0.0,
+                                axicon_lateral_shift_y=0.0):
+        """
+        Return intensity at a specific focal plane.
+        
+        Input: SLM phase
+        Output: reconstructed amplitutde
+        """
+        if not slm_phase.requires_grad:
+            slm_phase.requires_grad_(True)
+
+        if source_profile is not None:
+            use_profile = source_profile
+        elif self.source_modulation_map is not None:
+            use_profile = self.source_modulation_map
+        elif self.slm_amplitude_profile is not None:
+            use_profile = self.slm_amplitude_profile
+        else:
+            use_profile = self.buildSLMAmplitudeProfile()
+        beam_amp = torch.tensor(1.0, device=self.beam_config.device, dtype=self.beam_config.fdtype)
+
+        vol_field = self.propagateToVolume_Axicon2(
+                                                axicon_angle=axicon_angle, 
+                                                upsample_factor=upsample_factor,
+                                                phase_mask=slm_phase, 
+                                                beam_mean_amplitude=beam_amp, 
+                                                slm_amplitude_profile=use_profile,
+                                                H_asm=self.H_asm,
+                                                convert_to_intensity=True,
+                                                roi_size=1600,
+                                                n_medium=n_medium,
+                                                axicon_angle_in_medium=axicon_angle_in_medium,
+                                                axicon_transverse_frequency=axicon_transverse_frequency,
+                                                axicon_profile=axicon_profile,
+                                                axicon_phase_depth=axicon_phase_depth,
+                                                axicon_duty_cycle=axicon_duty_cycle,
+                                                axicon_radial_offset=axicon_radial_offset,
+                                                axicon_lateral_shift_x=axicon_lateral_shift_x,
+                                                axicon_lateral_shift_y=axicon_lateral_shift_y,
+        )
+
+        # get focal plane
+        zv = self.local_coord_vec[2]
+        defocus_m = defocus * 1e-9
+
+        # check if defocus exceeds the volume
+        if defocus_m < zv.min() or defocus_m > zv.max():
+             print(f"Warning: Defocus {defocus}nm is out of volume range [{zv.min().item()*1e9:.1f}, {zv.max().item()*1e9:.1f}]nm.")
+
+        dz = zv[1] - zv[0]
+        z_start = zv[0]
+        
+        # Index = (Target_Position - Start_Position) / Step_Size
+        exact_idx = (defocus_m - z_start) / dz
+        
+        # index clamping
+        exact_idx = torch.clamp(exact_idx, 0, len(zv) - 1.001)
+
+        # Linear Interpolation (Lerp)
+        idx_low = torch.floor(exact_idx).long()
+        idx_high = idx_low + 1
+        alpha = exact_idx - idx_low  
+
+        slice_low = vol_field[:, :, idx_low]
+        slice_high = vol_field[:, :, idx_high]
+        
+        # Complex Interpolation
+        target_field_slice = (1 - alpha) * slice_low + alpha * slice_high
+        reconstructed_intensity = torch.abs(target_field_slice) ** 2
+
+        final_image = reconstructed_intensity * torch.abs(self.camera_scale_factor)
+        
+        return final_image

@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "original_path": "H:\\Shared drives\\taylorlab\\3DHL\\CITL\\preprocess_hdr_aligned_camera.py",
+  "vendored_path": "preprocess_hdr_aligned_camera.py",
+  "source_sha256": "7e5bf4be6968850cd06acc113d126e5b8c656d35e7c289e8e33e5ef768f5668f",
+  "vendored_sha256": "7e5bf4be6968850cd06acc113d126e5b8c656d35e7c289e8e33e5ef768f5668f",
+  "source_size_bytes": 150164,
+  "copied_at_utc": "2026-10-15T21:41:13.574542+00:00",
+  "changes": "None; byte-for-byte copy. Existing comments and docstrings are in English.",
+  "notes": "Functional path strings are preserved. Live CITL config supplies explicit dataset and LUT paths."
+}

@@ -1,0 +1,3 @@
+# Preserve the byte-level hashes recorded for bundled runtime source snapshots.
+/preprocess_hdr_aligned_camera.py -text
+/citl_optics/** -text

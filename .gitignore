@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+runs_citl/
+tests/.citl-test-*/
+tests/.tmp/
+citl_config.local.json

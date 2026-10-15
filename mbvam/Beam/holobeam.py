@@ -646,7 +646,7 @@ class HoloBeam(Beam):
             
             km = 2 * torch.pi * n_medium / lambda_
             
-            # z_query: [Nz], gamma_sparse: [N_sparse] => 결과: [N_sparse, Nz]
+            # z_query: [Nz], gamma_sparse: [N_sparse] => result: [N_sparse, Nz]
             H_asm_sparse = torch.exp(1j * km * z_query.view(1, -1) * gamma_sparse.view(-1, 1))
             
             valid_mask_sparse = (gamma_sq_sparse >= 0).unsqueeze(-1)

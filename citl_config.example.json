@@ -1,0 +1,61 @@
+{
+  "output_dir": "runs_citl",
+  "reference_phase": null,
+  "proxy": {
+    "proxy_source_dir": "citl_optics",
+    "checkpoint": "C:/REVAMP/Yangwoo Heo/SLM_to_Axicon_Optimiaztion/CSSNet_training_10072006_newsim/20261013_114624_c4d2/best.pt",
+    "phase": null,
+    "target": "H:/Shared drives/taylorlab/3DHL/CITL/Fourier Neural Operator_Training phase masks/Targets_Geometric_Variance/00_baseline.png",
+    "device": "cuda",
+    "system_config": null,
+    "system_preset": "legacy_training",
+    "z_mm": 6.0,
+    "z_reference_mm": 6.0,
+    "reference_check": "auto",
+    "reference_field": null,
+    "target_mode": "legacy_optimizer",
+    "legacy_optimizer_roi_size": 1024,
+    "target_pixel_size_um": 2.0,
+    "target_peak": null,
+    "transpose_target": false,
+    "flip_target_ud": false,
+    "flip_target_lr": true,
+    "phase_units": "slm",
+    "phase_level_max": 1023,
+    "transpose_phase": true,
+    "flip_phase_first_axis": true,
+    "loss": "shape",
+    "loss_roi_fraction": null
+  },
+  "preprocessing": {
+    "training_root": "EDIT_ME/training_raw_root",
+    "preprocessing_script": "preprocess_hdr_aligned_camera.py",
+    "report_path": null,
+    "lut_path": "EDIT_ME/Camera_Response_LUT.xlsx",
+    "z_mm": 0.0,
+    "allow_refit": false,
+    "options": {}
+  },
+  "hardware": {
+    "config_path": "EDIT_ME/3DHL-Python-Control/hololith/util/setting.yaml",
+    "hololith_root": "EDIT_ME/3DHL-Python-Control",
+    "camera_serial": null,
+    "camera_gain": null,
+    "pixel_format": "BayerRG12",
+    "laser_pwm": 152,
+    "average_frames": 1,
+    "flush_frames": 2,
+    "slm_settle_s": 0.3,
+    "laser_settle_s": 0.1,
+    "raw_shape": [2168, 4096],
+    "slm_shape": [1200, 1920]
+  },
+  "loop": {
+    "iters": 30,
+    "lr": 0.1,
+    "grad_clip": null,
+    "max_phase_change": null,
+    "min_valid_fraction": 0.9,
+    "plot_every": 1
+  }
+}

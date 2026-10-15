@@ -1,0 +1,328 @@
+{
+  "format_version": 1,
+  "purpose": "Pinned optical runtime for live camera-in-the-loop phase optimization. Import via proxy_source_dir; unrelated root-level optical scripts are not modified.",
+  "source_directory": "C:\\REVAMP\\Yangwoo Heo\\SLM_to_Axicon_Optimiaztion\\3DHL_CITL",
+  "created_utc": "2026-10-15T21:41:09.437190+00:00",
+  "source_selection": "Seven optical/trainer modules, mbvam Python package excluding the standalone npy_visualizer utility, and the optional NVRTC CUDA source. No checkpoints, training data, or caches.",
+  "phase_contract": "Physical radians in internal [Nx,Ny] order; offline target placement and frozen shared_optical checkpoint architecture retained.",
+  "cuda_note": "mbvam/Beam/slm_tilt_cuda.py reads sibling slm_tilt_lanczos.cu via __file__. NVRTC is optional and uses the PyTorch bundled runtime.",
+  "files": [
+    {
+      "path": "axicon_optical.py",
+      "source_sha256": "dd0be8271b488e1d326fd34bd8f89ecc8a5643c698ea91c52eb442b7b6000ab7",
+      "snapshot_sha256": "dd0be8271b488e1d326fd34bd8f89ecc8a5643c698ea91c52eb442b7b6000ab7",
+      "bytes": 17635,
+      "changes": []
+    },
+    {
+      "path": "axicon_optical_visualization.py",
+      "source_sha256": "3bfc1d0216e3563a1eeb5bc56f9ebcb7c80df242ff18b1d8a8effcdae561efe0",
+      "snapshot_sha256": "3bfc1d0216e3563a1eeb5bc56f9ebcb7c80df242ff18b1d8a8effcdae561efe0",
+      "bytes": 18405,
+      "changes": []
+    },
+    {
+      "path": "axicon_simulator.py",
+      "source_sha256": "0ad0fd294e55a5811d78abf360dba1d136ec32ff463c516a1ede87bbd8200cc4",
+      "snapshot_sha256": "0ad0fd294e55a5811d78abf360dba1d136ec32ff463c516a1ede87bbd8200cc4",
+      "bytes": 55980,
+      "changes": []
+    },
+    {
+      "path": "fno_losses.py",
+      "source_sha256": "255b8ac18df15079cccd8d8e97457bc385548f8c4e2aea298e1c1f6aaabc9bae",
+      "snapshot_sha256": "255b8ac18df15079cccd8d8e97457bc385548f8c4e2aea298e1c1f6aaabc9bae",
+      "bytes": 9954,
+      "changes": []
+    },
+    {
+      "path": "mbvam/__init__.py",
+      "source_sha256": "833fd5198da8e3839eb7cbb120030215af1ba27aa7a57af2decd43641aadf1dc",
+      "snapshot_sha256": "833fd5198da8e3839eb7cbb120030215af1ba27aa7a57af2decd43641aadf1dc",
+      "bytes": 129,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Beam/__init__.py",
+      "source_sha256": "23e0c8f09142a4630eb8354db3df75a2ac2a26a3d0f957a29e97f1f0e2b3cce3",
+      "snapshot_sha256": "23e0c8f09142a4630eb8354db3df75a2ac2a26a3d0f957a29e97f1f0e2b3cce3",
+      "bytes": 194,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Beam/axicon.py",
+      "source_sha256": "60b3560168f8735a5b03bc8b53e045388d790cc02e0c495790a61aad159acde2",
+      "snapshot_sha256": "60b3560168f8735a5b03bc8b53e045388d790cc02e0c495790a61aad159acde2",
+      "bytes": 4398,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Beam/beam.py",
+      "source_sha256": "473dd6b41797e35b5f4dfb5a7681c2fbadb6a3239dfb11a0c094c96a48e16c88",
+      "snapshot_sha256": "473dd6b41797e35b5f4dfb5a7681c2fbadb6a3239dfb11a0c094c96a48e16c88",
+      "bytes": 18472,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Beam/field_resample.py",
+      "source_sha256": "5ae23c678582b44bc3052692f6f6e9eccadbb5f219540603d525b6fb119f6ba5",
+      "snapshot_sha256": "5ae23c678582b44bc3052692f6f6e9eccadbb5f219540603d525b6fb119f6ba5",
+      "bytes": 4535,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Beam/holobeam.py",
+      "source_sha256": "59d9bf6c85e94cb60e9c4154e03feb5c595f5679188ecaa1b4ea7d38fafee84b",
+      "snapshot_sha256": "c5181cb671ef910f7286fd97e1b53e5d12ec32d238ec38edcb6e1c55f633dde1",
+      "bytes": 86381,
+      "changes": [
+        "Translated the result-shape comment to English; no executable changes."
+      ]
+    },
+    {
+      "path": "mbvam/Beam/holobeamconfig.py",
+      "source_sha256": "49402b5a3027bd5099a9ee1737bb4d1daefe8ab3c6e530fcdec8c68725402702",
+      "snapshot_sha256": "49402b5a3027bd5099a9ee1737bb4d1daefe8ab3c6e530fcdec8c68725402702",
+      "bytes": 19401,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Beam/holotomobeam.py",
+      "source_sha256": "8623e9e9998ac4e2b7f30d53dd1e920597f2f9b2701e5d6435ac0d39e95aca2c",
+      "snapshot_sha256": "8623e9e9998ac4e2b7f30d53dd1e920597f2f9b2701e5d6435ac0d39e95aca2c",
+      "bytes": 8370,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Beam/holotomobeamconfig.py",
+      "source_sha256": "9e2c2ca141fbde609d039556277dd86e247c24d79bb7e0fa3501530e9ef988de",
+      "snapshot_sha256": "9e2c2ca141fbde609d039556277dd86e247c24d79bb7e0fa3501530e9ef988de",
+      "bytes": 3689,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Beam/muxholobeam.py",
+      "source_sha256": "6443f14f5d9ccddcf74d49103fbf8d4bd8b0d42b14df1d3a469f5c711a3da1f7",
+      "snapshot_sha256": "6443f14f5d9ccddcf74d49103fbf8d4bd8b0d42b14df1d3a469f5c711a3da1f7",
+      "bytes": 7020,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Beam/muxholobeamconfig.py",
+      "source_sha256": "2d83f1f0410ad0b0ee8b706cc01c83641195e56639f7b23b2afe26256a5dd713",
+      "snapshot_sha256": "2d83f1f0410ad0b0ee8b706cc01c83641195e56639f7b23b2afe26256a5dd713",
+      "bytes": 424,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Beam/phase_lut.py",
+      "source_sha256": "8603e5f0f05e966383e8a48713a8cf5e192ab625ddf6f2649f97c9c802ddb9e0",
+      "snapshot_sha256": "8603e5f0f05e966383e8a48713a8cf5e192ab625ddf6f2649f97c9c802ddb9e0",
+      "bytes": 7474,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Beam/slm_tilt.py",
+      "source_sha256": "6d8602d78d6c042a0de2a1dc3ac8e3c51f2437f30d3b0db5faf95cfae198de82",
+      "snapshot_sha256": "6d8602d78d6c042a0de2a1dc3ac8e3c51f2437f30d3b0db5faf95cfae198de82",
+      "bytes": 15925,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Beam/slm_tilt_cuda.py",
+      "source_sha256": "b42de9ff16530ba2ac4e81f913aefd24732c332518dd59ae25fb7acd6eae129a",
+      "snapshot_sha256": "b42de9ff16530ba2ac4e81f913aefd24732c332518dd59ae25fb7acd6eae129a",
+      "bytes": 6413,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Beam/slm_tilt_lanczos.cu",
+      "source_sha256": "e64a1aead9d5a68571f0ed24a33f18616808db0cd2c858c87f494a27f7824408",
+      "snapshot_sha256": "e64a1aead9d5a68571f0ed24a33f18616808db0cd2c858c87f494a27f7824408",
+      "bytes": 2138,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Beam/streamed_axicon.py",
+      "source_sha256": "bd374e633b071abf29d122086252c17d6e4e9f499dc74e9e92f1a338603352d3",
+      "snapshot_sha256": "bd374e633b071abf29d122086252c17d6e4e9f499dc74e9e92f1a338603352d3",
+      "bytes": 11177,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Beam/streamed_slm_tilt.py",
+      "source_sha256": "dd03e3023c6511e8dc714cfa6f00bc8845e2528368ebb367dba958dd865e7d3a",
+      "snapshot_sha256": "dd03e3023c6511e8dc714cfa6f00bc8845e2528368ebb367dba958dd865e7d3a",
+      "bytes": 8495,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Beam/zernike.py",
+      "source_sha256": "1e81c2aa8d1ab360da837a1b21c755074c427dcdc867fd3d395a96f7670bfb9d",
+      "snapshot_sha256": "1e81c2aa8d1ab360da837a1b21c755074c427dcdc867fd3d395a96f7670bfb9d",
+      "bytes": 3616,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Geometry/__init__.py",
+      "source_sha256": "40d7f70b153fefc8c4b76d5249a863f2cebb9659ebbd7c6c49c3f74df365b5eb",
+      "snapshot_sha256": "40d7f70b153fefc8c4b76d5249a863f2cebb9659ebbd7c6c49c3f74df365b5eb",
+      "bytes": 73,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Geometry/coordinate.py",
+      "source_sha256": "cf2ee87d9b92ba1774c4f849b0b3774f0f72b91f8754f791fee818e6ffee645d",
+      "snapshot_sha256": "cf2ee87d9b92ba1774c4f849b0b3774f0f72b91f8754f791fee818e6ffee645d",
+      "bytes": 5275,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Geometry/resample.py",
+      "source_sha256": "ec388081472f5a2299f274f5d784240fe2aa604b4348cbbcdd27f11cc80c8dba",
+      "snapshot_sha256": "ec388081472f5a2299f274f5d784240fe2aa604b4348cbbcdd27f11cc80c8dba",
+      "bytes": 4750,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Geometry/visualize.py",
+      "source_sha256": "fe32c8b4be3b0ef6524ab6c931e957ac39447a98dd961ae09872893c39b2a5bf",
+      "snapshot_sha256": "fe32c8b4be3b0ef6524ab6c931e957ac39447a98dd961ae09872893c39b2a5bf",
+      "bytes": 20146,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Optim/__init__.py",
+      "source_sha256": "07180c751bdfb5a9487000a9acd66247c92f76175aa6776bd90356d7f3c5edf3",
+      "snapshot_sha256": "07180c751bdfb5a9487000a9acd66247c92f76175aa6776bd90356d7f3c5edf3",
+      "bytes": 79,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Optim/metric.py",
+      "source_sha256": "b59b840b6bd04e9b94c8513ca2d202e19ebeae2e9d9a66a2df2a3b41a0622dc0",
+      "snapshot_sha256": "b59b840b6bd04e9b94c8513ca2d202e19ebeae2e9d9a66a2df2a3b41a0622dc0",
+      "bytes": 4472,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Optim/optimizationconfig.py",
+      "source_sha256": "a851bc87ac44b05af671d2624faf07a11b551e595a87a8a9c9d3e682f12e4dc7",
+      "snapshot_sha256": "a851bc87ac44b05af671d2624faf07a11b551e595a87a8a9c9d3e682f12e4dc7",
+      "bytes": 3280,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Optim/optimizer.py",
+      "source_sha256": "8868dc2f48d97dff7fa7617b8b03452254d4b122fa46de0a69428ace06b8b501",
+      "snapshot_sha256": "8868dc2f48d97dff7fa7617b8b03452254d4b122fa46de0a69428ace06b8b501",
+      "bytes": 11769,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Response/__init__.py",
+      "source_sha256": "a874f5a796a229ebea22eb34f5c561ebf2118af12d39a38742aec60f2ce8d2e4",
+      "snapshot_sha256": "a874f5a796a229ebea22eb34f5c561ebf2118af12d39a38742aec60f2ce8d2e4",
+      "bytes": 56,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Response/effectivedose.py",
+      "source_sha256": "43c6377776484de55c6eb04078cdd92b7cff73b4b5e82e2ce441cc74568b8cec",
+      "snapshot_sha256": "43c6377776484de55c6eb04078cdd92b7cff73b4b5e82e2ce441cc74568b8cec",
+      "bytes": 12316,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Response/responsemodel.py",
+      "source_sha256": "796692b09cbad2e5042afedb2fd5982b807ff73e933a80fda61b94aff8513818",
+      "snapshot_sha256": "796692b09cbad2e5042afedb2fd5982b807ff73e933a80fda61b94aff8513818",
+      "bytes": 9454,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Target/__init__.py",
+      "source_sha256": "6ff60635f36d466f8d67b105e5f99050b018d7c27ced33d2d9831822973bc3f0",
+      "snapshot_sha256": "6ff60635f36d466f8d67b105e5f99050b018d7c27ced33d2d9831822973bc3f0",
+      "bytes": 199,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Target/targetobject.py",
+      "source_sha256": "b0e7599f776f34bf7ac249573b48f489b175113bb92b2afb6953cdbdee871cda",
+      "snapshot_sha256": "b0e7599f776f34bf7ac249573b48f489b175113bb92b2afb6953cdbdee871cda",
+      "bytes": 14506,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Target/targetpreprocess.py",
+      "source_sha256": "7b3330d4da4554daa3f865890747dc8d676620d30eb066648549b76403cbefc2",
+      "snapshot_sha256": "7b3330d4da4554daa3f865890747dc8d676620d30eb066648549b76403cbefc2",
+      "bytes": 4147,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Target/targetpreprocessarray.py",
+      "source_sha256": "c5c7bb22024455e55219f2a9cf2248755af6acccb026e8f77a279577beb58cdb",
+      "snapshot_sha256": "c5c7bb22024455e55219f2a9cf2248755af6acccb026e8f77a279577beb58cdb",
+      "bytes": 77,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Target/targetpreprocessimagestack.py",
+      "source_sha256": "cedb6f75bc559c3dc30f316b9087b60d378b70644df10cc6da584fbf4c2d868f",
+      "snapshot_sha256": "cedb6f75bc559c3dc30f316b9087b60d378b70644df10cc6da584fbf4c2d868f",
+      "bytes": 6913,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Target/targetpreprocessingstl.py",
+      "source_sha256": "5c0154eb01d827a4db75ac4a03daaa082bd6e0783c5434942890b3acb8f8d88d",
+      "snapshot_sha256": "5c0154eb01d827a4db75ac4a03daaa082bd6e0783c5434942890b3acb8f8d88d",
+      "bytes": 8202,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Target/voxelize.py",
+      "source_sha256": "6fdb83d9241fd81dfe5512fb9987def26d05539032aad5e3a76f4a257b40bc7d",
+      "snapshot_sha256": "6fdb83d9241fd81dfe5512fb9987def26d05539032aad5e3a76f4a257b40bc7d",
+      "bytes": 27874,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Util/__init__.py",
+      "source_sha256": "d4b988182b3da4e6b33673a6a88e65075059e2be6bf2ba0099cd065d45f38d1e",
+      "snapshot_sha256": "d4b988182b3da4e6b33673a6a88e65075059e2be6bf2ba0099cd065d45f38d1e",
+      "bytes": 22,
+      "changes": []
+    },
+    {
+      "path": "mbvam/Util/saveload.py",
+      "source_sha256": "62ef3f9d7931837a17b7e63fd72386f3232a3fb3d8a91235fbff011d81739d8f",
+      "snapshot_sha256": "62ef3f9d7931837a17b7e63fd72386f3232a3fb3d8a91235fbff011d81739d8f",
+      "bytes": 14070,
+      "changes": []
+    },
+    {
+      "path": "shared_optical_phase_optimizer.py",
+      "source_sha256": "38f739c240b050093b0412b6e84bcf6a6b2fcbb7154a992bfc34b9f27814e128",
+      "snapshot_sha256": "38f739c240b050093b0412b6e84bcf6a6b2fcbb7154a992bfc34b9f27814e128",
+      "bytes": 31629,
+      "changes": []
+    },
+    {
+      "path": "shared_optical_phase_system.py",
+      "source_sha256": "94f822756694df44f02f337e611f49ca939f6831a5edcda42b43a43322f85134",
+      "snapshot_sha256": "94f822756694df44f02f337e611f49ca939f6831a5edcda42b43a43322f85134",
+      "bytes": 23417,
+      "changes": []
+    },
+    {
+      "path": "train_fno_axicon.py",
+      "source_sha256": "2ebd67589836d38a79f52fb7a1717a98195b2f42701357317967a3b82955c35d",
+      "snapshot_sha256": "2ebd67589836d38a79f52fb7a1717a98195b2f42701357317967a3b82955c35d",
+      "bytes": 130481,
+      "changes": []
+    }
+  ]
+}

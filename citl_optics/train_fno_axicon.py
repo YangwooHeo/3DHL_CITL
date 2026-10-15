@@ -1,0 +1,2745 @@
+# -*- coding: utf-8 -*-
+"""
+FNO / shared coherent optical-operator trainer for SLM-axicon camera learning.
+
+ARCHITECTURE='shared_optical' uses depth independent screen/transfer stages,
+native optical_input_size fields and model_size camera targets. Its output is
+gain*|crop(L(E))|^2 plus an optional shared positive background. FNO head,
+width/modes and coordinate-channel settings apply only to ARCHITECTURE='fno'.
+Optical channels optionally add coherent complex-linear paths; the default of
+one retains the original operator and checkpoint structure.
+Checkpoints without an architecture field retain their historical FNO behavior.
+
+One shared operator learns E_sim(z) -> camera intensity across all planes.
+SLM phase and z are NOT network inputs in the default configuration.
+
+Workflow-folder layout:
+
+    pool/
+      0.Phase_Masks/*.npy                  # optional, shared across z
+      3.Aligned_Camera/z_-0.5/*.npy         # offsets in mm
+      1.Forward_Sim/z_-0.5/*.npy
+      .../z_0/*.npy
+      .../z_+0.5/*.npy
+
+Unnumbered directory names and the previous flat layout are also supported.
+Pairing uses (z in mm, normalized pattern stem). All z views of a pattern,
+including its real/pert family, stay in one train/validation split. The unique
+sample id includes z; pattern_id retains the original normalized stem.
+
+Files are paired by normalized stem, so minor naming differences such as
+`sine80_890_0.npy` vs `sine_80_890_0.npy` and `..._09.npy` vs `..._9.npy`
+can still be matched.
+
+The optional FNO architecture retains its residual-field behavior:
+
+    [simulation electric field + intensity + spatial coordinates]
+        -> shared FNO -> complex delta_E
+        -> |E_sim + alpha * delta_E|^2 -> camera intensity loss
+
+Set PREDICTION_MODE = 'direct_field' if you want the FNO to generate a complex
+E_out and use |E_out|^2 as the final intensity. Use 'residual_field' if you
+want the FNO to predict a complex correction added to the simulated field before
+forming intensity.
+
+New runs use loss version 2 (fno_losses.py): positive shared-display SSIM and
+gradient error, plus SmoothL1 on raw intensity error divided by a floored
+target scale. The scale floor and linear residual-field gain are calibrated
+only from training samples and saved in cfg. Unversioned old checkpoints retain
+the original head settings and version 1 loss for reproducible evaluation.
+"""
+
+import csv
+import argparse
+import json
+import math
+import os
+import random
+import re
+from datetime import datetime
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, Subset
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class AxiconFieldDataset(Dataset):
+    def __init__(self, root_dir,
+                 workflow_field_dir='1.Forward_Sim',
+                 workflow_camera_dir='2.Aligned_Camera',
+                 workflow_phase_dir='0.Phase_Mask',
+                 sim_size=1024,
+                 phase_flip_lr=True,
+                 field_scale_mode='global_percentile',
+                 field_amp_percentile=99.9,
+                 field_amp_scale=None,
+                 camera_scale_mode='global_percentile',
+                 camera_percentile=99.9,
+                 camera_scale=None,
+                 camera_black_level=0.0,
+                 fov_crop_size=None,
+                 use_slm_phase=True,
+                 scale_max_pixels_per_sample=None,
+                 field_input_size=None):
+        self.root_dir = Path(root_dir)
+        self.workflow_field_dir = workflow_field_dir
+        self.workflow_camera_dir = workflow_camera_dir
+        self.workflow_phase_dir = workflow_phase_dir
+        self.sim_size = int(sim_size)
+        # Optional independent native field support; camera/normalization ROI
+        # remain governed by fov_crop_size and sim_size, as in historical runs.
+        self.field_input_size = field_input_size
+        if field_input_size is not None and (
+                isinstance(field_input_size, bool) or not isinstance(field_input_size, int)
+                or field_input_size < 2):
+            raise ValueError('field_input_size must be an integer >= 2 or None')
+        self.phase_flip_lr = phase_flip_lr
+        self.use_slm_phase = bool(use_slm_phase)
+        self.scale_max_pixels_per_sample = scale_max_pixels_per_sample
+        self.field_scale_mode = field_scale_mode
+        self.field_amp_percentile = field_amp_percentile
+        self.field_amp_scale = field_amp_scale
+        self.camera_scale_mode = camera_scale_mode
+        self.camera_percentile = camera_percentile
+        self.camera_scale = camera_scale
+        self.camera_black_level = camera_black_level
+        self.fov_crop_size = None if fov_crop_size is None else int(fov_crop_size)
+        self.valid_scale_modes = {'sample_norm', 'global_percentile', 'raw'}
+
+        if not self.root_dir.exists():
+            raise FileNotFoundError(f"Root not found: {self.root_dir}")
+        self._validate_scale_mode(self.field_scale_mode, 'field_scale_mode')
+        self._validate_scale_mode(self.camera_scale_mode, 'camera_scale_mode')
+        if self.fov_crop_size is not None and self.fov_crop_size <= 0:
+            raise ValueError(f"fov_crop_size must be positive or None; got {self.fov_crop_size}")
+        if scale_max_pixels_per_sample is not None and (
+                not isinstance(scale_max_pixels_per_sample, int) or scale_max_pixels_per_sample <= 0):
+            raise ValueError("scale_max_pixels_per_sample must be a positive integer or None")
+
+        self.samples = self._discover_workflow_samples()
+        if not self.samples:
+            raise RuntimeError("No matched simulation/camera samples; check workflow paths and z folders")
+        self.z_positions_mm = sorted({s['z_mm'] for s in self.samples})
+        print(f">>> Loaded {len(self.samples)} workflow samples from {self.root_dir}")
+        for z_mm in self.z_positions_mm:
+            count = sum(s['z_mm'] == z_mm for s in self.samples)
+            print(f">>>   z={z_mm:+g} mm: {count} matched samples")
+        if self.samples:
+            print(f">>> First sample ids: {', '.join(s['id'] for s in self.samples[:5])}")
+        if self.camera_scale_mode == 'global_percentile' and self.camera_scale is None:
+            self.camera_scale = self._compute_global_camera_scale()
+        if self.field_scale_mode == 'global_percentile' and self.field_amp_scale is None:
+            self.field_amp_scale = self._compute_global_field_amp_scale()
+        print(f">>> Camera scale mode: {self.camera_scale_mode}, scale={self.camera_scale}")
+        print(f">>> Field scale mode: {self.field_scale_mode}, amp_scale={self.field_amp_scale}")
+        if self.fov_crop_size is not None:
+            print(f">>> Native center FOV crop: {self.fov_crop_size} x {self.fov_crop_size}")
+
+    def _normalized_stem(self, path):
+        stem = Path(path).stem
+        if stem.startswith('sine') and len(stem) > 4 and stem[4].isdigit():
+            stem = 'sine_' + stem[4:]
+        parts = []
+        for part in stem.split('_'):
+            parts.append(str(int(part)) if part.isdigit() else part)
+        return '_'.join(parts)
+
+    def _resolve_workflow_directory(self, directory):
+        if directory is None:
+            raise ValueError("A workflow directory is required")
+        requested = self.root_dir / directory
+        if requested.is_dir():
+            return requested
+
+        def canonical(name):
+            name = re.sub(r'^\d+[. _-]*', '', name).lower()
+            return {'phase_masks': 'phase_mask',
+                    'camera_aligned': 'aligned_camera'}.get(name, name)
+
+        # Honor exact paths first; tolerate a changed/missing workflow number.
+        candidates = sorted(p for p in requested.parent.iterdir()
+                            if p.is_dir() and canonical(p.name) == canonical(requested.name))
+        if len(candidates) > 1:
+            raise ValueError(f"Ambiguous workflow directory {requested}: {candidates}")
+        if not candidates:
+            raise FileNotFoundError(f"Expected workflow directory not found: {requested}")
+        print(f">>> Resolved {directory} -> {candidates[0]}")
+        return candidates[0]
+
+    def _path_map_by_z_and_stem(self, directory, shared_phase=False):
+        directory = self._resolve_workflow_directory(directory)
+        # Only read NPYs directly in the root or a z folder, never quality sidecars.
+        folders = [(directory, None if shared_phase else 0.0, False)]
+        for child in sorted(directory.iterdir()):
+            if not child.is_dir():
+                continue
+            match = re.fullmatch(r'z_([+-]?(?:\d+(?:\.\d*)?|\.\d+))(?:mm)?',
+                                 child.name, flags=re.IGNORECASE)
+            if match:
+                folders.append((child, float(match[1]), True))
+            elif child.name.lower().startswith('z_'):
+                raise ValueError(f"Invalid z folder (expected e.g. z_+0.5 in mm): {child}")
+
+        path_map = {}
+        for folder, z_mm, has_z in folders:
+            for path in sorted(folder.glob('*.npy')):
+                key = (z_mm, self._normalized_stem(path))
+                if key in path_map:
+                    raise ValueError(f"Duplicate (z, pattern) {key}: {path_map[key][0]} and {path}")
+                path_map[key] = (path, has_z)
+        return path_map
+
+    def _discover_workflow_samples(self):
+        field_map = self._path_map_by_z_and_stem(self.workflow_field_dir)
+        camera_map = self._path_map_by_z_and_stem(self.workflow_camera_dir)
+        phase_map = (self._path_map_by_z_and_stem(self.workflow_phase_dir, shared_phase=True)
+                     if self.use_slm_phase else {})
+
+        common_ids = sorted(set(field_map) & set(camera_map))
+        samples = []
+        missing_phase = []
+        for z_mm, pattern_id in common_ids:
+            key = (z_mm, pattern_id)
+            phase_entry = phase_map.get(key, phase_map.get((None, pattern_id)))
+            if self.use_slm_phase and phase_entry is None:
+                missing_phase.append(key)
+                continue
+            has_z = field_map[key][1] or camera_map[key][1]
+            sample_id = f'{pattern_id}__z_{z_mm:+g}mm' if has_z else pattern_id
+            samples.append({
+                'id': sample_id,
+                'pattern_id': pattern_id,
+                'z_mm': z_mm,
+                'field': field_map[key][0],
+                'camera': camera_map[key][0],
+                'phase': phase_entry[0] if phase_entry else None,
+            })
+
+        missing_camera = sorted(set(field_map) - set(camera_map))
+        missing_field = sorted(set(camera_map) - set(field_map))
+        if missing_camera:
+            print(f">>> Workflow samples with simulation but no camera: {len(missing_camera)}")
+            print(f">>>   first (z_mm, pattern): {missing_camera[:8]}")
+        if missing_field:
+            print(f">>> Workflow samples with camera but no simulation: {len(missing_field)}")
+            print(f">>>   first (z_mm, pattern): {missing_field[:8]}")
+        if missing_phase:
+            raise FileNotFoundError(f"SLM phase required but missing for {len(missing_phase)} pairs: "
+                                    f"{missing_phase[:8]}")
+        return samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _validate_scale_mode(self, mode, name):
+        if mode not in self.valid_scale_modes:
+            valid = ', '.join(sorted(self.valid_scale_modes))
+            raise ValueError(f"{name} must be one of {{{valid}}}; got {mode}")
+
+    def _resize_chw(self, tensor, target_size, mode='bilinear'):
+        if tensor.shape[-2:] == (target_size, target_size):
+            return tensor
+        kwargs = {'mode': mode}
+        if mode in ('bilinear', 'bicubic'):
+            kwargs['align_corners'] = False
+        return F.interpolate(tensor.unsqueeze(0), size=(target_size, target_size),
+                             **kwargs).squeeze(0)
+
+    def _normalize_unit(self, arr, eps=1e-8):
+        arr = np.nan_to_num(np.asarray(arr, dtype=np.float32))
+        min_v = float(arr.min())
+        max_v = float(arr.max())
+        if min_v < 0.0 or max_v > 1.0:
+            arr = arr - min_v
+            max_v = float(arr.max())
+            arr = arr / (max_v + eps)
+        return np.clip(arr, 0.0, 1.0).astype(np.float32)
+
+    def _center_crop_2d(self, arr, source_name='array'):
+        arr = np.asarray(arr)
+        if arr.ndim != 2:
+            raise ValueError(f"{source_name} must be 2D before FOV cropping; got {arr.shape}")
+        if self.fov_crop_size is None:
+            return arr
+
+        crop = self.fov_crop_size
+        height, width = arr.shape
+        if crop > height or crop > width:
+            raise ValueError(
+                f"fov_crop_size={crop} exceeds {source_name} shape {arr.shape}"
+            )
+        y0 = (height - crop) // 2
+        x0 = (width - crop) // 2
+        return arr[y0:y0 + crop, x0:x0 + crop]
+
+    def _split_channel_array(self, arr):
+        if arr.ndim != 3:
+            return None
+        if arr.shape[0] in (2, 3):
+            return arr
+        if arr.shape[-1] in (2, 3):
+            return np.moveaxis(arr, -1, 0)
+        return None
+
+    def _crop_field_array(self, arr, source_name):
+        if self.field_input_size is None:
+            return self._center_crop_2d(arr, source_name=source_name)
+        arr = np.asarray(arr)
+        n = self.field_input_size
+        if arr.ndim != 2 or min(arr.shape) < n:
+            raise ValueError(f'Native optical field needs {n}x{n}; {source_name} has {arr.shape}')
+        if any((length-n) % 2 for length in arr.shape):
+            raise ValueError('Native optical input crop must preserve center-pixel parity')
+        y, x = (arr.shape[0]-n)//2, (arr.shape[1]-n)//2
+        return arr[y:y+n, x:x+n]
+
+    def _load_camera_array(self, path):
+        if path.suffix.lower() != '.npy':
+            raise ValueError(f"Camera files must be .npy in workflow layout; got {path}")
+        arr = np.load(path)
+        if np.iscomplexobj(arr):
+            arr = np.abs(arr) ** 2
+        arr = np.squeeze(arr)
+        if arr.ndim != 2:
+            raise ValueError(f"{path} must be 2D camera data; got {arr.shape}")
+        if self.field_input_size is not None and any((n - self.sim_size) % 2 for n in arr.shape):
+            raise ValueError('Native optical camera crop must preserve pixel-center parity')
+        arr = self._center_crop_2d(arr, source_name=f"camera {path.name}")
+        return np.nan_to_num(arr.astype(np.float32))
+
+    def _camera_to_training_scale(self, arr, eps=1e-8):
+        arr = np.nan_to_num(np.asarray(arr, dtype=np.float32))
+        if self.camera_scale_mode == 'sample_norm':
+            return self._normalize_unit(arr, eps=eps)
+
+        arr = arr - float(self.camera_black_level)
+        arr = np.clip(arr, 0.0, None)
+        if self.camera_scale_mode == 'global_percentile':
+            return (arr / (float(self.camera_scale) + eps)).astype(np.float32)
+        if self.camera_scale_mode == 'raw':
+            return arr.astype(np.float32)
+        raise RuntimeError(f"Unhandled camera_scale_mode: {self.camera_scale_mode}")
+
+    def _load_camera(self, path):
+        arr = self._camera_to_training_scale(self._load_camera_array(path))
+        cam = torch.from_numpy(arr).unsqueeze(0)
+        if self.field_input_size is not None:
+            if tuple(arr.shape) != (self.sim_size, self.sim_size):
+                raise ValueError('Shared optical camera ROI must be native model_size pixels; '
+                                 f'got {arr.shape}, expected {self.sim_size}x{self.sim_size}')
+            return cam.float()
+        return self._resize_chw(cam, self.sim_size, mode='bilinear').float()
+
+    def _extract_field_amplitude(self, field_arr):
+        field_arr = np.squeeze(field_arr)
+        if np.iscomplexobj(field_arr):
+            return np.abs(field_arr).astype(np.float32)
+
+        arr = np.asarray(field_arr, dtype=np.float32)
+        chw = self._split_channel_array(arr)
+        if chw is None:
+            intensity = self._normalize_unit(arr) if self.field_scale_mode == 'sample_norm' else np.clip(arr, 0.0, None)
+            return np.sqrt(intensity).astype(np.float32)
+        if chw.shape[0] == 2:
+            return np.sqrt(chw[0].astype(np.float32) ** 2 + chw[1].astype(np.float32) ** 2)
+        return chw[0].astype(np.float32)
+
+    def _scale_values(self, arr, rng):
+        values = np.asarray(arr).reshape(-1)
+        values = values[np.isfinite(values)]
+        cap = self.scale_max_pixels_per_sample
+        if cap is not None and values.size > cap:
+            # A fixed RNG makes the bounded global-percentile estimate reproducible.
+            values = values[rng.choice(values.size, size=cap, replace=False)]
+        return values
+
+    def _compute_global_camera_scale(self, eps=1e-8, indices=None):
+        values = []
+        rng = np.random.default_rng(0)
+        samples = self.samples if indices is None else [self.samples[int(i)] for i in indices]
+        for s in samples:
+            arr = self._load_camera_array(s['camera']) - float(self.camera_black_level)
+            arr = np.clip(arr, 0.0, None)
+            finite = self._scale_values(arr, rng)
+            if finite.size:
+                values.append(finite.reshape(-1))
+        if not values:
+            return 1.0
+        return max(float(np.percentile(np.concatenate(values), self.camera_percentile)), eps)
+
+    def _compute_global_field_amp_scale(self, eps=1e-8, indices=None):
+        values = []
+        rng = np.random.default_rng(0)
+        samples = self.samples if indices is None else [self.samples[int(i)] for i in indices]
+        for s in samples:
+            arr = np.load(s['field'])
+            amp = self._extract_field_amplitude(arr)
+            amp = self._center_crop_2d(amp, source_name=f"field amplitude {s['field'].name}")
+            finite = self._scale_values(amp, rng)
+            if finite.size:
+                values.append(finite.reshape(-1))
+        if not values:
+            return 1.0
+        return max(float(np.percentile(np.concatenate(values), self.field_amp_percentile)), eps)
+
+    def _scale_field_amplitude(self, amp, eps=1e-8):
+        amp = np.clip(np.nan_to_num(np.asarray(amp, dtype=np.float32)), 0.0, None)
+        if self.field_scale_mode == 'sample_norm':
+            scale = float(np.percentile(amp, self.field_amp_percentile))
+            return np.clip(amp / (scale + eps), 0.0, 1.0).astype(np.float32)
+        if self.field_scale_mode == 'global_percentile':
+            return (amp / (float(self.field_amp_scale) + eps)).astype(np.float32)
+        if self.field_scale_mode == 'raw':
+            return amp.astype(np.float32)
+        raise RuntimeError(f"Unhandled field_scale_mode: {self.field_scale_mode}")
+
+    def _field_to_channels(self, field_arr, eps=1e-8):
+        field_arr = np.squeeze(field_arr)
+
+        if np.iscomplexobj(field_arr):
+            if field_arr.ndim != 2:
+                raise ValueError(f"Complex simulation field must be 2D; got {field_arr.shape}")
+            amp = np.abs(field_arr).astype(np.float32)
+            phase = np.angle(field_arr).astype(np.float32)
+            cos_p = np.cos(phase).astype(np.float32)
+            sin_p = np.sin(phase).astype(np.float32)
+        else:
+            arr = np.asarray(field_arr, dtype=np.float32)
+            chw = self._split_channel_array(arr)
+            if chw is None:
+                if arr.ndim != 2:
+                    raise ValueError(f"Simulation field must be 2D, 2ch, or 3ch; got {arr.shape}")
+                intensity = self._normalize_unit(arr) if self.field_scale_mode == 'sample_norm' else np.clip(arr, 0.0, None)
+                amp = np.sqrt(intensity).astype(np.float32)
+                cos_p = np.ones_like(amp, dtype=np.float32)
+                sin_p = np.zeros_like(amp, dtype=np.float32)
+            elif chw.shape[0] == 2:
+                real = chw[0].astype(np.float32)
+                imag = chw[1].astype(np.float32)
+                amp = np.sqrt(real ** 2 + imag ** 2)
+                phase = np.arctan2(imag, real)
+                cos_p = np.cos(phase).astype(np.float32)
+                sin_p = np.sin(phase).astype(np.float32)
+            else:
+                amp = chw[0].astype(np.float32)
+                cos_p = chw[1].astype(np.float32)
+                sin_p = chw[2].astype(np.float32)
+
+        amp = self._crop_field_array(amp, source_name='field amplitude')
+        cos_p = self._crop_field_array(cos_p, source_name='field phase cosine')
+        sin_p = self._crop_field_array(sin_p, source_name='field phase sine')
+        amp = self._scale_field_amplitude(amp, eps=eps)
+        field = torch.from_numpy(np.stack([amp, cos_p, sin_p], axis=0))
+        if self.field_input_size is None:
+            field = self._resize_chw(field, self.sim_size, mode='bilinear')
+
+        phase_norm = torch.sqrt(field[1:2] ** 2 + field[2:3] ** 2).clamp_min(1e-6)
+        field[1:3] = field[1:3] / phase_norm
+        field[0:1] = field[0:1].clamp_min(0.0)
+        sim_intensity = field[0:1].pow(2).clamp_min(0.0)
+        return field.float(), sim_intensity.float()
+
+    def _load_field(self, path):
+        if path.suffix.lower() != '.npy':
+            raise ValueError(f"Simulation field files must be .npy in workflow layout; got {path}")
+        arr = np.load(path)
+        return self._field_to_channels(arr)
+
+    def _load_phase(self, path):
+        phase = np.load(path).astype(np.float32)
+        if self.phase_flip_lr:
+            phase = phase[:, ::-1].copy()
+        phase_rad = phase * (2 * np.pi / 1023.0)
+        return torch.from_numpy(phase_rad).unsqueeze(0).float()
+
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        field, sim = self._load_field(s['field'])
+        return {
+            'field': field,
+            'sim': sim,
+            # Keep the existing batching/predict_camera API when phase is disabled.
+            'phase': (self._load_phase(s['phase']) if self.use_slm_phase
+                      else torch.zeros(1, 1, 1)),
+            'camera': self._load_camera(s['camera']),
+            'id': s['id'],
+            'pattern_id': s['pattern_id'],
+            'z_mm': s['z_mm'],
+        }
+
+
+# ---------------------------------------------------------------------------
+# FNO model
+# ---------------------------------------------------------------------------
+
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, modes_y=32, modes_x=32):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes_y = int(modes_y)
+        self.modes_x = int(modes_x)
+        scale = 1.0 / math.sqrt(in_channels * out_channels)
+        self.weight_pos = nn.Parameter(
+            scale * torch.randn(in_channels, out_channels,
+                                self.modes_y, self.modes_x, dtype=torch.cfloat)
+        )
+        self.weight_neg = nn.Parameter(
+            scale * torch.randn(in_channels, out_channels,
+                                self.modes_y, self.modes_x, dtype=torch.cfloat)
+        )
+
+    def _compl_mul2d(self, x, weights):
+        return torch.einsum("bixy,ioxy->boxy", x, weights)
+
+    def forward(self, x):
+        batch, _, height, width = x.shape
+        x_ft = torch.fft.rfft2(x, norm='ortho')
+        out_ft = torch.zeros(
+            batch, self.out_channels, height, width // 2 + 1,
+            device=x.device, dtype=torch.cfloat,
+        )
+
+        my = min(self.modes_y, height)
+        mx = min(self.modes_x, width // 2 + 1)
+        out_ft[:, :, :my, :mx] = self._compl_mul2d(
+            x_ft[:, :, :my, :mx],
+            self.weight_pos[:, :, :my, :mx],
+        )
+        out_ft[:, :, -my:, :mx] = self._compl_mul2d(
+            x_ft[:, :, -my:, :mx],
+            self.weight_neg[:, :, :my, :mx],
+        )
+        return torch.fft.irfft2(out_ft, s=(height, width), norm='ortho')
+
+
+class FNOBlock2d(nn.Module):
+    def __init__(self, width, modes_y, modes_x, groups=4):
+        super().__init__()
+        self.spectral = SpectralConv2d(width, width, modes_y, modes_x)
+        self.local = nn.Conv2d(width, width, kernel_size=1)
+        self.norm = nn.GroupNorm(min(groups, width), width)
+
+    def forward(self, x):
+        x = self.spectral(x) + self.local(x)
+        x = self.norm(x)
+        return F.gelu(x)
+
+
+class AxiconFNO2d(nn.Module):
+    def __init__(self, in_ch, out_ch=1, width=32, modes_y=32, modes_x=32,
+                 depth=5, mlp_width=128):
+        super().__init__()
+        self.lift = nn.Sequential(
+            nn.Conv2d(in_ch, width, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(width, width, kernel_size=1),
+        )
+        self.blocks = nn.ModuleList([
+            FNOBlock2d(width, modes_y, modes_x)
+            for _ in range(depth)
+        ])
+        self.project = nn.Sequential(
+            nn.Conv2d(width, mlp_width, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(mlp_width, out_ch, kernel_size=1),
+        )
+
+    def forward(self, x):
+        x = self.lift(x)
+        for block in self.blocks:
+            x = block(x)
+        return self.project(x)
+
+
+# ---------------------------------------------------------------------------
+# Conditioning / prediction
+# ---------------------------------------------------------------------------
+
+def resize_batch(x, size, mode='bilinear'):
+    if x.shape[-2:] == (size, size):
+        return x
+    kwargs = {'mode': mode}
+    if mode in ('bilinear', 'bicubic'):
+        kwargs['align_corners'] = False
+    return F.interpolate(x, size=(size, size), **kwargs)
+
+
+def make_grid(batch, height, width, device, dtype, radial=True):
+    yy = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
+    xx = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype)
+    y, x = torch.meshgrid(yy, xx, indexing='ij')
+    channels = [x, y]
+    if radial:
+        r = torch.sqrt(x ** 2 + y ** 2)
+        channels.append(r)
+    grid = torch.stack(channels, dim=0).unsqueeze(0)
+    return grid.repeat(batch, 1, 1, 1)
+
+
+def make_axicon_phase_channels(batch, height, width, device, dtype,
+                               slope_rad_per_pixel=None):
+    if slope_rad_per_pixel is None:
+        return None
+    yy = torch.arange(height, device=device, dtype=dtype) - (height - 1) / 2
+    xx = torch.arange(width, device=device, dtype=dtype) - (width - 1) / 2
+    y, x = torch.meshgrid(yy, xx, indexing='ij')
+    phase = slope_rad_per_pixel * torch.sqrt(x ** 2 + y ** 2)
+    ax = torch.stack([torch.cos(phase), torch.sin(phase)], dim=0).unsqueeze(0)
+    return ax.repeat(batch, 1, 1, 1)
+
+
+def make_radial_mask(batch, height, width, device, dtype,
+                     radius=None, width_param=None):
+    if radius is None or width_param is None or width_param <= 0:
+        return None
+    yy = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
+    xx = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype)
+    y, x = torch.meshgrid(yy, xx, indexing='ij')
+    r = torch.sqrt(x ** 2 + y ** 2)
+    mask = torch.exp(-0.5 * ((r - float(radius)) / float(width_param)) ** 2)
+    return mask.unsqueeze(0).unsqueeze(0).repeat(batch, 1, 1, 1)
+
+
+def condition_slm_phase(phase, target_size,
+                        weight=1.0,
+                        lowpass_size=None,
+                        ring_radius=None,
+                        ring_width=None):
+    """
+    Build SLM phase conditioning channels without letting the full phase map
+    dominate as a spatial shortcut.
+
+    Phase is converted to cos/sin before any resizing/low-pass operation to
+    avoid wrap discontinuities. Use weight < 1 or disable SLM phase entirely
+    when the phase pattern starts imprinting onto the predicted camera image.
+    """
+    phase_cos = torch.cos(phase)
+    phase_sin = torch.sin(phase)
+
+    if lowpass_size is not None and int(lowpass_size) > 0 and int(lowpass_size) < target_size:
+        low = int(lowpass_size)
+        phase_cos = resize_batch(phase_cos, low, mode='bilinear')
+        phase_sin = resize_batch(phase_sin, low, mode='bilinear')
+
+    phase_cos = resize_batch(phase_cos, target_size, mode='bilinear')
+    phase_sin = resize_batch(phase_sin, target_size, mode='bilinear')
+
+    phase_norm = torch.sqrt(phase_cos ** 2 + phase_sin ** 2).clamp_min(1e-6)
+    phase_ch = torch.cat([phase_cos / phase_norm, phase_sin / phase_norm], dim=1)
+
+    mask = make_radial_mask(
+        phase_ch.shape[0], target_size, target_size,
+        phase_ch.device, phase_ch.dtype,
+        radius=ring_radius, width_param=ring_width,
+    )
+    if mask is not None:
+        phase_ch = phase_ch * mask
+
+    return float(weight) * phase_ch
+
+
+def build_fno_input(field, phase,
+                    use_slm_phase=True,
+                    slm_phase_weight=1.0,
+                    slm_phase_lowpass_size=None,
+                    slm_phase_ring_radius=None,
+                    slm_phase_ring_width=None,
+                    use_grid=True,
+                    use_radial_coord=True,
+                    use_axicon_phase_map=False,
+                    axicon_slope_rad_per_pixel=None):
+    batch, _, height, width = field.shape
+    pieces = [field, field[:, 0:1].pow(2).clamp_min(0.0)]
+
+    if use_slm_phase:
+        pieces.append(condition_slm_phase(
+            phase, height,
+            weight=slm_phase_weight,
+            lowpass_size=slm_phase_lowpass_size,
+            ring_radius=slm_phase_ring_radius,
+            ring_width=slm_phase_ring_width,
+        ))
+
+    if use_grid:
+        pieces.append(make_grid(batch, height, width, field.device, field.dtype,
+                                radial=use_radial_coord))
+
+    if use_axicon_phase_map:
+        ax = make_axicon_phase_channels(
+            batch, height, width, field.device, field.dtype,
+            slope_rad_per_pixel=axicon_slope_rad_per_pixel,
+        )
+        if ax is not None:
+            pieces.append(ax)
+
+    return torch.cat(pieces, dim=1)
+
+
+def field_to_real_imag(field):
+    amp = field[:, 0:1].clamp_min(0.0)
+    phase_vec = field[:, 1:3]
+    phase_norm = torch.sqrt((phase_vec ** 2).sum(dim=1, keepdim=True)).clamp_min(1e-6)
+    cos_p = phase_vec[:, 0:1] / phase_norm
+    sin_p = phase_vec[:, 1:2] / phase_norm
+    return amp * cos_p, amp * sin_p
+
+
+def scale_direct_field(raw_out, sim_field,
+                       field_out_scale=4.0,
+                       field_out_scale_mode='field_rms',
+                       activation='tanh',
+                       noise_std=0.0):
+    if activation == 'tanh':
+        e_out = torch.tanh(raw_out[:, 0:2])
+    elif activation == 'softsign':
+        e_out = F.softsign(raw_out[:, 0:2])
+    elif activation == 'linear':
+        e_out = raw_out[:, 0:2]
+    else:
+        raise ValueError(f"Unknown direct field activation: {activation}")
+
+    sim_real, sim_imag = field_to_real_imag(sim_field)
+    if field_out_scale_mode == 'field_rms':
+        sim_power = sim_real ** 2 + sim_imag ** 2
+        scale = field_out_scale * torch.sqrt(
+            sim_power.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-12)
+        )
+    elif field_out_scale_mode == 'absolute':
+        scale = float(field_out_scale)
+    else:
+        raise ValueError(f"Unknown field_out_scale_mode: {field_out_scale_mode}")
+
+    e_out = scale * e_out
+    if noise_std and noise_std > 0:
+        e_out = e_out + (noise_std * scale) * torch.randn_like(e_out)
+    return e_out
+
+
+def model_architecture(cfg):
+    name = cfg.get('architecture', 'fno')
+    if name not in {'fno', 'shared_optical'}:
+        raise ValueError(f'Unknown architecture={name!r}; use fno or shared_optical')
+    return name
+
+
+def predict_camera(model, field, phase, cfg, train_noise=False):
+    if model_architecture(cfg) == 'shared_optical':
+        # Includes the model's intensity gain/background exactly once. The
+        # second return is the coherent field only, before adding background.
+        return model.predict_camera(field)
+    x = build_fno_input(
+        field, phase,
+        use_slm_phase=cfg['use_slm_phase'],
+        slm_phase_weight=cfg['slm_phase_weight'],
+        slm_phase_lowpass_size=cfg['slm_phase_lowpass_size'],
+        slm_phase_ring_radius=cfg['slm_phase_ring_radius'],
+        slm_phase_ring_width=cfg['slm_phase_ring_width'],
+        use_grid=cfg['use_grid'],
+        use_radial_coord=cfg['use_radial_coord'],
+        use_axicon_phase_map=cfg['use_axicon_phase_map'],
+        axicon_slope_rad_per_pixel=cfg['axicon_slope_rad_per_pixel'],
+    )
+    raw = model(x)
+
+    if cfg['prediction_mode'] == 'intensity':
+        if cfg['intensity_activation'] == 'softplus':
+            pred = F.softplus(raw[:, 0:1])
+        elif cfg['intensity_activation'] == 'relu':
+            pred = F.relu(raw[:, 0:1])
+        elif cfg['intensity_activation'] == 'square':
+            pred = raw[:, 0:1].pow(2)
+        elif cfg['intensity_activation'] == 'linear_clamp':
+            pred = raw[:, 0:1].clamp_min(0.0)
+        else:
+            raise ValueError(f"Unknown intensity_activation: {cfg['intensity_activation']}")
+        field_like = raw[:, 0:1]
+    elif cfg['prediction_mode'] == 'direct_field':
+        e_out = scale_direct_field(
+            raw, field,
+            field_out_scale=cfg['field_out_scale'],
+            field_out_scale_mode=cfg['field_out_scale_mode'],
+            activation=cfg['direct_field_activation'],
+            noise_std=cfg['direct_field_noise_std'] if train_noise else 0.0,
+        )
+        pred = e_out[:, 0:1].pow(2) + e_out[:, 1:2].pow(2)
+        field_like = e_out
+    elif cfg['prediction_mode'] == 'residual_field':
+        sim_real, sim_imag = field_to_real_imag(field)
+        delta_e = scale_direct_field(
+            raw, field,
+            field_out_scale=cfg['field_out_scale'],
+            field_out_scale_mode=cfg['field_out_scale_mode'],
+            activation=cfg['direct_field_activation'],
+            noise_std=cfg['direct_field_noise_std'] if train_noise else 0.0,
+        )
+        alpha = float(cfg.get('residual_field_alpha', 1.0))
+        e_real = sim_real + alpha * delta_e[:, 0:1]
+        e_imag = sim_imag + alpha * delta_e[:, 1:2]
+        pred = e_real.pow(2) + e_imag.pow(2)
+        field_like = torch.cat([e_real, e_imag], dim=1)
+    else:
+        raise ValueError(f"Unknown prediction_mode: {cfg['prediction_mode']}")
+
+    return pred.clamp_min(0.0), field_like
+
+
+def center_roi_bounds(height, width, fraction):
+    if fraction is None:
+        return 0, height, 0, width
+    fraction = float(fraction)
+    if fraction <= 0:
+        raise ValueError(f"ROI fraction must be > 0 or None; got {fraction}")
+    if fraction >= 1:
+        return 0, height, 0, width
+
+    roi_h = max(1, int(round(height * fraction)))
+    roi_w = max(1, int(round(width * fraction)))
+    y0 = (height - roi_h) // 2
+    x0 = (width - roi_w) // 2
+    return y0, y0 + roi_h, x0, x0 + roi_w
+
+
+def crop_center_roi(x, fraction):
+    y0, y1, x0, x1 = center_roi_bounds(x.shape[-2], x.shape[-1], fraction)
+    return x[..., y0:y1, x0:x1]
+
+
+def apply_loss_roi(pred, target, fraction):
+    if fraction is None or float(fraction) >= 1.0:
+        return pred, target
+    return crop_center_roi(pred, fraction), crop_center_roi(target, fraction)
+
+
+def infer_input_channels(use_slm_phase=True, use_grid=True,
+                         use_radial_coord=True, use_axicon_phase_map=False,
+                         axicon_slope_rad_per_pixel=None):
+    ch = 4  # amp/cos/sin + sim intensity
+    if use_slm_phase:
+        ch += 2
+    if use_grid:
+        ch += 3 if use_radial_coord else 2
+    if use_axicon_phase_map and axicon_slope_rad_per_pixel is not None:
+        ch += 2
+    return ch
+
+
+# ---------------------------------------------------------------------------
+# Losses / metrics
+# ---------------------------------------------------------------------------
+
+def per_image_standardize(x, eps=1e-6):
+    mean = x.mean(dim=(-2, -1), keepdim=True)
+    std = x.std(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    return (x - mean) / std
+
+
+def log_display_tensor(x, eps=1e-6):
+    x = x.clamp_min(0.0)
+    scale = x.mean(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    return per_image_standardize(torch.log1p(x / scale), eps=eps)
+
+
+def mean_per_sample(x):
+    return x.flatten(start_dim=1).mean(dim=1)
+
+
+def gradient_loss_per_sample(pred, target):
+    pred_dx = pred[..., :, 1:] - pred[..., :, :-1]
+    pred_dy = pred[..., 1:, :] - pred[..., :-1, :]
+    target_dx = target[..., :, 1:] - target[..., :, :-1]
+    target_dy = target[..., 1:, :] - target[..., :-1, :]
+    return (mean_per_sample(torch.abs(pred_dx - target_dx)) +
+            mean_per_sample(torch.abs(pred_dy - target_dy)))
+
+
+def gradient_loss(pred, target):
+    return gradient_loss_per_sample(pred, target).mean()
+
+
+def simple_ssim_loss_per_sample(pred, target, window=11,
+                                c1=0.01 ** 2, c2=0.03 ** 2):
+    pad = window // 2
+    mu_x = F.avg_pool2d(pred, window, stride=1, padding=pad)
+    mu_y = F.avg_pool2d(target, window, stride=1, padding=pad)
+    sigma_x = F.avg_pool2d(pred * pred, window, stride=1, padding=pad) - mu_x ** 2
+    sigma_y = F.avg_pool2d(target * target, window, stride=1, padding=pad) - mu_y ** 2
+    sigma_xy = F.avg_pool2d(pred * target, window, stride=1, padding=pad) - mu_x * mu_y
+    ssim = ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)) / (
+        (mu_x ** 2 + mu_y ** 2 + c1) * (sigma_x + sigma_y + c2) + 1e-8
+    )
+    return mean_per_sample(1.0 - ssim.clamp(-1.0, 1.0))
+
+
+def simple_ssim_loss(pred, target, window=11, c1=0.01 ** 2, c2=0.03 ** 2):
+    return simple_ssim_loss_per_sample(
+        pred, target, window=window, c1=c1, c2=c2).mean()
+
+
+def highpass(x, kernel_size=31):
+    pad = kernel_size // 2
+    low = F.avg_pool2d(F.pad(x, (pad, pad, pad, pad), mode='reflect'),
+                       kernel_size, stride=1)
+    return x - low
+
+
+def fft_texture_loss_per_sample(pred, target, highpass_kernel=31):
+    pred_hp = highpass(pred, kernel_size=highpass_kernel)
+    target_hp = highpass(target, kernel_size=highpass_kernel)
+    pred_mag = torch.log1p(torch.abs(torch.fft.rfft2(pred_hp, norm='ortho')))
+    target_mag = torch.log1p(torch.abs(torch.fft.rfft2(target_hp, norm='ortho')))
+    return mean_per_sample(torch.abs(
+        per_image_standardize(pred_mag) - per_image_standardize(target_mag)))
+
+
+def fft_texture_loss(pred, target, highpass_kernel=31):
+    return fft_texture_loss_per_sample(
+        pred, target, highpass_kernel=highpass_kernel).mean()
+
+
+def bright_excess_loss_per_sample(pred, target, margin=0.10,
+                                  top_fraction=0.002, eps=1e-6):
+    """
+    Penalize small, very bright hallucinations that visual/log losses can miss.
+
+    The threshold follows the local target plus a per-image mean margin, so real
+    bright camera structures are allowed while predicted-only hot spots are not.
+    """
+    scale = target.mean(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    excess = F.relu(pred - target - float(margin) * scale) / scale
+    excess = excess.pow(2).flatten(start_dim=1)
+    if top_fraction is not None and top_fraction > 0:
+        k = max(1, int(excess.shape[1] * float(top_fraction)))
+        excess = torch.topk(excess, k=k, dim=1).values
+    return excess.mean(dim=1)
+
+
+def bright_excess_loss(pred, target, margin=0.10, top_fraction=0.002, eps=1e-6):
+    return bright_excess_loss_per_sample(
+        pred, target, margin=margin, top_fraction=top_fraction, eps=eps).mean()
+
+
+def dark_deficit_loss_per_sample(pred, target, margin=0.10,
+                                 top_fraction=0.002, eps=1e-6):
+    """
+    Penalize small, very dark hallucinations such as local pore artifacts.
+
+    This is the symmetric counterpart to bright_excess_loss.
+    """
+    scale = target.mean(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    deficit = F.relu(target - pred - float(margin) * scale) / scale
+    deficit = deficit.pow(2).flatten(start_dim=1)
+    if top_fraction is not None and top_fraction > 0:
+        k = max(1, int(deficit.shape[1] * float(top_fraction)))
+        deficit = torch.topk(deficit, k=k, dim=1).values
+    return deficit.mean(dim=1)
+
+
+def dark_deficit_loss(pred, target, margin=0.10, top_fraction=0.002, eps=1e-6):
+    return dark_deficit_loss_per_sample(
+        pred, target, margin=margin, top_fraction=top_fraction, eps=eps).mean()
+
+
+def target_mean_normalized_smooth_l1_loss_per_sample(pred, target, eps=1e-6):
+    scale = target.mean(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    loss_map = F.smooth_l1_loss(pred / scale, target / scale, reduction='none')
+    return mean_per_sample(loss_map)
+
+
+def target_mean_normalized_smooth_l1_loss(pred, target, eps=1e-6):
+    return target_mean_normalized_smooth_l1_loss_per_sample(
+        pred, target, eps=eps).mean()
+
+
+def visual_loss_per_sample(pred, target,
+                           w_log_display_smooth_l1=0.0, w_ssim=1.0,
+                           w_grad=0.1, w_fft=0.0,
+                           w_mean_norm_l1=1.0, w_peak=0.0, w_dark=0.0,
+                           peak_margin=0.10, peak_top_fraction=0.002,
+                           dark_margin=0.10, dark_top_fraction=0.002,
+                           loss_version=1, loss_scale_floor=None,
+                           loss_display_transform='log1p'):
+    # Unversioned callers/checkpoints retain their exact historical objective.
+    # New training explicitly selects v2 and supplies train-only calibration.
+    if loss_version == 2:
+        from fno_losses import camera_loss_v2_per_sample
+        if loss_scale_floor is None:
+            raise ValueError('Loss v2 needs a positive, train-calibrated loss_scale_floor')
+        return camera_loss_v2_per_sample(
+            pred, target, scale_floor=loss_scale_floor,
+            w_log_display_smooth_l1=w_log_display_smooth_l1,
+            w_ssim=w_ssim, w_grad=w_grad, w_fft=w_fft,
+            w_mean_norm_l1=w_mean_norm_l1, w_peak=w_peak, w_dark=w_dark,
+            peak_margin=peak_margin, peak_top_fraction=peak_top_fraction,
+            dark_margin=dark_margin, dark_top_fraction=dark_top_fraction,
+            display_transform=loss_display_transform,
+        )
+    if loss_version != 1:
+        raise ValueError(f'Unsupported loss_version: {loss_version}')
+    pred_d = target_d = None
+    if w_log_display_smooth_l1 > 0 or w_ssim > 0 or w_grad > 0 or w_fft > 0:
+        pred_d = log_display_tensor(pred)
+        target_d = log_display_tensor(target)
+
+    zeros = pred.new_zeros(pred.shape[0])
+    log_display_smooth_l1 = (
+        mean_per_sample(F.smooth_l1_loss(pred_d, target_d, reduction='none'))
+        if w_log_display_smooth_l1 > 0 else zeros
+    )
+    ssim = simple_ssim_loss_per_sample(pred_d, target_d) if w_ssim > 0 else zeros
+    grad = gradient_loss_per_sample(pred_d, target_d) if w_grad > 0 else zeros
+    fft = fft_texture_loss_per_sample(pred_d, target_d) if w_fft > 0 else zeros
+    mean_norm_l1 = (
+        target_mean_normalized_smooth_l1_loss_per_sample(pred, target)
+        if w_mean_norm_l1 > 0 else zeros
+    )
+    peak = bright_excess_loss_per_sample(
+        pred, target,
+        margin=peak_margin,
+        top_fraction=peak_top_fraction,
+    ) if w_peak > 0 else zeros
+    dark = dark_deficit_loss_per_sample(
+        pred, target,
+        margin=dark_margin,
+        top_fraction=dark_top_fraction,
+    ) if w_dark > 0 else zeros
+    total = (w_log_display_smooth_l1 * log_display_smooth_l1 +
+             w_ssim * ssim + w_grad * grad + w_fft * fft +
+             w_mean_norm_l1 * mean_norm_l1 +
+             w_peak * peak + w_dark * dark)
+    return total, {
+        'log_display_smooth_l1': log_display_smooth_l1,
+        'ssim': ssim,
+        'grad': grad,
+        'fft': fft,
+        'mean_norm_l1': mean_norm_l1,
+        'peak': peak,
+        'dark': dark,
+        'raw_mse': mean_per_sample((pred - target).pow(2)),
+    }
+
+
+def visual_loss(pred, target, **kwargs):
+    per_sample_loss, per_sample_comps = visual_loss_per_sample(
+        pred, target, **kwargs)
+    return per_sample_loss.mean(), {
+        key: value.mean().item() for key, value in per_sample_comps.items()
+    }
+
+
+def loss_kwargs_from_config(cfg):
+    """One loss definition for training, validation and checkpoint evaluation."""
+    defaults = dict(
+        w_log_display_smooth_l1=0.0, w_ssim=1.0, w_grad=0.1, w_fft=0.0,
+        w_mean_norm_l1=1.0, w_peak=0.0, w_dark=0.0,
+        peak_margin=0.10, peak_top_fraction=0.002,
+        dark_margin=0.10, dark_top_fraction=0.002,
+        loss_version=1, loss_scale_floor=None, loss_display_transform='log1p',
+    )
+    return {key: cfg.get(key, default) for key, default in defaults.items()}
+
+
+def calibrate_training_scales(dataset, train_idx, cfg,
+                              fit_camera_scale=True, fit_field_scale=True):
+    """Fit normalization, loss floor and optional global field gain on TRAIN only.
+
+    The global linear field gain controls optimization units, not the output
+    range. Unlike sample-RMS times tanh, it cannot exclude a camera intensity.
+    All resolved values are saved in cfg; evaluation must reuse them verbatim.
+    """
+    indices = sorted(set(int(i) for i in train_idx))
+    if not indices or indices[0] < 0 or indices[-1] >= len(dataset):
+        raise ValueError('Calibration needs nonempty, valid training indices')
+    if fit_camera_scale and dataset.camera_scale_mode == 'global_percentile':
+        dataset.camera_scale = dataset._compute_global_camera_scale(indices=indices)
+    if fit_field_scale and dataset.field_scale_mode == 'global_percentile':
+        dataset.field_amp_scale = dataset._compute_global_field_amp_scale(indices=indices)
+    optical = model_architecture(cfg) == 'shared_optical'
+    means = []
+    field_means = []
+    for idx in indices:
+        camera = dataset._load_camera(dataset.samples[idx]['camera']).unsqueeze(0)
+        camera = resize_batch(camera, cfg['model_size'])
+        camera = crop_center_roi(camera, cfg.get('loss_roi_fraction', 1.0))
+        means.append(float(camera.mean()))
+        if optical and cfg.get('optical_intensity_gain') is None:
+            field, _ = dataset._load_field(dataset.samples[idx]['field'])
+            intensity = native_center_crop(field[None, 0:1].square(), cfg['model_size'])
+            intensity = crop_center_roi(intensity, cfg.get('loss_roi_fraction', 1.0))
+            field_means.append(float(intensity.mean()))
+    means = np.asarray(means, dtype=np.float64)
+    median_mean = float(np.median(means))
+    if not np.isfinite(means).all():
+        raise ValueError('Calibration requires finite training-camera means')
+    automatic_values = []
+    if cfg.get('loss_version', 1) == 2 and cfg.get('loss_scale_floor') is None:
+        automatic_values.append('loss_scale_floor')
+    if not optical and cfg.get('field_out_scale') is None:
+        automatic_values.append('field_out_scale')
+    if median_mean <= 0 and automatic_values:
+        names = ', '.join(automatic_values)
+        raise ValueError(
+            f'Automatic calibration of {names} requires a positive training median; '
+            f'got {median_mean}. Supply finite positive values explicitly for all-zero targets.')
+    if cfg.get('loss_version', 1) == 2:
+        if cfg.get('loss_scale_floor') is None:
+            fraction = float(cfg.get('loss_scale_floor_fraction', 0.5))
+            if not math.isfinite(fraction) or fraction <= 0:
+                raise ValueError('loss_scale_floor_fraction must be finite and positive')
+            cfg['loss_scale_floor'] = fraction * median_mean
+        floor = float(cfg['loss_scale_floor'])
+        if not math.isfinite(floor) or floor <= 0:
+            raise ValueError('loss_scale_floor must be finite and positive')
+    if not optical and cfg.get('field_out_scale') is None:
+        cfg['field_out_scale'] = math.sqrt(median_mean)
+    gain = cfg.get('field_out_scale')
+    if not optical:
+        gain = float(gain)
+        if not math.isfinite(gain) or gain <= 0:
+            raise ValueError('field_out_scale must be finite and positive')
+    if optical:
+        if cfg.get('optical_intensity_gain') is None:
+            field_power = float(np.sum(field_means, dtype=np.float64))
+            if not math.isfinite(field_power) or field_power <= 0:
+                raise ValueError('Automatic optical gain requires nonzero finite TRAIN field power')
+            cfg['optical_intensity_gain'] = float(means.sum()) / field_power
+        optical_gain = float(cfg['optical_intensity_gain'])
+        if not math.isfinite(optical_gain) or optical_gain <= 0:
+            raise ValueError('optical_intensity_gain must be finite and positive')
+    cfg['camera_scale_actual'] = dataset.camera_scale
+    cfg['field_amp_scale_actual'] = dataset.field_amp_scale
+    cfg['training_calibration'] = {
+        'sample_count': len(indices),
+        'camera_mean_min': float(means.min()),
+        'camera_mean_median': median_mean,
+        'camera_mean_max': float(means.max()),
+        'source': 'training samples only, after configured crop/resize/loss ROI',
+    }
+    if optical:
+        cfg['training_calibration']['optical_intensity_gain_init'] = optical_gain
+        cfg['training_calibration']['optical_gain_source'] = (
+            'ratio of summed TRAIN camera/ideal mean intensity in supervised ROI'
+            if field_means else 'explicit configuration')
+        cfg['training_calibration']['field_scale_roi'] = dataset.fov_crop_size
+    print(f">>> Train-only calibration: camera_scale={dataset.camera_scale}, "
+          f"field_amp_scale={dataset.field_amp_scale}, "
+          f"loss_scale_floor={cfg.get('loss_scale_floor')}, "
+          + (f"optical_intensity_gain={optical_gain}" if optical else f"field_out_scale={gain}"))
+    return cfg['training_calibration']
+
+
+def quantile_normalize_np(arr, q_min=0.001, q_max=0.999, eps=1e-8):
+    arr = np.nan_to_num(np.asarray(arr, dtype=np.float32))
+    v_min = float(np.quantile(arr.reshape(-1), q_min))
+    v_max = float(np.quantile(arr.reshape(-1), q_max))
+    arr = np.clip(arr, v_min, v_max)
+    return (arr - v_min) / (v_max - v_min + eps)
+
+
+def sample_type_from_id(sample_id):
+    sample_id = str(sample_id)
+    if sample_id.startswith('sys_'):
+        return 'systematic'
+    if sample_id.startswith('real_'):
+        return 'real'
+    if sample_id.startswith('pert_'):
+        return 'pert'
+    return 'other'
+
+
+def normalize_group_loss_weights(dataset, train_indices, raw_weights, enabled=True):
+    group_names = ('systematic', 'real', 'pert', 'other')
+    counts = {name: 0 for name in group_names}
+    for idx in train_indices:
+        group = sample_type_from_id(dataset.samples[int(idx)]['id'])
+        counts[group if group in counts else 'other'] += 1
+
+    weights = {
+        name: float(raw_weights.get(name, 1.0)) if enabled else 1.0
+        for name in group_names
+    }
+    total_count = sum(counts.values())
+    if total_count == 0:
+        raise ValueError("Cannot normalize group loss weights for an empty training split")
+    mean_weight = sum(counts[name] * weights[name] for name in group_names) / total_count
+    if mean_weight <= 0:
+        raise ValueError(f"Mean group loss weight must be positive; got {mean_weight}")
+
+    normalized = {name: weights[name] / mean_weight for name in group_names}
+    print(">>> Training group loss weights (count, raw -> normalized):")
+    for name in group_names:
+        print(f">>>   {name}: {counts[name]}, {weights[name]:.4g} -> {normalized[name]:.4g}")
+    return normalized, counts
+
+
+def pert_parent_id_from_id(sample_id, real_ids=None):
+    sample_id = pattern_id_from_id(sample_id)
+    if not sample_id.startswith('pert_'):
+        return None
+
+    if real_ids:
+        for real_id in sorted((str(r) for r in real_ids), key=len, reverse=True):
+            if sample_id.startswith(f"pert_{real_id}_"):
+                return real_id
+
+    stem = sample_id[len('pert_'):]
+    for marker in ['_annrand_', '_anngradflow_']:
+        if marker in stem:
+            return stem.split(marker, 1)[0]
+    return stem
+
+
+def sample_group_from_id(sample_id):
+    sample_id = str(sample_id)
+    if sample_id.startswith('pert_'):
+        return 'pert'
+    if sample_id.startswith('real_'):
+        return 'real'
+    if sample_id.startswith('sys_zernike_combo'):
+        return 'zernike_combo'
+    if sample_id.startswith('sys_zernike_j'):
+        return 'zernike_single'
+    if sample_id.startswith('sys_ramp') or sample_id.startswith('sys_linear_ramp'):
+        return 'linear_ramp'
+    if sample_id.startswith('sys_checker'):
+        return 'checkerboard'
+    if sample_id.startswith('sys_square_ring'):
+        return 'square_ring'
+    if sample_id.startswith('sys_radial_ring'):
+        return 'radial_ring'
+    if sample_id.startswith('sys_local_bump'):
+        return 'local_bump'
+    if sample_id.startswith('sys_sine'):
+        return 'sine'
+    if sample_id.startswith('sys_'):
+        return 'systematic_other'
+    if sample_id.startswith('sine'):
+        return 'sine'
+    if sample_id.startswith('checker'):
+        return 'checkerboard'
+    if sample_id.startswith('linear_ramp'):
+        return 'linear_ramp'
+    return 'other'
+
+
+def pattern_id_from_id(sample_id):
+    """Remove only the trainer's z suffix, retaining the original pattern name."""
+    return str(sample_id).split('__z_', 1)[0]
+
+
+def split_dataset(dataset, real_train_ratio=0.8, sys_train_ratio=1.0,
+                  seed=42, train_ratio=None):
+    # train_ratio is retained as a compatibility alias for older callers.
+    if train_ratio is not None:
+        real_train_ratio = train_ratio
+    real_train_ratio = float(real_train_ratio)
+    sys_train_ratio = float(sys_train_ratio)
+    for name, ratio in [('real_train_ratio', real_train_ratio),
+                        ('sys_train_ratio', sys_train_ratio)]:
+        if not 0.0 <= ratio <= 1.0:
+            raise ValueError(f"{name} must be between 0 and 1; got {ratio}")
+
+    # Apply the existing family split to UNIQUE patterns, then expand all their
+    # z views. Splitting individual (pattern, z) pairs would leak patterns.
+    indices_by_pattern = {}
+    for idx, sample in enumerate(dataset.samples):
+        pattern_id = sample.get('pattern_id', pattern_id_from_id(sample['id']))
+        indices_by_pattern.setdefault(pattern_id, []).append(idx)
+    if (len(indices_by_pattern) != len(dataset) or
+            any(pattern != dataset.samples[indices[0]]['id']
+                for pattern, indices in indices_by_pattern.items())):
+        patterns = sorted(indices_by_pattern)
+        grouped = Subset(dataset, [indices_by_pattern[p][0] for p in patterns])
+        grouped.samples = [{'id': p} for p in patterns]
+        _, _, train_patterns, val_patterns = split_dataset(
+            grouped, real_train_ratio=real_train_ratio,
+            sys_train_ratio=sys_train_ratio, seed=seed,
+        )
+        train_idx = sorted(i for p in train_patterns for i in indices_by_pattern[patterns[p]])
+        val_idx = sorted(i for p in val_patterns for i in indices_by_pattern[patterns[p]])
+        print(f">>> Expanded pattern split: {len(train_idx)} train / {len(val_idx)} val pairs")
+        for z_mm in sorted({s.get('z_mm', 0.0) for s in dataset.samples}):
+            nt = sum(dataset.samples[i].get('z_mm', 0.0) == z_mm for i in train_idx)
+            nv = sum(dataset.samples[i].get('z_mm', 0.0) == z_mm for i in val_idx)
+            print(f">>>   z={z_mm:+g} mm: {nt} train / {nv} val")
+        return Subset(dataset, train_idx), Subset(dataset, val_idx), train_idx, val_idx
+
+    rng = random.Random(seed)
+
+    sys_idx_by_group = {}
+    real_idx_by_id = {}
+    pert_idx_by_parent = {}
+    other_idx = []
+    typed_samples = []
+
+    for idx, sample in enumerate(dataset.samples):
+        sample_type = sample_type_from_id(sample['id'])
+        typed_samples.append((idx, sample['id'], sample_type))
+        if sample_type == 'systematic':
+            group = sample_group_from_id(sample['id'])
+            sys_idx_by_group.setdefault(group, []).append(idx)
+        elif sample_type == 'real':
+            real_idx_by_id[sample['id']] = idx
+
+    real_ids = set(real_idx_by_id)
+    for idx, sample_id, sample_type in typed_samples:
+        if sample_type == 'pert':
+            parent_id = pert_parent_id_from_id(sample_id, real_ids=real_ids)
+            pert_idx_by_parent.setdefault(parent_id, []).append(idx)
+        elif sample_type not in {'systematic', 'real'}:
+            other_idx.append(idx)
+
+    for indices in pert_idx_by_parent.values():
+        indices.sort()
+
+    real_parent_ids = sorted(set(real_idx_by_id) | set(pert_idx_by_parent))
+    sys_train_idx = []
+    sys_val_idx = []
+    for group in sorted(sys_idx_by_group):
+        indices = sorted(sys_idx_by_group[group])
+        rng.shuffle(indices)
+        n_train = int(round(len(indices) * sys_train_ratio))
+        if 0.0 < sys_train_ratio < 1.0 and len(indices) >= 2:
+            n_train = min(max(n_train, 1), len(indices) - 1)
+        sys_train_idx.extend(indices[:n_train])
+        sys_val_idx.extend(indices[n_train:])
+
+    if sys_idx_by_group or real_parent_ids:
+        rng.shuffle(real_parent_ids)
+        rng.shuffle(other_idx)
+
+        n_parent_train = int(round(len(real_parent_ids) * real_train_ratio))
+        if 0.0 < real_train_ratio < 1.0 and len(real_parent_ids) >= 2:
+            n_parent_train = min(max(n_parent_train, 1), len(real_parent_ids) - 1)
+        n_other_train = int(round(len(other_idx) * real_train_ratio))
+        train_parent_ids = set(real_parent_ids[:n_parent_train])
+        val_parent_ids = set(real_parent_ids[n_parent_train:])
+
+        def grouped_indices(parent_ids):
+            out = []
+            for parent_id in sorted(parent_ids):
+                if parent_id in real_idx_by_id:
+                    out.append(real_idx_by_id[parent_id])
+                out.extend(pert_idx_by_parent.get(parent_id, []))
+            return out
+
+        grouped_train_idx = grouped_indices(train_parent_ids)
+        grouped_val_idx = grouped_indices(val_parent_ids)
+
+        train_idx = sys_train_idx + grouped_train_idx + other_idx[:n_other_train]
+        val_idx = sys_val_idx + grouped_val_idx + other_idx[n_other_train:]
+
+        train_real_count = sum(1 for i in grouped_train_idx
+                               if sample_type_from_id(dataset.samples[i]['id']) == 'real')
+        val_real_count = sum(1 for i in grouped_val_idx
+                             if sample_type_from_id(dataset.samples[i]['id']) == 'real')
+        train_pert_count = sum(1 for i in grouped_train_idx
+                               if sample_type_from_id(dataset.samples[i]['id']) == 'pert')
+        val_pert_count = sum(1 for i in grouped_val_idx
+                             if sample_type_from_id(dataset.samples[i]['id']) == 'pert')
+
+        print(
+            f"Prefix/group split: {len(train_idx)} train / {len(val_idx)} val "
+            f"(sys train/val={len(sys_train_idx)}/{len(sys_val_idx)}, "
+            f"real-parent train/val={len(train_parent_ids)}/{len(val_parent_ids)}, "
+            f"real samples train/val={train_real_count}/{val_real_count}, "
+            f"pert samples train/val={train_pert_count}/{val_pert_count}, "
+            f"other train/val={n_other_train}/{len(other_idx) - n_other_train}, "
+            f"sys ratio={sys_train_ratio}, real ratio={real_train_ratio})"
+        )
+        orphan_parents = sorted(pid for pid in pert_idx_by_parent if pid not in real_idx_by_id)
+        if orphan_parents:
+            print(
+                "[warn] pert samples without matching real parent were split as their own parent groups: "
+                + ", ".join(orphan_parents[:8])
+                + (" ..." if len(orphan_parents) > 8 else "")
+            )
+    else:
+        n = len(dataset)
+        n_train = int(round(n * real_train_ratio))
+        indices = list(range(n))
+        rng.shuffle(indices)
+        train_idx = indices[:n_train]
+        val_idx = indices[n_train:]
+        print(
+            f"Split: {len(train_idx)} train / {len(val_idx)} val "
+            f"(real ratio={real_train_ratio})"
+        )
+
+    return Subset(dataset, train_idx), Subset(dataset, val_idx), train_idx, val_idx
+
+
+def evenly_spaced_sample_indices(indices, n_samples):
+    """Pick visualization samples across the full dataset-index span."""
+    if n_samples is None or n_samples <= 0 or not indices:
+        return []
+
+    ordered = sorted(int(i) for i in indices)
+    if len(ordered) <= n_samples:
+        return ordered
+    if n_samples == 1:
+        return [ordered[len(ordered) // 2]]
+
+    positions = np.linspace(0, len(ordered) - 1, int(n_samples))
+    selected = []
+    seen = set()
+    for pos in positions:
+        idx = ordered[int(round(float(pos)))]
+        if idx not in seen:
+            selected.append(idx)
+            seen.add(idx)
+
+    if len(selected) < n_samples:
+        for idx in ordered:
+            if idx not in seen:
+                selected.append(idx)
+                seen.add(idx)
+                if len(selected) == n_samples:
+                    break
+    return selected
+
+
+def print_torch_device_diagnostics():
+    cuda_available = torch.cuda.is_available()
+    print("=== Torch device diagnostics ===")
+    print(f"Torch version: {torch.__version__}")
+    print(f"Torch CUDA build: {torch.version.cuda}")
+    print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
+    print(f"torch.cuda.is_available(): {cuda_available}")
+    print(f"torch.cuda.device_count(): {torch.cuda.device_count()}")
+    if cuda_available:
+        current = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(current)
+        print(f"Active CUDA device: cuda:{current} - {props.name}")
+        print(f"CUDA capability: {props.major}.{props.minor}")
+        print(f"Total VRAM: {props.total_memory / 1024**3:.2f} GiB")
+        print(f"cuDNN version: {torch.backends.cudnn.version()}")
+    else:
+        print("No CUDA accelerator is visible to this Python process; training will run on CPU.")
+    print("================================")
+
+
+# ---------------------------------------------------------------------------
+# Training / evaluation
+# ---------------------------------------------------------------------------
+
+def native_center_crop(x, size):
+    h, w = x.shape[-2:]
+    if min(h, w) < size or (h-size) % 2 or (w-size) % 2:
+        raise ValueError(f'Cannot make aligned native {size}x{size} crop from {h}x{w}')
+    y, x0 = (h-size)//2, (w-size)//2
+    return x[..., y:y+size, x0:x0+size]
+
+
+def prepare_batch(batch, device, model_size, cfg=None):
+    if cfg is not None and model_architecture(cfg) == 'shared_optical':
+        field = batch['field'].to(device)
+        input_size = cfg.get('optical_input_size', 1024)
+        if tuple(field.shape[-2:]) != (input_size, input_size):
+            raise ValueError(f'Shared optical field must remain native {input_size}x{input_size}')
+        camera = batch['camera'].to(device)
+        if tuple(camera.shape[-2:]) != (model_size, model_size):
+            raise ValueError(f'Shared optical camera target must be native {model_size}x{model_size}')
+        sim = native_center_crop(field[:, 0:1].square(), model_size)
+        return field, sim, batch['phase'].to(device), camera
+    field = resize_batch(batch['field'].to(device), model_size, mode='bilinear')
+    sim_source = batch.get('sim', batch['field'][:, 0:1].square())
+    sim = resize_batch(sim_source.to(device), model_size, mode='bilinear')
+    phase = batch['phase'].to(device)
+    camera = resize_batch(batch['camera'].to(device), model_size, mode='bilinear')
+    return field, sim, phase, camera
+
+
+def prepare_sample(sample, device, cfg):
+    batch = {k: sample[k].unsqueeze(0) for k in ('field', 'phase', 'camera')}
+    if 'sim' in sample:
+        batch['sim'] = sample['sim'].unsqueeze(0)
+    return prepare_batch(batch, device, cfg['model_size'], cfg)
+
+
+def validate_lr_scheduler_config(cfg, initial_lrs=None):
+    """Validate opt-in scheduling before reading data or starting training."""
+    kind = cfg.get('lr_scheduler', 'none')
+    if kind not in ('none', 'plateau'):
+        raise ValueError('lr_scheduler must be none or plateau')
+    if kind == 'none':
+        return
+    factor = cfg.get('lr_factor', .5)
+    threshold = cfg.get('lr_threshold', .001)
+    minimum = cfg.get('lr_min', 1e-4)
+    patience = cfg.get('lr_patience', 10)
+    if not math.isfinite(factor) or not 0 < factor < 1:
+        raise ValueError('lr_factor must be finite and between 0 and 1')
+    if isinstance(patience, bool) or not isinstance(patience, int) or patience < 0:
+        raise ValueError('lr_patience must be a nonnegative integer')
+    if not math.isfinite(threshold) or not 0 <= threshold < 1:
+        raise ValueError('lr_threshold must be finite and in [0, 1) (relative)')
+    if not math.isfinite(minimum) or minimum <= 0:
+        raise ValueError('lr_min must be finite and positive')
+    rates = initial_lrs if initial_lrs is not None else [cfg['lr']]
+    if any(not math.isfinite(rate) or rate <= 0 or minimum > rate for rate in rates):
+        raise ValueError('lr_min must not exceed any initial optimizer learning rate')
+
+
+def build_lr_scheduler(optimizer, cfg):
+    validate_lr_scheduler_config(cfg, [group['lr'] for group in optimizer.param_groups])
+    if cfg.get('lr_scheduler', 'none') == 'none':
+        return None
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=cfg.get('lr_factor', .5),
+        patience=cfg.get('lr_patience', 10), threshold=cfg.get('lr_threshold', .001),
+        threshold_mode='rel', min_lr=cfg.get('lr_min', 1e-4))
+
+
+def train_one_run(model, train_loader, val_loader, optimizer, device, cfg, run_dir):
+    if model_architecture(cfg) == 'shared_optical' and cfg.get('use_amp', False):
+        raise ValueError('Shared optical FFT training requires use_amp=False (complex FP32)')
+    amp_enabled = cfg['use_amp'] and device == 'cuda'
+    loss_roi_fraction = cfg.get('loss_roi_fraction', 1.0)
+    loss_kwargs = loss_kwargs_from_config(cfg)
+    scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
+    best_val = float('inf')
+    scheduler = build_lr_scheduler(optimizer, cfg)
+    print(f">>> LR schedule: {cfg.get('lr_scheduler', 'none')}; "
+          "monitor=total validation loss; checkpoint selection remains exact minimum")
+    history = {
+        'train': [], 'val': [], 'lr': [], 'lr_next': [],
+        'train_unweighted': [],
+        'train_systematic': [], 'train_real_family': [], 'train_other': [],
+        'val_systematic': [], 'val_real_family': [], 'val_other': [],
+        'train_log_display_smooth_l1': [], 'val_log_display_smooth_l1': [],
+        'train_ssim': [], 'val_ssim': [],
+        'train_grad': [], 'val_grad': [],
+        'train_fft': [], 'val_fft': [],
+        'train_mean_norm_l1': [], 'val_mean_norm_l1': [],
+        'train_peak': [], 'val_peak': [],
+        'train_dark': [], 'val_dark': [],
+        'train_raw_mse': [], 'val_raw_mse': [],
+        'grad_norm_mean': [], 'grad_norm_max': [], 'grad_clip_fraction': [],
+    }
+    for group_index in range(len(optimizer.param_groups)):
+        history[f'lr_group_{group_index}'] = []
+        history[f'lr_next_group_{group_index}'] = []
+
+    for epoch in range(cfg['epochs']):
+        epoch_lrs = [float(group['lr']) for group in optimizer.param_groups]
+        model.train()
+        sums = {k: 0.0 for k in ['loss', 'unweighted_loss',
+                                  'log_display_smooth_l1', 'ssim', 'grad', 'fft',
+                                  'mean_norm_l1', 'peak', 'dark', 'raw_mse']}
+        group_loss_sums = {'systematic': 0.0, 'real_family': 0.0, 'other': 0.0}
+        group_counts = {'systematic': 0, 'real_family': 0, 'other': 0}
+        n_seen = 0
+        gradient_norms = []
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{cfg['epochs']} [train]"):
+            field, _, phase, camera = prepare_batch(batch, device, cfg['model_size'], cfg)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast('cuda', enabled=amp_enabled):
+                pred, _ = predict_camera(model, field, phase, cfg, train_noise=True)
+                pred_loss, camera_loss = apply_loss_roi(pred, camera, loss_roi_fraction)
+                per_sample_loss, per_sample_comps = visual_loss_per_sample(
+                    pred_loss, camera_loss,
+                    **loss_kwargs,
+                )
+                sample_types = [sample_type_from_id(sample_id) for sample_id in batch['id']]
+                sample_weights = pred.new_tensor([
+                    cfg['group_loss_weights_normalized'].get(sample_type, 1.0)
+                    for sample_type in sample_types
+                ])
+                loss = (sample_weights * per_sample_loss).mean()
+
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"Nonfinite training loss at epoch {epoch + 1}: {batch['id']}")
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            clip_limit = cfg['grad_clip'] if cfg['grad_clip'] is not None else float('inf')
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), clip_limit, error_if_nonfinite=True)
+            gradient_norms.append(float(grad_norm))
+            scaler.step(optimizer)
+            scaler.update()
+
+            b = field.shape[0]
+            sums['loss'] += loss.item() * b
+            sums['unweighted_loss'] += per_sample_loss.detach().sum().item()
+            for key, values in per_sample_comps.items():
+                sums[key] += values.detach().sum().item()
+            for sample_type, sample_loss in zip(
+                    sample_types, per_sample_loss.detach().cpu().tolist()):
+                if sample_type == 'systematic':
+                    family = 'systematic'
+                elif sample_type in {'real', 'pert'}:
+                    family = 'real_family'
+                else:
+                    family = 'other'
+                group_loss_sums[family] += float(sample_loss)
+                group_counts[family] += 1
+            n_seen += b
+
+        train_stats = {k: v / max(n_seen, 1) for k, v in sums.items()}
+        train_group_stats = {
+            name: (group_loss_sums[name] / group_counts[name]
+                   if group_counts[name] else float('nan'))
+            for name in group_loss_sums
+        }
+
+        model.eval()
+        sums = {k: 0.0 for k in ['loss', 'log_display_smooth_l1', 'ssim', 'grad', 'fft',
+                                  'mean_norm_l1', 'peak', 'dark', 'raw_mse']}
+        val_group_loss_sums = {'systematic': 0.0, 'real_family': 0.0, 'other': 0.0}
+        val_group_counts = {'systematic': 0, 'real_family': 0, 'other': 0}
+        n_seen = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                field, _, phase, camera = prepare_batch(batch, device, cfg['model_size'], cfg)
+                pred, _ = predict_camera(model, field, phase, cfg, train_noise=False)
+                pred_loss, camera_loss = apply_loss_roi(pred, camera, loss_roi_fraction)
+                per_sample_loss, per_sample_comps = visual_loss_per_sample(
+                    pred_loss, camera_loss,
+                    **loss_kwargs,
+                )
+                loss = per_sample_loss.mean()
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f"Nonfinite validation loss at epoch {epoch + 1}: {batch['id']}")
+                b = field.shape[0]
+                sums['loss'] += loss.item() * b
+                for key, values in per_sample_comps.items():
+                    sums[key] += values.sum().item()
+                sample_types = [sample_type_from_id(sample_id) for sample_id in batch['id']]
+                for sample_type, sample_loss in zip(
+                        sample_types, per_sample_loss.cpu().tolist()):
+                    if sample_type == 'systematic':
+                        family = 'systematic'
+                    elif sample_type in {'real', 'pert'}:
+                        family = 'real_family'
+                    else:
+                        family = 'other'
+                    val_group_loss_sums[family] += float(sample_loss)
+                    val_group_counts[family] += 1
+                n_seen += b
+
+        val_stats = {k: v / max(n_seen, 1) for k, v in sums.items()}
+        val_group_stats = {
+            name: (val_group_loss_sums[name] / val_group_counts[name]
+                   if val_group_counts[name] else float('nan'))
+            for name in val_group_loss_sums
+        }
+
+        history['train'].append(train_stats['loss'])
+        history['val'].append(val_stats['loss'])
+        history['train_unweighted'].append(train_stats['unweighted_loss'])
+        history['train_systematic'].append(train_group_stats['systematic'])
+        history['train_real_family'].append(train_group_stats['real_family'])
+        history['train_other'].append(train_group_stats['other'])
+        history['val_systematic'].append(val_group_stats['systematic'])
+        history['val_real_family'].append(val_group_stats['real_family'])
+        history['val_other'].append(val_group_stats['other'])
+        history['grad_norm_mean'].append(float(np.mean(gradient_norms)) if gradient_norms else 0.0)
+        history['grad_norm_max'].append(max(gradient_norms, default=0.0))
+        history['grad_clip_fraction'].append(
+            float(np.mean(np.asarray(gradient_norms) > cfg['grad_clip']))
+            if gradient_norms and cfg['grad_clip'] is not None else 0.0)
+        for k in ['log_display_smooth_l1', 'ssim', 'grad', 'fft', 'mean_norm_l1',
+                  'peak', 'dark', 'raw_mse']:
+            history[f'train_{k}'].append(train_stats[k])
+            history[f'val_{k}'].append(val_stats[k])
+
+        # Step only after validation: new rates apply to the NEXT epoch.
+        # Scheduler's relative threshold does not change best.pt selection.
+        if scheduler is not None:
+            scheduler.step(val_stats['loss'])
+        next_lrs = [float(group['lr']) for group in optimizer.param_groups]
+        history['lr'].append(epoch_lrs[0])
+        history['lr_next'].append(next_lrs[0])
+        for group_index, (used, following) in enumerate(zip(epoch_lrs, next_lrs)):
+            history[f'lr_group_{group_index}'].append(used)
+            history[f'lr_next_group_{group_index}'].append(following)
+        if next_lrs != epoch_lrs:
+            print(f">>> LR reduced after epoch {epoch + 1}: {epoch_lrs} -> {next_lrs}")
+
+        # Online train metrics are measured before each update; validation is
+        # measured with the end-of-epoch model. Preserve names for old plotting.
+        serializable_history = {
+            key: [float(v) if np.isfinite(v) else None for v in values]
+            for key, values in history.items()
+        }
+        with open(Path(run_dir) / 'history.json', 'w', encoding='utf-8') as handle:
+            json.dump(serializable_history, handle, indent=2, allow_nan=False)
+
+        print(
+            f"  Epoch {epoch + 1}: "
+            f"lr={epoch_lrs[0]:.6g} next_lr={next_lrs[0]:.6g} "
+            f"train_weighted={train_stats['loss']:.5f} "
+            f"train_unweighted={train_stats['unweighted_loss']:.5f} "
+            f"train_sys={train_group_stats['systematic']:.5f} "
+            f"train_real_family={train_group_stats['real_family']:.5f} "
+            f"val_loss={val_stats['loss']:.5f} "
+            f"val_sys={val_group_stats['systematic']:.5f} "
+            f"val_real_family={val_group_stats['real_family']:.5f} "
+            f"val_mean_norm_l1={val_stats['mean_norm_l1']:.5f} "
+            f"val_ssim={val_stats['ssim']:.5f} "
+            f"val_grad={val_stats['grad']:.5f} "
+            f"raw_mse={val_stats['raw_mse']:.5f} "
+            f"grad_norm={history['grad_norm_mean'][-1]:.3f} "
+            f"clip_fraction={history['grad_clip_fraction'][-1]:.1%}"
+        )
+
+        if val_stats['loss'] < best_val:
+            best_val = val_stats['loss']
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+                'epoch': epoch + 1,
+                'val_loss': best_val,
+                'cfg': cfg,
+            }, run_dir / 'best.pt')
+
+        if epoch + 1 == cfg['epochs']:
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+                'epoch': epoch + 1, 'val_loss': val_stats['loss'], 'cfg': cfg,
+            }, run_dir / 'last.pt')
+
+    return history
+
+
+def camera_comparison_display(pred_np, cam_np, cfg):
+    """Build camera comparison arrays without hiding v2 brightness errors.
+
+    V1 preserves the historical independent quantile-normalized full/ROI
+    displays. V2 uses the saved positive transform and floor, one target-ROI
+    scale and one target-ROI 99.9th display percentile for BOTH images. Only
+    image arrays are clipped to [0, 1]; error and MSE use the common, unclipped
+    display so simultaneous saturation cannot conceal an intensity mismatch.
+    """
+    pred_np, cam_np = np.asarray(pred_np), np.asarray(cam_np)
+    if pred_np.ndim != 2 or pred_np.shape != cam_np.shape:
+        raise ValueError('Camera display requires matching 2D prediction/target arrays')
+    roi_fraction = cfg.get('loss_roi_fraction', 1.0)
+    y0, y1, x0, x1 = center_roi_bounds(*pred_np.shape, roi_fraction)
+    pred_roi_np, cam_roi_np = pred_np[y0:y1, x0:x1], cam_np[y0:y1, x0:x1]
+    version = cfg.get('loss_version', 1)
+    if version == 1:
+        cam_d = quantile_normalize_np(cam_np, q_max=0.999)
+        pred_d = quantile_normalize_np(pred_np, q_max=0.999)
+        cam_roi_d = quantile_normalize_np(cam_roi_np, q_max=0.999)
+        pred_roi_d = quantile_normalize_np(pred_roi_np, q_max=0.999)
+        return {
+            'camera': cam_d, 'prediction': pred_d,
+            'error': np.abs(pred_d - cam_d),
+            'display_mse': float(np.mean((pred_roi_d - cam_roi_d) ** 2)),
+            'display_scale': None, 'display_quantile': None,
+        }
+    if version != 2:
+        raise ValueError(f'Unsupported loss_version: {version}')
+    from fno_losses import camera_target_scale, shared_positive_display
+    if cfg.get('loss_scale_floor') is None:
+        raise ValueError('Loss v2 visualization requires the saved loss_scale_floor')
+    prediction = torch.from_numpy(np.ascontiguousarray(pred_np, dtype=np.float32))[None, None]
+    camera = torch.from_numpy(np.ascontiguousarray(cam_np, dtype=np.float32))[None, None]
+    scale = camera_target_scale(camera[..., y0:y1, x0:x1], cfg['loss_scale_floor'])
+    pred_display, cam_display = shared_positive_display(
+        prediction, camera, scale, transform=cfg.get('loss_display_transform', 'log1p'))
+    # A zero target still has a defined display. This divisor is for visualization
+    # only; it does not enter the training objective or its gradient.
+    divisor = max(float(torch.quantile(cam_display[..., y0:y1, x0:x1].reshape(-1), 0.999)), 1e-6)
+    pred_display = pred_display[0, 0].numpy() / divisor
+    cam_display = cam_display[0, 0].numpy() / divisor
+    difference = pred_display - cam_display
+    pred_mean, cam_mean = float(pred_roi_np.mean()), float(cam_roi_np.mean())
+    return {
+        'camera': np.clip(cam_display, 0.0, 1.0),
+        'prediction': np.clip(pred_display, 0.0, 1.0),
+        'error': np.abs(difference),
+        'display_mse': float(np.mean(difference[y0:y1, x0:x1] ** 2)),
+        'mean_ratio': pred_mean / cam_mean if cam_mean > 0 else None,
+        'prediction_clipped_fraction': float(np.mean(pred_display > 1.0)),
+        'camera_clipped_fraction': float(np.mean(cam_display > 1.0)),
+        'display_scale': float(scale), 'display_quantile': divisor,
+    }
+
+
+def visualize_samples(model, dataset, indices, device, cfg, save_dir):
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    roi_fraction = cfg.get('loss_roi_fraction', 1.0)
+    has_roi = roi_fraction is not None and float(roi_fraction) < 1.0
+
+    model.eval()
+    with torch.no_grad():
+        for idx in indices:
+            batch = dataset[idx]
+            field, sim, phase, cam = prepare_sample(batch, device, cfg)
+
+            pred, _ = predict_camera(model, field, phase, cfg, train_noise=False)
+            pred_roi, cam_roi = apply_loss_roi(pred, cam, roi_fraction)
+
+            sim_np = sim[0, 0].cpu().numpy()
+            cam_np = cam[0, 0].cpu().numpy()
+            pred_np = pred[0, 0].cpu().numpy()
+            cam_roi_np = cam_roi[0, 0].cpu().numpy()
+            pred_roi_np = pred_roi[0, 0].cpu().numpy()
+
+            sim_d = quantile_normalize_np(sim_np, q_max=0.999)
+            display = camera_comparison_display(pred_np, cam_np, cfg)
+            cam_d, pred_d, err_d = display['camera'], display['prediction'], display['error']
+            display_mse = display['display_mse']
+            raw_mse = float(np.mean((pred_roi_np - cam_roi_np) ** 2))
+            shared_display = cfg.get('loss_version', 1) == 2
+
+            fig, ax = plt.subplots(1, 4, figsize=(20, 5))
+            ax[0].imshow(sim_d, cmap='gray', vmin=0, vmax=1)
+            ax[0].set_title(f"Sim - {batch['id']}" + ("\nIndependent simulation display" if shared_display else ""))
+            ax[1].imshow(cam_d, cmap='gray', vmin=0, vmax=1)
+            ax[1].set_title("Camera (target)" + ("\nShared target-derived display" if shared_display else ""))
+            ax[2].imshow(pred_d, cmap='gray', vmin=0, vmax=1)
+            metric_prefix = "ROI " if has_roi else ""
+            model_label = 'Shared optical' if model_architecture(cfg) == 'shared_optical' else 'FNO'
+            if shared_display:
+                mean_ratio = display['mean_ratio']
+                ratio_text = f"{mean_ratio:.3g}" if mean_ratio is not None else "undefined (zero target)"
+                ax[2].set_title(
+                    f"{model_label}\n{metric_prefix}Raw-MSE: {raw_mse:.4f}\n"
+                    f"{metric_prefix}Shared-display-MSE: {display_mse:.4f}\n"
+                    f"{metric_prefix}Pred/target mean: {ratio_text}; clipped: {display['prediction_clipped_fraction']:.1%}")
+                ax[3].imshow(err_d, cmap='hot', vmin=0, vmax=1)
+                ax[3].set_title("|Shared display Pred - Cam|\nBefore display clipping; heatmap saturates at 1")
+            else:
+                ax[2].set_title(f"{model_label}\n{metric_prefix}Raw-MSE: {raw_mse:.4f}\n{metric_prefix}Display-MSE: {display_mse:.4f}")
+                ax[3].imshow(err_d, cmap='hot', vmin=0, vmax=0.5)
+                ax[3].set_title("|Pred - Cam|")
+            if has_roi:
+                y0, y1, x0, x1 = center_roi_bounds(pred_d.shape[0], pred_d.shape[1], roi_fraction)
+                for a in ax:
+                    a.add_patch(plt.Rectangle(
+                        (x0 - 0.5, y0 - 0.5),
+                        x1 - x0,
+                        y1 - y0,
+                        fill=False,
+                        edgecolor='deepskyblue',
+                        linewidth=0.8,
+                        linestyle=(0, (3, 3)),
+                        alpha=0.9,
+                    ))
+            for a in ax:
+                a.axis('off')
+            plt.tight_layout()
+            safe = ''.join(c if c.isalnum() or c in '-_.' else '_' for c in batch['id'])
+            # Four-line quantitative titles need their full bounding box.
+            fig.savefig(save_dir / f'sample_{safe}.png', dpi=120,
+                        bbox_inches='tight', pad_inches=0.15)
+            plt.close(fig)
+
+
+def evaluate_all(model, dataset, device, cfg):
+    model.eval()
+    rows = []
+    version = cfg.get('loss_version', 1)
+    if version == 2:
+        from fno_losses import (camera_target_scale, shared_positive_display,
+                                positive_ssim_loss_per_sample)
+    elif version != 1:
+        raise ValueError(f'Unsupported loss_version: {version}')
+    with torch.no_grad():
+        for idx in tqdm(range(len(dataset)), desc='Final eval'):
+            batch = dataset[idx]
+            field, _, phase, cam = prepare_sample(batch, device, cfg)
+            pred, _ = predict_camera(model, field, phase, cfg, train_noise=False)
+            pred_eval, cam_eval = apply_loss_roi(pred, cam, cfg.get('loss_roi_fraction', 1.0))
+            pred_d = log_display_tensor(pred_eval)
+            cam_d = log_display_tensor(cam_eval)
+            display_mse = F.mse_loss(pred_d, cam_d).item()
+            raw_mse = F.mse_loss(pred_eval, cam_eval).item()
+            if version == 2:
+                scale = camera_target_scale(cam_eval, cfg.get('loss_scale_floor'))
+                pred_ssim, cam_ssim = shared_positive_display(
+                    pred_eval, cam_eval, scale,
+                    transform=cfg.get('loss_display_transform', 'log1p'),
+                )
+                ssim = 1.0 - positive_ssim_loss_per_sample(pred_ssim, cam_ssim).mean().item()
+            else:
+                ssim = 1.0 - simple_ssim_loss(pred_eval, cam_eval).item()
+            rows.append((idx, batch['id'], raw_mse, display_mse, ssim))
+    return rows
+
+
+def plot_loss_curve(history, run_dir):
+    if not history['train']:
+        return
+    if history.get('lr'):
+        figure, axis = plt.subplots(figsize=(8, 3.5))
+        keys = sorted(k for k in history if k.startswith('lr_group_')) or ['lr']
+        for key in keys:
+            axis.step(range(1, len(history[key]) + 1), history[key], where='post', label=key)
+        axis.set(xlabel='Epoch (1-based)', ylabel='Learning rate used', yscale='log')
+        axis.grid(True, alpha=.3)
+        axis.legend()
+        figure.tight_layout()
+        figure.savefig(Path(run_dir) / 'learning_rate_curve.png', dpi=140)
+        plt.close(figure)
+    plt.figure(figsize=(8, 5))
+    plt.plot(history['train'], label='train weighted', color='steelblue')
+    if history.get('train_unweighted'):
+        plt.plot(history['train_unweighted'], label='train unweighted',
+                 color='steelblue', linestyle='--', alpha=0.7)
+    plt.plot(history['val'], label='val', color='coral')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.yscale('log')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(Path(run_dir) / 'loss_curve.png', dpi=140)
+    plt.close()
+
+    group_series = [
+        ('train_systematic', 'train systematic', 'tab:blue', '-'),
+        ('val_systematic', 'val systematic', 'tab:blue', '--'),
+        ('train_real_family', 'train real + pert', 'tab:green', '-'),
+        ('val_real_family', 'val real + pert', 'tab:green', '--'),
+        ('train_other', 'train other', 'tab:gray', '-'),
+        ('val_other', 'val other', 'tab:gray', '--'),
+    ]
+    plt.figure(figsize=(8, 5))
+    plotted = False
+    for key, label, color, linestyle in group_series:
+        values = np.asarray(history.get(key, []), dtype=np.float64)
+        if values.size and np.isfinite(values).any():
+            plt.plot(values, label=label, color=color, linestyle=linestyle)
+            plotted = True
+    if plotted:
+        plt.xlabel('Epoch')
+        plt.ylabel('Unweighted per-sample loss')
+        plt.yscale('log')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(Path(run_dir) / 'group_loss_curve.png', dpi=140)
+    plt.close()
+
+
+def write_per_sample_metrics(rows, dataset, train_idx, val_idx, run_dir, metric_prefix=''):
+    run_dir = Path(run_dir)
+    train_indices, val_indices = set(train_idx), set(val_idx)
+    records = []
+
+    for idx, sid, raw_mse, display_mse, ssim in rows:
+        if idx in train_indices:
+            split = 'train'
+        elif idx in val_indices:
+            split = 'val'
+        else:
+            split = 'unknown'
+        records.append({
+            'index': int(idx),
+            'id': sid,
+            'pattern_id': dataset.samples[idx].get('pattern_id', pattern_id_from_id(sid)),
+            'z_mm': float(dataset.samples[idx].get('z_mm', 0.0)),
+            'type': sample_type_from_id(sid),
+            'group': sample_group_from_id(sid),
+            'split': split,
+            'raw_mse': float(raw_mse),
+            'display_log_mse': float(display_mse),
+            'ssim': float(ssim),
+        })
+
+    with open(run_dir / 'per_sample_metrics.csv', 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'index', 'id', 'pattern_id', 'z_mm', 'type', 'group', 'split',
+            f'{metric_prefix}raw_mse',
+            f'{metric_prefix}display_log_mse',
+            f'{metric_prefix}ssim',
+        ])
+        for record in records:
+            writer.writerow([
+                record['index'],
+                record['id'],
+                record['pattern_id'],
+                record['z_mm'],
+                record['type'],
+                record['group'],
+                record['split'],
+                record['raw_mse'],
+                record['display_log_mse'],
+                record['ssim'],
+            ])
+
+    summary = {}
+    for record in records:
+        key = (record['type'], record['group'], record['split'])
+        bucket = summary.setdefault(key, {'n': 0, 'raw': [], 'display': [], 'ssim': []})
+        bucket['n'] += 1
+        bucket['raw'].append(record['raw_mse'])
+        bucket['display'].append(record['display_log_mse'])
+        bucket['ssim'].append(record['ssim'])
+
+    with open(run_dir / 'per_sample_metrics_summary.csv', 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'type', 'group', 'split', 'n',
+            f'mean_{metric_prefix}raw_mse',
+            f'median_{metric_prefix}raw_mse',
+            f'mean_{metric_prefix}display_log_mse',
+            f'median_{metric_prefix}display_log_mse',
+            f'mean_{metric_prefix}ssim',
+            f'median_{metric_prefix}ssim',
+        ])
+        for (sample_type, group, split), bucket in sorted(summary.items()):
+            writer.writerow([
+                sample_type, group, split, bucket['n'],
+                float(np.mean(bucket['raw'])),
+                float(np.median(bucket['raw'])),
+                float(np.mean(bucket['display'])),
+                float(np.median(bucket['display'])),
+                float(np.mean(bucket['ssim'])),
+                float(np.median(bucket['ssim'])),
+            ])
+
+    # Report z separately: the many z=0 patterns otherwise dominate pooled metrics.
+    with open(run_dir / 'per_z_metrics_summary.csv', 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['z_mm', 'split', 'n', f'mean_{metric_prefix}raw_mse',
+                         f'mean_{metric_prefix}display_log_mse', f'mean_{metric_prefix}ssim'])
+        for z_mm, split in sorted({(r['z_mm'], r['split']) for r in records}):
+            group = [r for r in records if r['z_mm'] == z_mm and r['split'] == split]
+            writer.writerow([z_mm, split, len(group)] + [
+                float(np.mean([r[metric] for r in group]))
+                for metric in ('raw_mse', 'display_log_mse', 'ssim')
+            ])
+
+    return records
+
+
+def plot_per_sample_metrics(records, run_dir, metric_prefix=''):
+    if not records:
+        return
+    run_dir = Path(run_dir)
+
+    group_colors = {
+        'sine': 'tab:blue',
+        'linear_ramp': 'tab:cyan',
+        'checkerboard': 'tab:orange',
+        'square_ring': 'tab:brown',
+        'radial_ring': 'tab:red',
+        'zernike_single': 'tab:purple',
+        'zernike_combo': 'tab:pink',
+        'local_bump': 'tab:green',
+        'real': 'black',
+        'pert': 'tab:olive',
+        'systematic_other': 'tab:gray',
+        'other': 'tab:gray',
+    }
+    split_markers = {'train': 'o', 'val': 'x', 'unknown': '.'}
+
+    fig, axes = plt.subplots(3, 1, figsize=(13, 10), sharex=True)
+    for ax, metric_key, title, log_y in [
+        (axes[0], 'raw_mse', f"{metric_prefix}raw MSE", True),
+        (axes[1], 'display_log_mse', f"{metric_prefix}display log MSE", True),
+        (axes[2], 'ssim', f"{metric_prefix}SSIM", False),
+    ]:
+        for group in sorted({r['group'] for r in records}):
+            for split in ['train', 'val', 'unknown']:
+                subset = [r for r in records if r['group'] == group and r['split'] == split]
+                if not subset:
+                    continue
+                ax.scatter(
+                    [r['index'] for r in subset],
+                    [r[metric_key] for r in subset],
+                    c=group_colors.get(group, 'tab:gray'),
+                    marker=split_markers.get(split, '.'),
+                    s=14 if split == 'train' else 28,
+                    alpha=0.8,
+                    label=f"{group} / {split}",
+                )
+        ax.set_title(f"Per-sample {title} by dataset index")
+        ax.set_ylabel(title)
+        if log_y and any(r[metric_key] > 0 for r in records):
+            ax.set_yscale('log')
+        ax.grid(True, alpha=0.25)
+    axes[-1].set_xlabel("dataset index")
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    axes[0].legend(by_label.values(), by_label.keys(), fontsize=7, loc='best', ncol=3)
+    plt.tight_layout()
+    plt.savefig(run_dir / 'per_sample_mse_plot.png', dpi=150)
+    plt.close(fig)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    for ax, metric_key, title in [
+        (axes[0], 'raw_mse', f"{metric_prefix}raw MSE"),
+        (axes[1], 'display_log_mse', f"{metric_prefix}display log MSE"),
+        (axes[2], 'ssim', f"{metric_prefix}SSIM"),
+    ]:
+        for group in sorted({r['group'] for r in records}):
+            vals = [r[metric_key] for r in records if r['group'] == group]
+            if vals:
+                ax.hist(vals, bins=30, alpha=0.45, label=group,
+                        color=group_colors.get(group, 'tab:gray'))
+        ax.set_title(f"Distribution of {title}")
+        ax.set_xlabel(title)
+        ax.set_ylabel("count")
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(run_dir / 'per_sample_mse_hist.png', dpi=150)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def evaluation_metric_definitions(cfg):
+    """Name the historical display metric and versioned SSIM unambiguously."""
+    version = cfg.get('loss_version', 1)
+    return {
+        'loss_version': version,
+        'loss_roi_fraction': cfg.get('loss_roi_fraction', 1.0),
+        'raw_mse': 'Mean squared error in saved camera training units after the loss ROI',
+        'display_log_mse': (
+            'Historical display-only diagnostic: each image is independently log1p transformed '
+            'and standardized; this is not the v2 training display transform'
+        ),
+        'ssim': ({
+            'name': f"shared_positive_{cfg.get('loss_display_transform', 'log1p')}_ssim",
+            'description': 'Exactly one minus the v2 per-image SSIM training component',
+            'scale': 'sqrt(target_mean**2 + loss_scale_floor**2), shared by prediction and target',
+            'loss_scale_floor': cfg.get('loss_scale_floor'),
+            'window': 11,
+            'padding': 'reflect; window shrinks for small images',
+        } if version == 2 else {
+            'name': 'legacy_raw_intensity_ssim',
+            'description': 'Historical raw-intensity SSIM metric, not the legacy training SSIM',
+        }),
+        'comparability': 'Compare SSIM only when its definition and preprocessing scales match',
+    }
+
+
+def needs_training_calibration(cfg):
+    """Automatic field gain remains usable when only the loss version changes."""
+    return (model_architecture(cfg) == 'shared_optical' or
+            cfg.get('loss_version', 1) == 2 or
+            (cfg.get('prediction_mode', 'intensity') in {'direct_field', 'residual_field'}
+             and cfg.get('field_out_scale', 4.0) is None))
+
+
+def build_dataset_from_config(cfg, *, training=False):
+    """Construct data with saved scales, or placeholders before train-only fitting."""
+    optical = model_architecture(cfg) == 'shared_optical'
+    if optical:
+        if cfg.get('sim_size', cfg['model_size']) != cfg['model_size']:
+            raise ValueError('Shared optical sim_size and model_size must match the native camera ROI')
+        if cfg.get('fov_crop_size') not in (None, cfg['model_size']):
+            raise ValueError('Shared optical fov_crop_size must equal model_size; no camera resampling')
+        if cfg.get('use_slm_phase', False):
+            raise ValueError('Shared optical architecture uses pre-propagated fields, not SLM phase channels')
+    field_mode = cfg.get('field_scale_mode', 'global_percentile')
+    camera_mode = cfg.get('camera_scale_mode', 'global_percentile')
+    field_scale = cfg.get('field_amp_scale_actual', cfg.get('field_amp_scale'))
+    camera_scale = cfg.get('camera_scale_actual', cfg.get('camera_scale'))
+    for name, mode, scale in [('field', field_mode, field_scale),
+                              ('camera', camera_mode, camera_scale)]:
+        if not training and mode == 'global_percentile' and scale is None:
+            raise ValueError(f"Evaluation checkpoint is missing the saved {name} scale")
+    # Discovery must precede splitting. Automatic fitting occurs after the split,
+    # so construction must not estimate a percentile from validation images.
+    if training and needs_training_calibration(cfg):
+        if field_mode == 'global_percentile' and field_scale is None:
+            field_scale = 1.0
+        if camera_mode == 'global_percentile' and camera_scale is None:
+            camera_scale = 1.0
+    return AxiconFieldDataset(
+        root_dir=cfg['pool_dir'],
+        workflow_field_dir=cfg.get('workflow_field_dir', '1.Forward_Sim'),
+        workflow_camera_dir=cfg.get('workflow_camera_dir', '3.Aligned_Camera'),
+        workflow_phase_dir=cfg.get('workflow_phase_dir', '0.Phase_Masks'),
+        sim_size=int(cfg.get('sim_size', cfg['model_size'])),
+        phase_flip_lr=cfg.get('phase_flip', True),
+        field_scale_mode=field_mode,
+        field_amp_percentile=cfg.get('field_amp_percentile', 99.9),
+        field_amp_scale=field_scale,
+        camera_scale_mode=camera_mode,
+        camera_percentile=cfg.get('camera_percentile', 99.9),
+        camera_scale=camera_scale,
+        camera_black_level=cfg.get('camera_black_level', 0.0),
+        fov_crop_size=cfg.get('fov_crop_size'),
+        use_slm_phase=cfg.get('use_slm_phase', False),
+        scale_max_pixels_per_sample=cfg.get('scale_max_pixels_per_sample'),
+        field_input_size=cfg.get('optical_input_size', 1024) if optical else None,
+    )
+
+
+def build_model_from_config(cfg, device='cpu', *, initialize=True):
+    """Keep training and checkpoint evaluation on the identical architecture."""
+    if model_architecture(cfg) == 'shared_optical':
+        from axicon_optical import make_shared_optical_model
+        return make_shared_optical_model(cfg).to(device)
+    in_ch = infer_input_channels(
+        use_slm_phase=cfg.get('use_slm_phase', False),
+        use_grid=cfg.get('use_grid', True),
+        use_radial_coord=cfg.get('use_radial_coord', True),
+        use_axicon_phase_map=cfg.get('use_axicon_phase_map', False),
+        axicon_slope_rad_per_pixel=cfg.get('axicon_slope_rad_per_pixel'),
+    )
+    mode = cfg.get('prediction_mode', 'intensity')
+    if mode not in {'intensity', 'direct_field', 'residual_field'}:
+        raise ValueError(f"Unknown prediction_mode={mode!r}")
+    model = AxiconFNO2d(
+        in_ch=in_ch, out_ch=1 if mode == 'intensity' else 2,
+        width=int(cfg['width']), modes_y=int(cfg['modes_y']),
+        modes_x=int(cfg['modes_x']), depth=int(cfg['depth']),
+        mlp_width=int(cfg['mlp_width']),
+    ).to(device)
+    if initialize:
+        if (mode == 'intensity' and cfg.get('intensity_activation', 'softplus') == 'softplus'
+                and cfg.get('output_bias_init') is not None):
+            nn.init.constant_(model.project[-1].bias, float(cfg['output_bias_init']))
+        if mode == 'residual_field' and cfg.get('residual_field_zero_init', False):
+            nn.init.zeros_(model.project[-1].weight)
+            nn.init.zeros_(model.project[-1].bias)
+    return model
+
+
+def migrate_optical_experiment_config(cfg):
+    """Explicitly import the completed diagnostic candidate without FNO defaults.
+
+    Old experimental configs carry unused FNO depth/width fields: the true
+    operator depth was physics_stages. Never reinterpret ordinary old FNO cfgs.
+    """
+    cfg = dict(cfg)
+    if 'architecture' not in cfg and cfg.get('arm', '').startswith('physics_'):
+        if cfg['arm'] != 'physics_screens_bg':
+            raise ValueError(f"Experimental arm {cfg['arm']} is not supported by this shared_optical import")
+        cfg['architecture'] = 'shared_optical'
+        cfg['depth'] = cfg.get('physics_stages', 2)
+        cfg['optical_input_size'] = cfg.get('input_size', 1024)
+        if cfg.get('physics_reference_size', 1024) != cfg['optical_input_size']:
+            raise ValueError('Import of cropped experimental screen-reference geometry is not supported')
+        for name, default in [('frequency_grid', 512), ('spatial_sizes', [16, 64, 256]),
+                              ('max_log_amplitude', .7), ('max_phase', math.pi),
+                              ('intensity_gain', 1.), ('learn_gain', True),
+                              ('background_grid', 64), ('background_initial_intensity', .001)]:
+            cfg['optical_'+name] = cfg.get('physics_'+name, default)
+        cfg['optical_background'] = cfg['arm'] == 'physics_screens_bg'
+        cfg['optical_background_reference_intensity'] = cfg.get(
+            'physics_background_reference_intensity',
+            cfg.get('training_calibration', {}).get('camera_mean_median', .07))
+        cfg['checkpoint_import'] = 'diagnostic shared optical candidate; physics_stages mapped to depth'
+    return cfg
+
+
+def load_evaluation_checkpoint(run_dir, device='cpu'):
+    """Load the actual training contract before constructing data or a model."""
+    path = Path(run_dir) / 'best.pt'
+    try:
+        checkpoint = torch.load(path, map_location=device, weights_only=True)
+    except TypeError:  # PyTorch releases predating weights_only.
+        checkpoint = torch.load(path, map_location=device)
+    if not checkpoint.get('cfg'):
+        raise ValueError(f"Checkpoint {path} has no saved cfg; cannot reproduce preprocessing")
+    cfg = migrate_optical_experiment_config(checkpoint['cfg'])
+    cfg.setdefault('loss_version', 1)
+    cfg.setdefault('camera_black_level', 0.0)
+    cfg['device'] = str(device)
+    return checkpoint, cfg
+
+
+def positive_integer(value):
+    value = int(value)
+    if value < 1:
+        raise argparse.ArgumentTypeError('must be a positive integer')
+    return value
+
+
+def build_argument_parser():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--architecture', choices=['fno', 'shared_optical'])
+    parser.add_argument('--depth', type=int, help='Independent S/H stages (optical), or FNO blocks')
+    parser.add_argument('--epochs', type=int)
+    parser.add_argument('--lr', type=float)
+    parser.add_argument('--lr-scheduler', choices=['none', 'plateau'], help='Optional validation-driven LR decay')
+    parser.add_argument('--lr-factor', type=float)
+    parser.add_argument('--lr-patience', type=int)
+    parser.add_argument('--lr-threshold', type=float, help='Relative improvement threshold for LR scheduling only')
+    parser.add_argument('--lr-min', type=float)
+    parser.add_argument('--batch-size', type=int)
+    parser.add_argument('--num-workers', type=int)
+    parser.add_argument('--seed', type=int)
+    parser.add_argument('--device', choices=['cpu', 'cuda'])
+    parser.add_argument('--optical-input-size', type=int, help='Native field domain; default 1024')
+    parser.add_argument('--optical-channels', type=positive_integer,
+                        help='Coherent complex-linear optical channels; default 1 (not FNO width)')
+    parser.add_argument('--optical-frequency-grid', type=int, help='H coefficient grid; default 512')
+    parser.add_argument('--optical-spatial-sizes', type=int, nargs='+', help='S grids; default 16 64 256')
+    parser.add_argument('--no-optical-background', action='store_true')
+    parser.add_argument('--pool-dir')
+    parser.add_argument('--output-dir')
+    parser.add_argument('--run-name')
+    parser.add_argument('--eval-only-run-dir', help='Read best.pt and its saved training configuration')
+    parser.add_argument('--eval-output-dir', help='Save evaluation outside the checkpoint directory')
+    parser.add_argument('--optical-maps-only', action='store_true',
+                        help='With --eval-only-run-dir: export H/S without reading any dataset')
+    parser.add_argument('--n-vis-train', type=int)
+    parser.add_argument('--n-vis-val', type=int)
+    return parser
+
+
+def export_optical_parameters(model, cfg, run_dir, checkpoint_epoch=None):
+    if model_architecture(cfg) != 'shared_optical':
+        return None
+    from axicon_optical_visualization import visualize_optical_parameters
+    paths = visualize_optical_parameters(
+        model, cfg, Path(run_dir) / 'optical_parameters', checkpoint_epoch=checkpoint_epoch)
+    print(f">>> H/S amplitude and phase maps: {paths['metadata_json']}")
+    return paths
+
+
+if __name__ == '__main__':
+    parser = build_argument_parser()
+    args = parser.parse_args()
+    #POOL_DIR = r'H:\Shared drives\3DHL + OptiCAL + TFT + SpaceCAL\3DHL\FNO\TrainSet_10072026'
+    POOL_DIR = r'C:\REVAMP\Yangwoo Heo\SLM_to_Axicon_Optimiaztion\Train_Pool\10_07_2026_TrainingSet'
+    OUTPUT_DIR = r'C:\REVAMP\Yangwoo Heo\SLM_to_Axicon_Optimiaztion\CSSNet_training_10072006_newsim'
+    RUN_NAME = datetime.now().strftime('%Y%m%d_%H%M%S')
+    EVAL_ONLY_RUN_DIR = args.eval_only_run_dir
+
+    # Data
+    # Exact paths take priority; missing/changed leading numbers are auto-resolved.
+    WORKFLOW_FIELD_DIR = '1.Forward_Sim'
+    WORKFLOW_CAMERA_DIR = '2.Aligned_Camera'
+    WORKFLOW_PHASE_DIR = '0.Phase_Masks'  # may be an absolute path; unused when USE_SLM_PHASE=False
+    # Set to None for full-frame training. 608 is a native ~60% crop of 1024
+    # and avoids resizing the valid FOV back to the original resolution.
+    FOV_CROP_SIZE = 608
+    SIM_SIZE = FOV_CROP_SIZE if FOV_CROP_SIZE is not None else 1024
+    MODEL_SIZE = SIM_SIZE
+    PHASE_FLIP = True
+    FIELD_SCALE_MODE = 'global_percentile'   # 'raw', 'global_percentile', or 'sample_norm'
+    CAMERA_SCALE_MODE = 'global_percentile'  # 'raw', 'global_percentile', or 'sample_norm'
+    FIELD_AMP_PERCENTILE = 99.9
+    CAMERA_PERCENTILE = 99.9
+    FIELD_AMP_SCALE = None
+    CAMERA_SCALE = None
+    CAMERA_BLACK_LEVEL = 0.0
+    # One shared scale across z preserves relative brightness. Bound RAM use for
+    # the multi-z pool; set None to compute the exact percentile over every pixel.
+    SCALE_MAX_PIXELS_PER_SAMPLE = 8192
+
+    # Shared optics is the tested candidate; set 'fno' to retain the old model.
+    ARCHITECTURE = args.architecture or 'shared_optical'
+    DEPTH = 3 # if ARCHITECTURE == 'shared_optical' else 3
+    # Each optical stage applies S_j in space, then H_j in Fourier space.
+    # Retain the full native field BEFORE cropping the final camera prediction.
+    OPTICAL_INPUT_SIZE = 1024
+    OPTICAL_CHANNELS = 5  # 1 preserves the original operator; try 2 for coherent channel mixing
+    OPTICAL_FREQUENCY_GRID = 512  # resolution of H coefficients, not a mode cutoff
+    OPTICAL_SPATIAL_SIZES = (16, 64, 256)
+    OPTICAL_MAX_LOG_AMPLITUDE = 0.7
+    OPTICAL_MAX_PHASE = math.pi
+    OPTICAL_INTENSITY_GAIN = None  # initial gain fitted on training ROI only
+    OPTICAL_LEARN_GAIN = True
+    OPTICAL_BACKGROUND = True
+    OPTICAL_BACKGROUND_GRID = 64
+    OPTICAL_BACKGROUND_INITIAL_INTENSITY = 0.001
+
+    # FNO-only architecture/head settings (ignored by shared_optical).
+    PREDICTION_MODE = 'direct_field'  # 'intensity', 'direct_field', or 'residual_field'
+    WIDTH = 8
+    INTENSITY_ACTIVATION = 'softplus'
+    MODES_Y = 120
+    MODES_X = 120
+    MLP_WIDTH = 128
+    OUTPUT_BIAS_INIT = -4.0  # softplus(-4) gives a dark, nonzero initial output
+
+    # Axicon/SLM-aware conditioning
+    USE_SLM_PHASE = False  # field-only shared FNO; no SLM phase or z input channels
+    SLM_PHASE_WEIGHT = 0.10
+    SLM_PHASE_LOWPASS_SIZE = 64
+    SLM_PHASE_RING_RADIUS = None  # normalized radius in camera coordinates, e.g. 0.55
+    SLM_PHASE_RING_WIDTH = None   # normalized Gaussian width, e.g. 0.08
+    USE_GRID = True
+    USE_RADIAL_COORD = True
+    USE_AXICON_PHASE_MAP = False
+    AXICON_SLOPE_RAD_PER_PIXEL = None  # set if fixed NA/lambda/pixel slope is known
+
+    # Used when PREDICTION_MODE is 'direct_field' or 'residual_field'
+    FIELD_OUT_SCALE = None  # train-only calibrated fixed gain; no simulated-RMS cap
+    FIELD_OUT_SCALE_MODE = 'absolute'
+    DIRECT_FIELD_ACTIVATION = 'linear'
+    DIRECT_FIELD_NOISE_STD = 0.0  # deterministic residual baseline; optional training noise
+    RESIDUAL_FIELD_ALPHA = 1.0
+    # Makes residual_field start as E_pred = E_sim without freezing learning.
+    RESIDUAL_FIELD_ZERO_INIT = True
+
+    # Training
+    REQUIRE_CUDA = False
+    SYS_TRAIN_RATIO = 0.90   # 10% of each systematic pattern family goes to validation
+    REAL_TRAIN_RATIO = 0.60  # real parents and all matching pert samples stay together
+    BATCH_SIZE = 3
+    EPOCHS = 200
+    LR = 3e-3 if ARCHITECTURE == 'shared_optical' else 3e-4
+    LR_SCHEDULER = 'none'  # set 'plateau' to enable validation-driven decay
+    LR_FACTOR = 0.5
+    LR_PATIENCE = 10
+    LR_THRESHOLD = 0.001  # relative 0.1%; does not affect best checkpoint selection
+    LR_MIN = 1e-4
+    WEIGHT_DECAY = 1e-5
+    NUM_WORKERS = 1
+    USE_AMP = False  # FFT + complex weights are safer in full fp32 for the first run
+    GRAD_CLIP = 1.0
+    USE_GROUP_LOSS_WEIGHTS = True
+    GROUP_LOSS_WEIGHTS = {
+        'systematic': 1.0,
+        'real': 1.0,
+        'pert': 1.0,
+        'other': 1.0,
+    }
+
+    # Loss
+    LOSS_VERSION = 2  # unversioned checkpoints retain the legacy objective
+    LOSS_DISPLAY_TRANSFORM = 'log1p'
+    LOSS_SCALE_FLOOR_FRACTION = 0.5
+    LOSS_SCALE_FLOOR = None  # calibrated from training targets after splitting
+    W_LOG_DISPLAY_SMOOTH_L1 = 0.0
+    W_SSIM = 1.0
+    W_GRAD = 0.10
+    W_FFT = 0.0
+    W_MEAN_NORM_L1 = 1.0  # SmoothL1 intensity error with the shared target scale
+    W_PEAK = 0.0
+    W_DARK = 0.0
+    PEAK_MARGIN = 0.10
+    PEAK_TOP_FRACTION = 0.002
+    DARK_MARGIN = 0.10
+    DARK_TOP_FRACTION = 0.002
+    # A native FOV crop is already the supervised domain. When it is disabled,
+    # retain the previous full-frame behavior with an 80% center loss ROI.
+    LOSS_ROI_FRACTION = 1.0 if FOV_CROP_SIZE is not None else 0.80
+
+    # Visualization
+    N_VIS_TRAIN = 30
+    N_VIS_VAL = 30
+    SEED = 42
+
+    # CLI overrides are useful for depth sweeps; all effective values go in cfg.
+    POOL_DIR = args.pool_dir or POOL_DIR
+    OUTPUT_DIR = args.output_dir or OUTPUT_DIR
+    RUN_NAME = args.run_name or RUN_NAME
+    DEPTH = args.depth if args.depth is not None else DEPTH
+    EPOCHS = args.epochs if args.epochs is not None else EPOCHS
+    LR = args.lr if args.lr is not None else LR
+    lr_schedule_cfg = {
+        'lr_scheduler': args.lr_scheduler if args.lr_scheduler is not None else LR_SCHEDULER,
+        'lr_factor': args.lr_factor if args.lr_factor is not None else LR_FACTOR,
+        'lr_patience': args.lr_patience if args.lr_patience is not None else LR_PATIENCE,
+        'lr_threshold': args.lr_threshold if args.lr_threshold is not None else LR_THRESHOLD,
+        'lr_min': args.lr_min if args.lr_min is not None else LR_MIN,
+    }
+    if EVAL_ONLY_RUN_DIR and any(v is not None for v in (
+            args.lr_scheduler, args.lr_factor, args.lr_patience, args.lr_threshold, args.lr_min)):
+        parser.error('LR scheduler overrides apply only to training, not evaluation')
+    if not EVAL_ONLY_RUN_DIR:
+        try:
+            validate_lr_scheduler_config(dict(lr_schedule_cfg, lr=LR))
+        except ValueError as error:
+            parser.error(str(error))
+    BATCH_SIZE = args.batch_size if args.batch_size is not None else BATCH_SIZE
+    NUM_WORKERS = args.num_workers if args.num_workers is not None else NUM_WORKERS
+    SEED = args.seed if args.seed is not None else SEED
+    OPTICAL_INPUT_SIZE = args.optical_input_size if args.optical_input_size is not None else OPTICAL_INPUT_SIZE
+    OPTICAL_CHANNELS = args.optical_channels if args.optical_channels is not None else OPTICAL_CHANNELS
+    OPTICAL_FREQUENCY_GRID = args.optical_frequency_grid if args.optical_frequency_grid is not None else OPTICAL_FREQUENCY_GRID
+    OPTICAL_SPATIAL_SIZES = args.optical_spatial_sizes or OPTICAL_SPATIAL_SIZES
+    OPTICAL_BACKGROUND = OPTICAL_BACKGROUND and not args.no_optical_background
+    N_VIS_TRAIN = args.n_vis_train if args.n_vis_train is not None else N_VIS_TRAIN
+    N_VIS_VAL = args.n_vis_val if args.n_vis_val is not None else N_VIS_VAL
+    if EPOCHS < 1 or BATCH_SIZE < 1 or NUM_WORKERS < 0 or not math.isfinite(LR) or LR <= 0:
+        parser.error('epochs/batch-size/lr must be positive; num-workers must be nonnegative')
+    if min(N_VIS_TRAIN, N_VIS_VAL) < 0:
+        parser.error('visualization sample counts must be nonnegative')
+    if ARCHITECTURE != 'shared_optical' and args.optical_channels is not None:
+        parser.error('--optical-channels requires --architecture shared_optical; FNO uses WIDTH')
+    if (args.optical_maps_only or args.eval_output_dir) and not EVAL_ONLY_RUN_DIR:
+        parser.error('--optical-maps-only / --eval-output-dir require --eval-only-run-dir')
+    if EVAL_ONLY_RUN_DIR and any(v is not None for v in (
+            args.architecture, args.depth, args.optical_input_size, args.optical_channels, args.optical_frequency_grid,
+            args.optical_spatial_sizes)):
+        parser.error('Evaluation uses the saved architecture; omit architecture/depth/channels/grid overrides')
+    if EVAL_ONLY_RUN_DIR and args.no_optical_background:
+        parser.error('Evaluation uses the saved background setting')
+
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    random.seed(SEED)
+
+    print_torch_device_diagnostics()
+    DEVICE = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    if REQUIRE_CUDA and DEVICE != 'cuda':
+        raise RuntimeError("REQUIRE_CUDA=True but CUDA is not available to this Python process.")
+    eval_only = EVAL_ONLY_RUN_DIR is not None
+    checkpoint_dir = Path(EVAL_ONLY_RUN_DIR) if eval_only else None
+    run_dir = (Path(args.eval_output_dir) if args.eval_output_dir else checkpoint_dir) if eval_only else Path(OUTPUT_DIR) / RUN_NAME
+    if not eval_only and run_dir.exists() and any(run_dir.iterdir()):
+        parser.error(f'Training output directory is not empty: {run_dir}. Choose a new --run-name.')
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg = {
+        **lr_schedule_cfg,
+        'architecture': ARCHITECTURE,
+        'optical_input_size': OPTICAL_INPUT_SIZE,
+        'optical_channels': OPTICAL_CHANNELS,
+        'optical_frequency_grid': OPTICAL_FREQUENCY_GRID,
+        'optical_spatial_sizes': list(OPTICAL_SPATIAL_SIZES),
+        'optical_max_log_amplitude': OPTICAL_MAX_LOG_AMPLITUDE,
+        'optical_max_phase': OPTICAL_MAX_PHASE,
+        'optical_intensity_gain': OPTICAL_INTENSITY_GAIN,
+        'optical_learn_gain': OPTICAL_LEARN_GAIN,
+        'optical_background': OPTICAL_BACKGROUND,
+        'optical_background_grid': OPTICAL_BACKGROUND_GRID,
+        'optical_background_initial_intensity': OPTICAL_BACKGROUND_INITIAL_INTENSITY,
+        'pool_dir': str(POOL_DIR),
+        'workflow_field_dir': WORKFLOW_FIELD_DIR,
+        'workflow_camera_dir': WORKFLOW_CAMERA_DIR,
+        'workflow_phase_dir': WORKFLOW_PHASE_DIR,
+        'fov_crop_size': FOV_CROP_SIZE,
+        'sim_size': SIM_SIZE,
+        'model_size': MODEL_SIZE,
+        'phase_flip': PHASE_FLIP,
+        'field_scale_mode': FIELD_SCALE_MODE,
+        'camera_scale_mode': CAMERA_SCALE_MODE,
+        'field_amp_percentile': FIELD_AMP_PERCENTILE,
+        'camera_percentile': CAMERA_PERCENTILE,
+        'field_amp_scale': FIELD_AMP_SCALE,
+        'camera_scale': CAMERA_SCALE,
+        'camera_black_level': CAMERA_BLACK_LEVEL,
+        'scale_max_pixels_per_sample': SCALE_MAX_PIXELS_PER_SAMPLE,
+        'z_input_mode': 'none',
+        'z_units': 'mm',
+        'z_semantics': 'offset_from_reference_plane',
+        'prediction_mode': PREDICTION_MODE,
+        'intensity_activation': INTENSITY_ACTIVATION,
+        'width': WIDTH,
+        'depth': DEPTH,
+        'modes_y': MODES_Y,
+        'modes_x': MODES_X,
+        'mlp_width': MLP_WIDTH,
+        'output_bias_init': OUTPUT_BIAS_INIT,
+        'use_slm_phase': USE_SLM_PHASE,
+        'slm_phase_weight': SLM_PHASE_WEIGHT,
+        'slm_phase_lowpass_size': SLM_PHASE_LOWPASS_SIZE,
+        'slm_phase_ring_radius': SLM_PHASE_RING_RADIUS,
+        'slm_phase_ring_width': SLM_PHASE_RING_WIDTH,
+        'use_grid': USE_GRID,
+        'use_radial_coord': USE_RADIAL_COORD,
+        'use_axicon_phase_map': USE_AXICON_PHASE_MAP,
+        'axicon_slope_rad_per_pixel': AXICON_SLOPE_RAD_PER_PIXEL,
+        'field_out_scale': FIELD_OUT_SCALE,
+        'field_out_scale_mode': FIELD_OUT_SCALE_MODE,
+        'direct_field_activation': DIRECT_FIELD_ACTIVATION,
+        'direct_field_noise_std': DIRECT_FIELD_NOISE_STD,
+        'residual_field_alpha': RESIDUAL_FIELD_ALPHA,
+        'residual_field_zero_init': RESIDUAL_FIELD_ZERO_INIT,
+        'sys_train_ratio': SYS_TRAIN_RATIO,
+        'real_train_ratio': REAL_TRAIN_RATIO,
+        'batch_size': BATCH_SIZE,
+        'epochs': EPOCHS,
+        'lr': LR,
+        'weight_decay': WEIGHT_DECAY,
+        'num_workers': NUM_WORKERS,
+        'require_cuda': REQUIRE_CUDA,
+        'use_amp': USE_AMP,
+        'grad_clip': GRAD_CLIP,
+        'use_group_loss_weights': USE_GROUP_LOSS_WEIGHTS,
+        'group_loss_weights_raw': GROUP_LOSS_WEIGHTS,
+        'loss_version': LOSS_VERSION,
+        'loss_display_transform': LOSS_DISPLAY_TRANSFORM,
+        'loss_scale_floor_fraction': LOSS_SCALE_FLOOR_FRACTION,
+        'loss_scale_floor': LOSS_SCALE_FLOOR,
+        'w_log_display_smooth_l1': W_LOG_DISPLAY_SMOOTH_L1,
+        'w_ssim': W_SSIM,
+        'w_grad': W_GRAD,
+        'w_fft': W_FFT,
+        'w_mean_norm_l1': W_MEAN_NORM_L1,
+        'w_peak': W_PEAK,
+        'w_dark': W_DARK,
+        'peak_margin': PEAK_MARGIN,
+        'peak_top_fraction': PEAK_TOP_FRACTION,
+        'dark_margin': DARK_MARGIN,
+        'dark_top_fraction': DARK_TOP_FRACTION,
+        'loss_roi_fraction': LOSS_ROI_FRACTION,
+        'seed': SEED,
+        'device': DEVICE,
+    }
+
+    print(f"=== Camera-operator run: {RUN_NAME} ===")
+    if eval_only:
+        ckpt, cfg = load_evaluation_checkpoint(checkpoint_dir, DEVICE)
+        cfg['source_checkpoint'] = str((checkpoint_dir / 'best.pt').resolve())
+        if args.pool_dir:
+            cfg['pool_dir'] = args.pool_dir  # relocated data; saved sample IDs/scales stay fixed
+        if args.optical_maps_only:
+            if model_architecture(cfg) != 'shared_optical':
+                parser.error('--optical-maps-only requires a shared_optical checkpoint')
+            model = build_model_from_config(cfg, DEVICE, initialize=False)
+            model.load_state_dict(ckpt['model_state_dict'])
+            export_optical_parameters(model, cfg, run_dir, ckpt.get('epoch'))
+            print(f"Done. Optical parameter maps in: {run_dir / 'optical_parameters'}")
+            raise SystemExit(0)
+
+    print(f"Device: {DEVICE}")
+    print(f"Output dir: {run_dir}")
+
+    dataset = build_dataset_from_config(cfg, training=not eval_only)
+
+    if len(dataset) < 2:
+        raise RuntimeError(f"Need at least 2 samples, found {len(dataset)}")
+
+    additional_eval_ids = []
+    split_path = (checkpoint_dir if eval_only else run_dir) / 'split.json'
+    if eval_only:
+        with open(split_path, 'r', encoding='utf-8') as f:
+            split_dump = json.load(f)
+        id_to_idx = {sample['id']: i for i, sample in enumerate(dataset.samples)}
+        missing = set(split_dump.get('train', []) + split_dump.get('val', [])) - set(id_to_idx)
+        if missing:
+            raise ValueError(f"Evaluation dataset is missing {len(missing)} saved split samples")
+        additional_eval_ids = sorted(set(id_to_idx) -
+                                    set(split_dump.get('train', []) + split_dump.get('val', [])))
+        if additional_eval_ids:
+            print(f">>> Evaluation includes {len(additional_eval_ids)} new samples as split=unknown; "
+                  "saved train/validation membership is unchanged")
+        train_idx = [id_to_idx[sid] for sid in split_dump.get('train', [])]
+        val_idx = [id_to_idx[sid] for sid in split_dump.get('val', [])]
+        train_set = Subset(dataset, train_idx)
+        val_set = Subset(dataset, val_idx)
+    else:
+        train_set, val_set, train_idx, val_idx = split_dataset(
+            dataset,
+            sys_train_ratio=cfg['sys_train_ratio'],
+            real_train_ratio=cfg['real_train_ratio'],
+            seed=cfg['seed'],
+        )
+        if not eval_only:
+            with open(split_path, 'w', encoding='utf-8') as f:
+                json.dump({
+                    'split_rule': (
+                        'sys_* -> family-stratified random train/val; '
+                        'real_* parent groups -> random train/val; '
+                        'pert_* -> same split as matching real_* parent; others -> random train/val; '
+                        'all z views of each pattern stay in the same split'
+                    ),
+                    'sys_train_ratio': SYS_TRAIN_RATIO,
+                    'real_train_ratio_for_parents_and_other': REAL_TRAIN_RATIO,
+                    'train': [dataset.samples[i]['id'] for i in train_idx],
+                    'val': [dataset.samples[i]['id'] for i in val_idx],
+                    'z_positions_mm': dataset.z_positions_mm,
+                }, f, indent=2)
+
+    if not train_idx or not val_idx:
+        raise RuntimeError("Training and validation must both contain samples; adjust split ratios")
+    if not eval_only:
+        if needs_training_calibration(cfg):
+            calibrate_training_scales(
+                dataset, train_idx, cfg,
+                fit_camera_scale=(cfg['camera_scale_mode'] == 'global_percentile'
+                                  and cfg.get('camera_scale') is None),
+                fit_field_scale=(cfg['field_scale_mode'] == 'global_percentile'
+                                 and cfg.get('field_amp_scale') is None),
+            )
+        cfg['field_amp_scale_actual'] = dataset.field_amp_scale
+        cfg['camera_scale_actual'] = dataset.camera_scale
+        cfg['z_positions_mm'] = dataset.z_positions_mm
+        train_index_set = set(train_idx)
+        val_index_set = set(val_idx)
+        with open(run_dir / 'dataset_manifest.csv', 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['id', 'pattern_id', 'z_mm', 'split', 'field', 'camera', 'phase'])
+            for i, sample in enumerate(dataset.samples):
+                split = 'train' if i in train_index_set else ('val' if i in val_index_set else 'unknown')
+                writer.writerow([sample['id'], sample['pattern_id'], sample['z_mm'], split,
+                                 str(sample['field']), str(sample['camera']),
+                                 str(sample['phase']) if sample['phase'] else ''])
+        normalized_group_weights, train_group_counts = normalize_group_loss_weights(
+            dataset, train_idx, cfg['group_loss_weights_raw'],
+            enabled=cfg['use_group_loss_weights'],
+        )
+        cfg['group_loss_weights_normalized'] = normalized_group_weights
+        cfg['train_group_counts'] = train_group_counts
+        with open(run_dir / 'config.json', 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=2)
+
+    pin_memory = DEVICE == 'cuda'
+    model = build_model_from_config(cfg, DEVICE, initialize=not eval_only)
+    n_params = sum(p.numel() * (2 if p.is_complex() else 1)
+                   for p in model.parameters() if p.requires_grad)
+    print(f"Architecture: {model_architecture(cfg)}, depth: {cfg['depth']}")
+    if model_architecture(cfg) == 'shared_optical':
+        print(f"Coherent optical channels: {cfg.get('optical_channels', 1)}")
+        print(f"Native field: {cfg['optical_input_size']} square; camera ROI: {cfg['model_size']} square")
+    else:
+        print(f"Input channels: {model.lift[0].in_channels}")
+    print(f"Trainable real parameters: {n_params:,}")
+    if not eval_only:
+        cfg['trainable_real_parameters'] = n_params
+        with open(run_dir / 'config.json', 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=2)
+
+    if eval_only:
+        model.load_state_dict(ckpt['model_state_dict'])
+        history = {'train': [], 'val': []}
+    else:
+        train_loader = DataLoader(train_set, batch_size=cfg['batch_size'], shuffle=True,
+                                  num_workers=cfg['num_workers'], pin_memory=pin_memory)
+        val_loader = DataLoader(val_set, batch_size=cfg['batch_size'], shuffle=False,
+                                num_workers=cfg['num_workers'], pin_memory=pin_memory)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg['lr'],
+                                      weight_decay=cfg['weight_decay'])
+        history = train_one_run(model, train_loader, val_loader,
+                                optimizer, DEVICE, cfg, run_dir)
+        plot_loss_curve(history, run_dir)
+        print(">>> Loading best checkpoint for final evaluation...")
+        ckpt, cfg = load_evaluation_checkpoint(run_dir, DEVICE)
+        model.load_state_dict(ckpt['model_state_dict'])
+
+    export_optical_parameters(model, cfg, run_dir, ckpt.get('epoch'))
+    rows = evaluate_all(model, dataset, DEVICE, cfg)
+    metric_definitions = evaluation_metric_definitions(cfg)
+    metric_definitions['sample_counts'] = {
+        'all': len(dataset), 'train': len(train_idx), 'val': len(val_idx),
+        'additional_unknown': len(additional_eval_ids),
+    }
+    metric_definitions['additional_unknown_ids'] = additional_eval_ids
+    with open(run_dir / 'evaluation_metric_definitions.json', 'w', encoding='utf-8') as f:
+        json.dump(metric_definitions, f, indent=2)
+    roi_fraction = cfg.get('loss_roi_fraction', 1.0)
+    metric_prefix = 'roi_' if roi_fraction is not None and float(roi_fraction) < 1.0 else ''
+    metric_records = write_per_sample_metrics(
+        rows, dataset, train_idx, val_idx, run_dir, metric_prefix=metric_prefix)
+    plot_per_sample_metrics(metric_records, run_dir, metric_prefix=metric_prefix)
+
+    vis_train = evenly_spaced_sample_indices(train_idx, N_VIS_TRAIN)
+    vis_val = evenly_spaced_sample_indices(val_idx, N_VIS_VAL)
+    if vis_train:
+        visualize_samples(model, dataset, vis_train, DEVICE, cfg,
+                          save_dir=run_dir / 'samples_train')
+    if vis_val:
+        visualize_samples(model, dataset, vis_val, DEVICE, cfg,
+                          save_dir=run_dir / 'samples_val')
+
+    print(f"\nDone. All outputs in: {run_dir}")
